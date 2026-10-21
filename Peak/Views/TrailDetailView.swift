@@ -3,8 +3,8 @@ import MapKit
 import PeakCore
 import SwiftUI
 
-/// A hike's card: the route on a map, its numbers, the climb, and a button to draw it on
-/// the mountain.
+/// A hike's card: the route on a map, its numbers, the climb, and buttons to draw it on
+/// the mountain or see it from above.
 struct TrailDetailView: View {
     let model: AppModel
     let link: TrailLink
@@ -45,15 +45,19 @@ struct TrailDetailView: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
 
-                Button {
-                    model.showOnMountain(trail, peakID: peak.id)
-                } label: {
-                    Label("Show on the mountain", systemImage: "mountain.2.fill")
-                        .frame(maxWidth: .infinity)
+                // Side by side where they fit, else one above the other.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) {
+                        mountainButton(trail, peak, title: "On the mountain")
+                        aboveButton(trail, peak, fill: false)
+                    }
+                    VStack(spacing: 8) {
+                        mountainButton(trail, peak, title: "Show on the mountain")
+                        aboveButton(trail, peak, fill: true)
+                    }
                 }
-                .buttonStyle(.borderedProminent)
                 .tint(Color(red: 1, green: 0.72, blue: 0.28))
-                .foregroundStyle(.black)
+                .lineLimit(1)
                 .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             }
@@ -113,6 +117,28 @@ struct TrailDetailView: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
+    }
+
+    private func mountainButton(_ trail: Trail, _ peak: Peak, title: String) -> some View {
+        Button {
+            model.showOnMountain(trail, peakID: peak.id)
+        } label: {
+            Label(title, systemImage: "mountain.2.fill")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .foregroundStyle(.black)
+    }
+
+    private func aboveButton(_ trail: Trail, _ peak: Peak, fill: Bool) -> some View {
+        Button {
+            model.showFromAbove(trail, peakID: peak.id)
+        } label: {
+            Label("From above", systemImage: "map")
+                .frame(maxWidth: fill ? .infinity : nil)
+        }
+        .buttonStyle(.bordered)
+        .foregroundStyle(Color(red: 1, green: 0.72, blue: 0.28))
     }
 
     private func kind(_ trail: Trail) -> String {

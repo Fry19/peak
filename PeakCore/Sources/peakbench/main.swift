@@ -37,6 +37,10 @@ peakbench: desk test harness for skyline matching.
       peak at --lat/--lon. With --dem, climb from the terrain; with --from-*, how much of
       each trail is in sight from there, as the app draws it on the mountain.
 
+  peakbench relief --dem DIR --lat L --lon L [--size-km K] [--cell M] [--image FILE]
+      The terrain seen from above around a point, as the app draws it under a trail:
+      hillshade and ridge crests. Prints how long each step takes and what it found.
+
   peakbench facts ENTITY.json --id Q [--labels LABELS.json] [--summary SUMMARY.json]
       Read a peak's facts from Wikidata and Wikipedia responses.
 
@@ -616,6 +620,48 @@ func benchSummary(_ results: [BenchRun], mode: String, aim: String) -> String {
     return md
 }
 
+// MARK: - Relief
+
+func reliefCommand(_ args: Arguments) throws {
+    let terrain = try loadTerrain(args.string("dem"))
+    let size = (args.double("size-km") ?? 12) * 1000, cell = args.double("cell") ?? 30
+    let extent = MapExtent(center: LatLon(try args.required("lat"), try args.required("lon")), width: size, height: size)
+    let map = timed("Grid") { ReliefMap(terrain: terrain, extent: extent, cellSize: cell) }
+    let shade = timed("Hillshade") { map.hillshade(exaggeration: 1.5) }
+    let crests = timed("Crests") { map.crestLines() }
+    let bands = [(400.0, "main ridges"), (150, "ridges"), (60, "spurs"), (0, "small spurs")]
+    let known = map.heights.filter(\.isFinite)
+    print("Heights \(f(Double(known.min() ?? .nan), 0))–\(f(Double(known.max() ?? .nan), 0)) m, " +
+          "\(f(Double(map.heights[map.rows / 2 * map.cols + map.cols / 2]), 0)) m in the middle")
+    print("\(map.cols)×\(map.rows) grid at \(f(cell, 0)) m; \(crests.count) crest lines, " +
+          "\(crests.reduce(0) { $0 + $1.points.count }) points")
+    for (k, band) in bands.enumerated() {
+        let inBand = crests.filter { $0.relief >= band.0 && (k == 0 || $0.relief < bands[k - 1].0) }
+        let km = inBand.reduce(0.0) { sum, line in
+            sum + zip(line.points, line.points.dropFirst()).reduce(0) { $0 + (($1.1 - $1.0) * ($1.1 - $1.0)).sum().squareRoot() }
+        } / 1000
+        print("  \(band.1) (relief over \(Int(band.0)) m): \(inBand.count) lines, \(f(km, 1)) km")
+    }
+    guard let path = args.string("image") else { return }
+    var image = RGBImage(width: map.cols, height: map.rows, fill: (9, 11, 16))
+    for r in 0..<map.rows {
+        for c in 0..<map.cols where shade[r * map.cols + c].isFinite {
+            let v = Double(shade[r * map.cols + c])
+            image.set(c, r, (UInt8(10 + 70 * v), UInt8(12 + 78 * v), UInt8(18 + 88 * v)))
+        }
+    }
+    func pixel(_ p: SIMD2<Double>) -> (Double, Double) {
+        (p.x / cell + Double(map.cols - 1) / 2, Double(map.rows - 1) / 2 - p.y / cell)
+    }
+    for line in crests.sorted(by: { $0.relief < $1.relief }) {
+        let t = min(1, line.relief / 400)
+        let v = UInt8(110 + 145 * t)
+        image.drawPolyline(line.points.map(pixel), color: (UInt8(Double(v) * 0.86), UInt8(Double(v) * 0.94), v))
+    }
+    try saveImage(image, to: path)
+    print("Wrote \(path)")
+}
+
 // MARK: - main
 
 let argv = CommandLine.arguments
@@ -635,6 +681,7 @@ do {
     case "scene": try sceneCommand(args)
     case "trails": try trailsCommand(args)
     case "facts": try factsCommand(args)
+    case "relief": try reliefCommand(args)
     case "case": try caseCommand(args)
     case "help", "-h", "--help": print(usage)
     default:

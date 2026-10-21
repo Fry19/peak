@@ -136,6 +136,8 @@ final class AppModel {
     /// The peak highlighted in the view (tapped, or picked from the list).
     var selectedPeakID: Int64?
     var arTrail: ARTrail?
+    /// That trail seen from straight above, over the ridgelines, instead of the camera.
+    var showsFromAbove = false
     /// Lining the view up by hand: the picture is paused and dragging moves the lines.
     var aligning = false
     /// How far the picture and the lines are zoomed in, 1 to `maxZoom`.
@@ -411,12 +413,23 @@ final class AppModel {
     func showOnMountain(_ trail: Trail, peakID: Int64) {
         selectedPeakID = peakID
         sheet = nil
-        arTrail = ARTrail(trail: trail, peakID: peakID, runs: nil)
-        drapeTrail()
+        showsFromAbove = false
+        if arTrail?.trail.id != trail.id || arTrail?.peakID != peakID {
+            arTrail = ARTrail(trail: trail, peakID: peakID, runs: nil)
+            drapeTrail()
+        }
+    }
+
+    /// Shows a trail from straight above. It's drawn on the mountain too, for switching
+    /// back to the camera.
+    func showFromAbove(_ trail: Trail, peakID: Int64) {
+        showOnMountain(trail, peakID: peakID)
+        showsFromAbove = true
     }
 
     func clearTrail() {
         arTrail = nil
+        showsFromAbove = false
     }
 
     private func drapeTrail() {

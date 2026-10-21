@@ -59,6 +59,13 @@ struct RootView: View {
             .padding(.bottom, 12)
             .padding(.horizontal, 12)
         }
+        .overlay {
+            if model.showsFromAbove, let trail = model.arTrail {
+                TrailFromAboveView(model: model, trail: trail)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: model.showsFromAbove)
         .background(Color.black)
         .onAppear { model.start() }
         .onChange(of: scenePhase) { _, phase in
@@ -157,7 +164,8 @@ private struct AlignBanner: View {
     }
 }
 
-/// The trail drawn on the mountain: tap for its card, × to clear it.
+/// The trail drawn on the mountain: tap for its card, the map to see it from above, × to
+/// clear it.
 private struct TrailChip: View {
     let model: AppModel
     let trail: AppModel.ARTrail
@@ -175,6 +183,15 @@ private struct TrailChip: View {
                     .foregroundStyle(.white.opacity(0.7))
             }
             Spacer(minLength: 4)
+            Button {
+                model.showsFromAbove = true
+            } label: {
+                Image(systemName: "map")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 28, height: 28)
+                    .background(.white.opacity(0.15), in: Circle())
+            }
+            .accessibilityLabel("See the trail from above")
             Button {
                 model.clearTrail()
             } label: {
