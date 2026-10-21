@@ -1,0 +1,86 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-tests:
+    name: PeakCore tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run PeakCore tests
+        working-directory: PeakCore
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee test.log | xcbeautify --renderer github-actions
+          echo "::notice title=XCTest::$(grep -E 'Executed [0-9]+ tests' test.log | tail -1)"
+
+  linux-tests:
+    name: PeakCore tests (Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.1-noble
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run PeakCore tests
+        working-directory: PeakCore
+        run: swift test
+
+  bench:
+    name: Skyline matching benchmark
+    runs-on: macos-15
+    env:
+      LAT: "45.9837"
+      LON: "7.7856"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache DEM tiles
+        uses: actions/cache@v4
+        with:
+          path: DEM
+          key: dem-gornergrat-100km-${{ hashFiles('Tools/fetch_dem.py') }}
+
+      - name: Fetch Copernicus GLO-30 tiles
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r Tools/requirements.txt
+          .venv/bin/python Tools/fetch_dem.py --lat "$LAT" --lon "$LON" --radius-km 100 --out DEM
+
+      - name: Build peakbench
+        working-directory: PeakCore
+        run: |
+          set -o pipefail
+          swift build -c release 2>&1 | xcbeautify --renderer github-actions
+
+      - name: Run benchmark
+        run: |
+          B=PeakCore/.build/release/peakbench
+          mkdir -p out/frames
+          {
+            echo "## Heading error before and after skyline matching"
+            echo "Synthetic photos of the real terrain within 3 km of Gornergrat, Zermatt. Compass error σ ≈ 8°, GPS error up to 15 m, random clouds and trees."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --mode arkit --save out/frames --markdown arkit.md
+          $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --mode photo --seed 2 --markdown photo.md
+          $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --aim any --seed 3 --markdown any.md
+          cat arkit.md photo.md any.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Matterhorn example
+        run: |
+          B=PeakCore/.build/release/peakbench
+          $B horizon --dem DEM --lat "$LAT" --lon "$LON" --image out/gornergrat-panorama.png
+          $B synth --dem DEM --lat "$LAT" --lon "$LON" --heading 262 --pitch 3 --roll 1 --compass-error 8 --out out/matterhorn
+          $B align out/matterhorn.json --dem DEM --debug out/matterhorn-aligned.png
+
+      - name: Upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyline-matching
+          path: out

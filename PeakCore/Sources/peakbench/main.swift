@@ -1,0 +1,449 @@
+import Foundation
+import PeakCore
+
+let usage = """
+peakbench: desk test harness for skyline matching.
+
+  peakbench horizon --dem DIR --lat L --lon L [--altitude M] [--csv FILE] [--image FILE]
+      Render the horizon from a point and print a summary. --image writes a depth panorama.
+
+  peakbench synth --dem DIR --lat L --lon L --heading H [--pitch P] [--roll R] [--fov F]
+                  [--width W] [--height H] [--compass-error E] [--clouds C] [--trees T]
+                  [--seed S] --out NAME
+      Render a synthetic photo (NAME.ppm, or NAME.png on a Mac) and its case file NAME.json.
+
+  peakbench align CASE.json [--dem DIR] [--debug FILE]
+      Find the skyline in a photo, align it to the terrain and report the heading error
+      before and after correction.
+
+  peakbench bench --dem DIR --lat L --lon L [--runs N] [--spread-km K] [--gps-error M]
+                  [--mode arkit|photo] [--aim far|any] [--seed S] [--markdown FILE] [--save DIR]
+      Monte Carlo test on synthetic photos of the real terrain around a point. By default
+      the camera aims where the skyline is at least 5 km away, as when pointing at peaks.
+
+  peakbench detect IMAGE [--width W] [--debug FILE]
+      Run only the skyline detector and draw what it found.
+
+  peakbench case PHOTO.jpg [--out CASE.json]          (macOS only)
+      Make a case file from an iPhone photo's location, compass heading and lens data.
+"""
+
+/// A photo plus what the phone knew when it was taken.
+struct PhotoCase: Codable {
+    var image: String
+    var latitude: Double
+    var longitude: Double
+    /// Eye height above sea level. Leave out to use the DEM height plus 1.6 m.
+    var altitude: Double?
+    /// Compass heading (degrees from true north) of the camera's optical axis.
+    var heading: Double
+    /// Pitch and roll if known (ARKit or the motion sensors). Leave out to search wider.
+    var pitch: Double?
+    var roll: Double?
+    var horizontalFOV: Double
+    /// The real attitude, when known.
+    var truth: Attitude?
+    /// Summits marked in the photo; used to work out `truth` when it is missing.
+    var anchors: [Anchor]?
+    /// DEM directory, relative to this file.
+    var dem: String?
+    var note: String?
+}
+
+struct Arguments {
+    var positional: [String] = []
+    var options: [String: String] = [:]
+
+    init(_ args: ArraySlice<String>) {
+        var it = args.makeIterator()
+        while let a = it.next() {
+            if a.hasPrefix("--") {
+                let key = String(a.dropFirst(2))
+                if let eq = key.firstIndex(of: "=") {
+                    options[String(key[..<eq])] = String(key[key.index(after: eq)...])
+                } else {
+                    options[key] = it.next() ?? ""
+                }
+            } else {
+                positional.append(a)
+            }
+        }
+    }
+
+    func string(_ key: String) -> String? { options[key] }
+    func double(_ key: String) -> Double? { options[key].flatMap(Double.init) }
+    func int(_ key: String) -> Int? { options[key].flatMap(Int.init) }
+
+    func required(_ key: String) throws -> Double {
+        guard let v = double(key) else { throw HarnessError("missing --\(key)") }
+        return v
+    }
+}
+
+struct HarnessError: Error, CustomStringConvertible {
+    let description: String
+    init(_ message: String) { description = message }
+}
+
+func loadTerrain(_ path: String?) throws -> Terrain {
+    let dir = path ?? ProcessInfo.processInfo.environment["PEAK_DEM"] ?? "DEM"
+    let start = Date()
+    let terrain = try Terrain(directory: URL(fileURLWithPath: dir))
+    log(String(format: "Loaded %d DEM tiles from %@ in %.1f s", terrain.tiles.count, dir, Date().timeIntervalSince(start)))
+    return terrain
+}
+
+func log(_ s: String) {
+    FileHandle.standardError.write(Data((s + "\n").utf8))
+}
+
+func timed<T>(_ label: String, _ body: () throws -> T) rethrows -> T {
+    let start = Date()
+    let v = try body()
+    log(String(format: "%@: %.2f s", label, Date().timeIntervalSince(start)))
+    return v
+}
+
+func f(_ v: Double, _ digits: Int = 2) -> String { String(format: "%.\(digits)f", v) }
+func signed(_ v: Double, _ digits: Int = 2) -> String { String(format: "%+.\(digits)f", v) }
+
+// MARK: - horizon
+
+func horizonCommand(_ args: Arguments) throws {
+    let terrain = try loadTerrain(args.string("dem"))
+    let renderer = HorizonRenderer(terrain: terrain)
+    let lat = try args.required("lat"), lon = try args.required("lon")
+    let observer = args.double("altitude").map { GeoPoint(latitude: lat, longitude: lon, height: $0) }
+        ?? renderer.observer(latitude: lat, longitude: lon)
+    var settings = HorizonSettings()
+    if let km = args.double("max-km") { settings.maxDistance = km * 1000 }
+    if let step = args.double("step") { settings.azimuthStep = step }
+    let profile = timed("Horizon (\(Int(360 / settings.azimuthStep)) rays)") { renderer.render(from: observer, settings: settings) }
+
+    let top = profile.elevations.indices.max { profile.elevations[$0] < profile.elevations[$1] }!
+    print("Observer: \(f(lat, 5)), \(f(lon, 5)) at \(f(observer.height, 0)) m")
+    print("Highest point on the skyline: azimuth \(f(profile.azimuth(ofRay: top), 1))°, elevation " +
+          "\(f(Double(profile.elevations[top])))°, \(f(Double(profile.distances[top]) / 1000, 1)) km away")
+    print("Farthest skyline: \(f(Double(profile.distances.max()!) / 1000, 1)) km")
+
+    if let path = args.string("csv") {
+        var csv = "azimuth,elevation,distance\n"
+        for i in 0..<profile.count {
+            csv += "\(f(profile.azimuth(ofRay: i), 2)),\(f(Double(profile.elevations[i]), 4)),\(Int(profile.distances[i]))\n"
+        }
+        try csv.write(toFile: path, atomically: true, encoding: .utf8)
+        print("Wrote \(path)")
+    }
+    if let path = args.string("image") {
+        try saveImage(depthPanorama(profile), to: path)
+        print("Wrote \(path)")
+    }
+}
+
+/// Equirectangular panorama, 10 px per degree: terrain shaded by distance, ridges in white.
+func depthPanorama(_ profile: HorizonProfile) -> RGBImage {
+    let pxPerDegree = 10.0
+    let top = Double(profile.elevations.max()!) + 2
+    let bottom = min(-3, Double(profile.elevations.min()!) - 1)
+    let w = Int(360 * pxPerDegree), h = Int(((top - bottom) * pxPerDegree).rounded(.up))
+    var image = RGBImage(width: w, height: h, fill: (12, 16, 28))
+    for x in 0..<w {
+        let az = (Double(x) + 0.5) / pxPerDegree
+        for y in 0..<h {
+            let el = top - (Double(y) + 0.5) / pxPerDegree
+            guard let d = profile.distance(atAzimuth: az, elevation: el) else { continue }
+            // Near terrain bright, far terrain fading, like haze.
+            let t = min(1, log(1 + d / 1000) / log(151))
+            let v = UInt8(200 - 160 * t)
+            image.set(x, y, (v, v, UInt8(min(255, Double(v) + 20))))
+        }
+        let i = Int((az / profile.azimuthStep).rounded()) % profile.count
+        for ridge in profile.ridges(ofRay: i) {
+            image.set(x, Int((top - Double(ridge.elevation)) * pxPerDegree), (255, 255, 255))
+        }
+    }
+    return image
+}
+
+// MARK: - synth
+
+func synthCommand(_ args: Arguments) throws {
+    guard let out = args.string("out") else { throw HarnessError("missing --out") }
+    let terrain = try loadTerrain(args.string("dem"))
+    let renderer = HorizonRenderer(terrain: terrain)
+    let lat = try args.required("lat"), lon = try args.required("lon")
+    let observer = renderer.observer(latitude: lat, longitude: lon)
+    var settings = HorizonSettings()
+    settings.azimuthStep = 0.05
+    let profile = timed("Horizon") { renderer.render(from: observer, settings: settings) }
+
+    let truth = Attitude(heading: try args.required("heading"), pitch: args.double("pitch") ?? 2, roll: args.double("roll") ?? 0)
+    let fov = args.double("fov") ?? 65
+    let k = CameraIntrinsics(width: args.int("width") ?? 1280, height: args.int("height") ?? 960, horizontalFOV: fov)
+    var scene = SyntheticScene()
+    scene.seed = UInt64(args.int("seed") ?? 1)
+    scene.clouds = args.double("clouds") ?? 0
+    scene.trees = args.double("trees") ?? 0
+    let image = timed("Photo") { SyntheticPhoto.render(profile, camera: Camera(intrinsics: k, attitude: truth), scene: scene) }
+
+    let imagePath = out + "." + defaultImageExtension
+    try saveImage(image, to: imagePath)
+    let photo = PhotoCase(image: URL(fileURLWithPath: imagePath).lastPathComponent, latitude: lat, longitude: lon,
+                          altitude: nil, heading: normalizedAzimuth(truth.heading + (args.double("compass-error") ?? 8)),
+                          pitch: truth.pitch, roll: truth.roll, horizontalFOV: fov, truth: truth, anchors: nil,
+                          dem: nil, note: "synthetic")
+    try writeCase(photo, to: out + ".json")
+    print("Wrote \(imagePath) and \(out).json")
+}
+
+func writeCase(_ photo: PhotoCase, to path: String) throws {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(photo).write(to: URL(fileURLWithPath: path))
+}
+
+// MARK: - align
+
+func alignCommand(_ args: Arguments) throws {
+    guard let casePath = args.positional.first else { throw HarnessError("which case file?") }
+    let caseURL = URL(fileURLWithPath: casePath)
+    var photo = try JSONDecoder().decode(PhotoCase.self, from: Data(contentsOf: caseURL))
+    let base = caseURL.deletingLastPathComponent()
+    let demPath = args.string("dem") ?? photo.dem.map { base.appendingPathComponent($0).path }
+    let terrain = try loadTerrain(demPath)
+    let renderer = HorizonRenderer(terrain: terrain)
+    let observer = photo.altitude.map { GeoPoint(latitude: photo.latitude, longitude: photo.longitude, height: $0) }
+        ?? renderer.observer(latitude: photo.latitude, longitude: photo.longitude)
+    let image = try loadImage(base.appendingPathComponent(photo.image).path)
+    let intrinsics = CameraIntrinsics(width: image.width, height: image.height, horizontalFOV: photo.horizontalFOV)
+    let horizon = timed("Horizon") { renderer.render(from: observer) }
+
+    if photo.truth == nil, let anchors = photo.anchors, !anchors.isEmpty {
+        let initial = Attitude(heading: photo.heading, pitch: photo.pitch ?? 0, roll: photo.roll ?? 0)
+        if let solved = AnchorSolver.attitude(anchors: anchors, observer: observer, intrinsics: intrinsics, initial: initial) {
+            photo.truth = solved.attitude
+            print("Truth from \(anchors.count) marked summit(s): heading \(f(solved.attitude.heading))°, " +
+                  "pitch \(f(solved.attitude.pitch))°, roll \(f(solved.attitude.roll))° (fit \(f(solved.rmsPixels, 1)) px)")
+        }
+    }
+
+    var matcher = SkylineMatcher()
+    if photo.pitch == nil || photo.roll == nil { matcher.settings = .photo }
+    let prior = Attitude(heading: photo.heading, pitch: photo.pitch ?? 0, roll: photo.roll ?? 0)
+    let match = matcher.match(image, intrinsics: intrinsics, prior: prior, horizon: horizon)
+    report(match, truth: photo.truth)
+
+    if let path = args.string("debug") {
+        try saveImage(debugOverlay(match, horizon: horizon), to: path)
+        print("Wrote \(path)")
+    }
+}
+
+func report(_ m: SkylineMatcher.Match, truth: Attitude?) {
+    let a = m.alignment
+    print("Skyline found in \(Int(m.skyline.validFraction * 100))% of columns; \(a.pointCount) points used")
+    print("Heading \(f(m.camera.attitude.heading))° → \(f(a.attitude.heading))° (correction \(signed(a.headingCorrection))°)")
+    print("Pitch correction \(signed(a.pitchCorrection))°, roll correction \(signed(a.rollCorrection))°")
+    print("Fit: \(f(a.rms, 3))° RMS; \(Int(a.inlierFraction * 100))% of points match, \(Int(a.farFraction * 100))% " +
+          "match and are far away; ambiguity \(f(a.ambiguity))")
+    print(a.accepted ? "Accepted" : "Rejected: \(a.rejectionReason ?? "")")
+    if let truth {
+        let before = azimuthDifference(m.camera.attitude.heading, truth.heading)
+        let after = azimuthDifference(a.attitude.heading, truth.heading)
+        print("Heading error: \(signed(before))° before, \(signed(after, 3))° after")
+        print("Pitch error after: \(signed(a.attitude.pitch - truth.pitch, 3))°, " +
+              "roll error after: \(signed(a.attitude.roll - truth.roll, 3))°")
+    }
+    print(String(format: "Matching took %.0f ms", m.seconds * 1000))
+}
+
+/// The working image with the horizon where the sensors put it (red), where the correction
+/// puts it (green), ridges behind the skyline (cyan) and the detected skyline (yellow).
+func debugOverlay(_ m: SkylineMatcher.Match, horizon: HorizonProfile) -> RGBImage {
+    var image = m.image
+    let w = image.width
+    func horizonLine(_ camera: Camera) -> [(Double, Double)] {
+        let projector = camera.projector
+        return (0..<w).map { x in
+            let az = projector.look(x: Double(x) + 0.5, y: Double(image.height) / 2).azimuth
+            guard let p = projector.pixel(azimuth: az, elevation: horizon.elevation(atAzimuth: az)) else { return (.nan, .nan) }
+            return (p.x, p.y)
+        }
+    }
+    let corrected = Camera(intrinsics: m.alignment.intrinsics, attitude: m.alignment.attitude)
+    image.drawPolyline(horizonLine(m.camera), color: (255, 64, 64), thickness: 2, maxGap: 40)
+    let projector = corrected.projector
+    for x in stride(from: 0, to: w, by: 2) {
+        let az = projector.look(x: Double(x) + 0.5, y: Double(image.height) / 2).azimuth
+        let i = Int((az / horizon.azimuthStep).rounded()) % horizon.count
+        for ridge in horizon.ridges(ofRay: i).dropLast() {
+            if let p = projector.pixel(azimuth: horizon.azimuth(ofRay: i), elevation: Double(ridge.elevation)) {
+                image.drawDot(p.x, p.y, radius: 1, color: (0, 220, 255))
+            }
+        }
+    }
+    image.drawPolyline(horizonLine(corrected), color: (64, 255, 96), thickness: 2, maxGap: 40)
+    let detected = (0..<m.skyline.width).map { x -> (Double, Double) in
+        let r = m.skyline.rows[x]
+        return r.isNaN ? (.nan, .nan) : (Double(x) + 0.5, Double(r))
+    }
+    image.drawPolyline(detected, color: (255, 220, 0), thickness: 1, maxGap: 6)
+    return image
+}
+
+// MARK: - detect
+
+func detectCommand(_ args: Arguments) throws {
+    guard let path = args.positional.first else { throw HarnessError("which image?") }
+    let full = try loadImage(path)
+    let width = args.int("width") ?? 960
+    let image = full.width > width ? full.resized(toWidth: width) : full
+    let skyline = timed("Detection") { SkylineDetector().detect(in: image) }
+    let strengths = skyline.strength.sorted()
+    print("Skyline found in \(Int(skyline.validFraction * 100))% of \(skyline.width) columns; " +
+          "median edge strength \(f(Double(strengths[strengths.count / 2])))")
+    if let out = args.string("debug") {
+        var overlay = image
+        let points = (0..<skyline.width).map { x -> (Double, Double) in
+            let r = skyline.rows[x]
+            return r.isNaN ? (.nan, .nan) : (Double(x) + 0.5, Double(r))
+        }
+        overlay.drawPolyline(points, color: (255, 220, 0), thickness: 2, maxGap: 6)
+        try saveImage(overlay, to: out)
+        print("Wrote \(out)")
+    }
+}
+
+// MARK: - bench
+
+struct BenchRun {
+    var before: Double
+    var after: Double
+    var accepted: Bool
+    var seconds: Double
+}
+
+func benchCommand(_ args: Arguments) throws {
+    let terrain = try loadTerrain(args.string("dem"))
+    let renderer = HorizonRenderer(terrain: terrain)
+    let lat = try args.required("lat"), lon = try args.required("lon")
+    let runs = args.int("runs") ?? 30
+    let spread = (args.double("spread-km") ?? 3) * 1000
+    let gpsError = args.double("gps-error") ?? 15
+    let mode = args.string("mode") ?? "arkit"
+    let aim = args.string("aim") ?? "far"
+    var rng = SplitMix64(seed: UInt64(args.int("seed") ?? 1))
+    var results: [BenchRun] = []
+
+    print("Mode: \(mode), aim: \(aim), \(runs) runs within \(f(spread / 1000, 1)) km of \(f(lat, 4)), \(f(lon, 4)); " +
+          "GPS error up to \(f(gpsError, 0)) m")
+    print(" run  heading   fov clouds trees  skyline   before     after  ok    time")
+    for run in 0..<runs {
+        // The real spot, and where the GPS thinks it is.
+        let spot = destination(from: GeoPoint(latitude: lat, longitude: lon), azimuth: 360 * rng.uniform(),
+                               distance: spread * rng.uniform().squareRoot())
+        let truePosition = renderer.observer(latitude: spot.latitude, longitude: spot.longitude)
+        let gps = destination(from: truePosition, azimuth: 360 * rng.uniform(), distance: gpsError * rng.uniform())
+        let believed = renderer.observer(latitude: gps.latitude, longitude: gps.longitude)
+
+        var heading = 360 * rng.uniform()
+        // The photo comes from a finer render at the true spot than the one we match against.
+        var fine = HorizonSettings()
+        fine.azimuthStep = 0.05
+        let world = renderer.render(from: truePosition, settings: fine)
+        if aim == "far" {
+            let far = world.distances.indices.filter { world.distances[$0] >= 5_000 }
+            if !far.isEmpty { heading = world.azimuth(ofRay: far[Int(rng.next() % UInt64(far.count))]) }
+        }
+        let truth = Attitude(heading: heading, pitch: -2 + 8 * rng.uniform(), roll: -4 + 8 * rng.uniform())
+        let fov = 55 + 20 * rng.uniform()
+        let k = CameraIntrinsics(width: 1280, height: 960, horizontalFOV: fov)
+        var scene = SyntheticScene()
+        scene.seed = rng.next()
+        scene.clouds = rng.uniform() < 0.5 ? 0.5 * rng.uniform() : 0
+        scene.trees = rng.uniform() < 0.4 ? 0.3 * rng.uniform() : 0
+
+        let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth), scene: scene)
+        let horizon = renderer.render(from: believed)
+
+        let compassError = max(-18, min(18, 8 * rng.gaussian()))
+        var prior = truth
+        prior.heading = normalizedAzimuth(truth.heading + compassError)
+        var matcher = SkylineMatcher()
+        if mode == "photo" {
+            prior.pitch = 0
+            prior.roll = 0
+            matcher.settings = .photo
+        } else {
+            prior.pitch += 0.4 * rng.gaussian()
+            prior.roll += 0.4 * rng.gaussian()
+        }
+        let m = matcher.match(photo, intrinsics: k, prior: prior, horizon: horizon)
+        let after = azimuthDifference(m.alignment.attitude.heading, truth.heading)
+        // Median distance of the skyline across the view.
+        let half = fov / 2
+        let inView = horizon.distances.indices.filter {
+            abs(azimuthDifference(horizon.azimuth(ofRay: $0), truth.heading)) <= half
+        }.map { Double(horizon.distances[$0]) }.sorted()
+        let skylineKm = inView.isEmpty ? 0 : inView[inView.count / 2] / 1000
+        let r = BenchRun(before: compassError, after: after, accepted: m.alignment.accepted, seconds: m.seconds)
+        results.append(r)
+        print(String(format: "%4d  %6.1f°  %3.0f°  %4.2f  %4.2f  %5.1f km  %+6.2f°  %+7.3f°  %@  %4.0f ms",
+                     run + 1, truth.heading, fov, scene.clouds, scene.trees, skylineKm, r.before, r.after,
+                     r.accepted ? "yes" : " no", r.seconds * 1000)
+              + (m.alignment.rejectionReason.map { "  (\($0))" } ?? ""))
+        if let dir = args.string("save") {
+            try saveImage(debugOverlay(m, horizon: horizon), to: "\(dir)/run\(run + 1).\(defaultImageExtension)")
+        }
+    }
+
+    let summary = benchSummary(results, mode: mode, aim: aim)
+    print("\n" + summary)
+    if let path = args.string("markdown") {
+        try summary.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
+func benchSummary(_ results: [BenchRun], mode: String, aim: String) -> String {
+    func stats(_ v: [Double]) -> (median: Double, p90: Double, max: Double) {
+        let s = v.map(abs).sorted()
+        guard !s.isEmpty else { return (.nan, .nan, .nan) }
+        return (s[s.count / 2], s[min(s.count - 1, Int(Double(s.count) * 0.9))], s.last!)
+    }
+    let accepted = results.filter(\.accepted)
+    let before = stats(results.map(\.before))
+    let after = stats(accepted.map(\.after))
+    let bad = accepted.filter { abs($0.after) > 0.5 }.count
+    var md = "| Heading error (\(mode) mode, aim \(aim)) | median | 90th percentile | worst |\n|---|---|---|---|\n"
+    md += "| Compass (before) | \(f(before.median))° | \(f(before.p90))° | \(f(before.max))° |\n"
+    md += "| Skyline matched (after) | \(f(after.median, 3))° | \(f(after.p90, 3))° | \(f(after.max, 3))° |\n\n"
+    md += "Accepted \(accepted.count) of \(results.count) frames; \(bad) accepted with an error over 0.5°. "
+    md += String(format: "Median matching time %.0f ms.\n", stats(results.map(\.seconds)).median * 1000)
+    return md
+}
+
+// MARK: - main
+
+let argv = CommandLine.arguments
+guard argv.count >= 2 else {
+    print(usage)
+    exit(1)
+}
+let args = Arguments(argv.dropFirst(2))
+do {
+    switch argv[1] {
+    case "horizon": try horizonCommand(args)
+    case "synth": try synthCommand(args)
+    case "align": try alignCommand(args)
+    case "bench": try benchCommand(args)
+    case "detect": try detectCommand(args)
+    case "case": try caseCommand(args)
+    case "help", "-h", "--help": print(usage)
+    default:
+        print(usage)
+        exit(1)
+    }
+} catch {
+    log("error: \(error)")
+    exit(1)
+}
