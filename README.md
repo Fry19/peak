@@ -2,11 +2,50 @@
 
 An iPhone app that labels the mountains in your camera view and stays lined up with them. Phone compasses are often 5–15° off, which is why other peak apps drift. Peak corrects the heading by matching the skyline the camera sees against the skyline the terrain says should be there.
 
-This repo holds the first milestone from the [project brief](CLAUDE.md): the skyline matching itself, built and measured at a desk before any UI.
+This repo holds the skyline matching from the [project brief](CLAUDE.md), built and measured at a desk first, and a first version of the iPhone app (0.1) that uses it in a live camera view.
 
 ![Synthetic photo toward the Matterhorn from Gornergrat. Red: the horizon where an 8° wrong compass puts it. Green: after skyline matching. Yellow: the detected skyline. Cyan: ridges behind the skyline.](docs/matterhorn-aligned.jpg)
 
 *Red is where an 8° wrong compass puts the horizon, green is after correction (0.02° off), yellow is the detected skyline, and cyan marks ridges behind it.*
+
+## The app (0.1)
+
+Peak opens straight into the camera. The first time you use it somewhere, it downloads the terrain and the named peaks for 80 km around you and keeps them, so the same area works offline afterwards. Then it draws:
+
+- the skyline and the ridges in front of it as thin glowing lines, nearer ones brighter and farther ones fading;
+- labels (name and height) for up to 10 of the highest peaks you can actually see. Peaks hidden behind a nearer ridge aren't labeled.
+
+About once a second, while the phone is steady enough for ARKit to track, Peak matches the skyline in the camera picture against the terrain and corrects the compass. The pill at the bottom shows which mode it's in:
+
+- **Locked to the skyline** (green): the last match was within 20 seconds. It also shows how far off your compass was.
+- **Using the compass** (orange): no match yet. Point the phone at mountains with a clear skyline.
+
+Tap anywhere to freeze the view so you can lower the phone and look; tap again to go live. A light tick marks a labeled peak crossing the middle of the screen.
+
+**Downloads:** terrain comes as 1° tiles of about 40 MB each, and 80 km around you is usually 4 to 9 tiles, so set it up on Wi-Fi. Peaks come from OpenStreetMap through the Overpass API (a few hundred KB). Both are cached on the phone.
+
+Not in 0.1 yet: tapping a peak for details, trails, downloading a region ahead of time, and a learned skyline detector. The app has only been built in CI, not tried on a phone yet, so expect rough edges.
+
+## Installing on your iPhone
+
+You need an iPhone with iOS 17 or later. Both ways work with a free Apple ID; with a free Apple ID the app stops opening after 7 days until you refresh or reinstall it.
+
+### Option 1: Sideload the IPA (no Xcode)
+
+Every push builds an unsigned `Peak.ipa`: open the latest **Build** run under the repo's Actions tab and download the **Peak-ipa** artifact (a zip with the IPA inside). Tagged versions (`v0.1.0` and so on) also put `Peak_<version>.ipa` on the Releases page.
+
+iPhones can't install an app file directly, so a sideloading tool signs it with your Apple ID:
+
+- **SideStore** installs and refreshes apps from the iPhone itself. Setting it up needs a computer once; follow the guide at [sidestore.io](https://sidestore.io). Then open SideStore, go to **My Apps**, tap **+** and pick the IPA. Open SideStore at least once a week and tap **Refresh All**.
+- **Sideloadly** installs from a Mac or Windows PC over a cable: drag the IPA into [Sideloadly](https://sideloadly.io), enter your Apple ID and click **Start**. Do it again within 7 days, or turn on its automatic refresh.
+
+The first time, also turn on **Settings → Privacy & Security → Developer Mode** and restart the iPhone, then trust your Apple ID under **Settings → General → VPN & Device Management**.
+
+### Option 2: Build it in Xcode
+
+On a Mac with Xcode 16 or later: open `Peak.xcodeproj`, select the **Peak** target, set **Signing & Capabilities → Team** to your Apple ID (change the bundle identifier `com.fry19.peak` if Xcode says it's taken), pick your iPhone and press **Run**.
+
+When Peak starts, allow the camera and your location.
 
 ## Where it stands
 
@@ -87,6 +126,10 @@ iPhone photos record where they were taken and which way the camera faced (the c
 ## Project layout
 
 ```
+Peak.xcodeproj
+Peak/                      The iPhone app (SwiftUI and ARKit)
+  Model/                   Location, downloads and caching, skyline correction, projection to the screen
+  Views/                   Camera, overlay with ridgelines and labels, status pill
 PeakCore/                  Swift package, no iOS dependencies (builds on macOS and Linux)
   Sources/PeakCore/
     Geodesy.swift          WGS84, east-north-up frames, conformal-sphere rays
@@ -97,6 +140,10 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
     Aligner.swift          Heading, pitch and roll from skyline vs horizon, with gates
     SkylineMatcher.swift   Detection and alignment for one frame
     Anchors.swift          True attitude of a real photo from marked summits
+    Scene.swift            Ridge segments to draw and visible peaks
+    GeoTIFF.swift          Reads Copernicus tiles on the phone (with Inflate.swift)
+    Peaks.swift            Peaks from OpenStreetMap's Overpass API
+    UprightFrame.swift     Turns sideways camera frames so the sky is up
     SyntheticPhoto.swift   Fake photos with a known camera, for testing
     Image.swift            RGB images, PPM files, drawing
   Sources/peakbench/       The desk harness
@@ -112,17 +159,20 @@ A `.pkdem` file is a 64-byte header (magic `PKDM`, version, south and west edge 
 GitHub Actions runs on every push:
 
 - **PeakCore tests** on macOS and on Linux.
+- **Build app**: archives the app for iPhone and uploads an unsigned `Peak.ipa` as the `Peak-ipa` artifact.
 - **Skyline matching benchmark** on macOS: downloads the DEM (cached between runs), runs the three benchmarks above, and posts the tables in the job summary. The panorama, the Matterhorn example and the benchmark frames are saved as a `skyline-matching` artifact.
+
+**Release** runs when a `v*` tag is pushed (or by hand with a tag name): it builds `Peak_<version>.ipa` and publishes it on the Releases page.
 
 ## Next
 
 - Run it on real photos with marked summits, and tune detection on them.
 - Match the detected boundary against the rendered ridges too, not just the skyline. In haze, the far skyline can fade into the sky while a nearer ridge stays sharp.
 - A small Core ML sky segmentation model in place of the heuristic.
-- Live ARKit view: apply the correction as a yaw offset to world tracking, filter it over time, and keep ARKit tracking between corrections.
+- Try the app on a phone in the mountains, and tune matching on real camera frames.
 - Offline region packs with a coarser DEM for far distances, plus peaks and trails from OpenStreetMap.
 - Better summit heights (see above).
 
 ## Data and attribution
 
-Terrain: produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018, provided under COPERNICUS by the European Union and ESA; all rights reserved. The app will need to show this attribution, and OpenStreetMap's (ODbL) once peaks and trails are in.
+Terrain: produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018, provided under COPERNICUS by the European Union and ESA; all rights reserved. Peaks: © OpenStreetMap contributors, available under the Open Database License (ODbL). The app shows both in small print under the status pill.

@@ -57,6 +57,15 @@ jobs:
           # An ad-hoc signature; sideloading tools replace it with one from your Apple ID.
           codesign --force --sign - Payload/Peak.app
           zip -qry Peak.ipa Payload
+      - name: Check the app bundle
+        run: |
+          APP=Payload/Peak.app
+          ls -la "$APP"
+          echo "Binary: $(stat -f%z "$APP/Peak") bytes; IPA: $(stat -f%z Peak.ipa) bytes"
+          # The skyline matcher and the terrain download must be in the binary.
+          strings "$APP/Peak" | grep -q "copernicus-dem-30m" || { echo "terrain download missing"; exit 1; }
+          nm "$APP/Peak" | grep -q "SkylineMatcher" || { echo "PeakCore missing"; exit 1; }
+          plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleShortVersionString|NSCameraUsageDescription|NSLocationWhenInUseUsageDescription"
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:

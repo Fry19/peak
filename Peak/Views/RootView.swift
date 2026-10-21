@@ -16,11 +16,14 @@ struct RootView: View {
             }
             OverlayView(model: model)
                 .ignoresSafeArea()
-            VStack {
+            VStack(spacing: 10) {
                 Spacer()
                 StatusPill(model: model)
-                    .padding(.bottom, 24)
+                Text("Terrain © Copernicus DEM (DLR, Airbus) · Peaks © OpenStreetMap contributors")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.white.opacity(0.45))
             }
+            .padding(.bottom, 12)
         }
         .background(Color.black)
         .contentShape(Rectangle())
