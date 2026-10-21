@@ -273,12 +273,15 @@ extension Trail {
 }
 
 extension Overpass {
-    /// Hiking routes and named paths within `radius` meters of a point, with their
+    /// Hiking routes and named paths within `radius` meters of a point, and graded paths
+    /// without a name within `summitRadius` (often the way up a summit), with their
     /// geometry clipped to `clip` meters around it.
-    public static func trailsQuery(latitude: Double, longitude: Double, radius: Double, clip: Double) -> String {
+    public static func trailsQuery(latitude: Double, longitude: Double, radius: Double, clip: Double,
+                                   summitRadius: Double = 400) -> String {
         let dlat = clip / 111_000, dlon = clip / (111_000 * max(cos(latitude * .pi / 180), 0.05))
         let box = String(format: "%.5f,%.5f,%.5f,%.5f", latitude - dlat, longitude - dlon, latitude + dlat, longitude + dlon)
         let around = String(format: "around:%.0f,%.6f,%.6f", radius, latitude, longitude)
+        let summit = String(format: "around:%.0f,%.6f,%.6f", summitRadius, latitude, longitude)
         return """
         [out:json][timeout:60];
         relation["route"~"^(hiking|foot)$"](\(around))->.routes;
@@ -288,6 +291,7 @@ extension Overpass {
         (
           way["highway"~"^(path|bridleway)$"]["name"](\(around));
           way["highway"~"^(footway|steps|track)$"]["name"]["sac_scale"](\(around));
+          way["highway"~"^(path|footway|steps)$"]["sac_scale"][!"name"](\(summit));
         );
         out tags geom(\(box));
         """
@@ -376,6 +380,22 @@ extension Overpass {
             trails.append(Trail(id: "p:" + name, name: name, kind: .path, lines: lines,
                                 difficulty: ways.compactMap { wayDifficulty[$0.id] }.max(),
                                 operatorName: ways.lazy.compactMap { $0.tags?["operator"] }.first, isPartial: partial))
+        }
+        // Graded paths without a name (fetched only near the summit), joined where they meet.
+        let unnamed = elements.filter {
+            $0.type == "way" && $0.geometry != nil && !routeWays.contains($0.id) && ($0.tags?["name"] ?? "").isEmpty
+        }
+        let unnamedParts = unnamed.map { (way: $0, pieces: pieces($0.geometry ?? [])) }
+        for line in Trail.chain(unnamedParts.flatMap(\.pieces)) {
+            let points = Set(line.map { [Int(($0.latitude * 1e6).rounded()), Int(($0.longitude * 1e6).rounded())] })
+            let ways = unnamedParts.filter { part in
+                part.pieces.contains { piece in piece.contains { points.contains([Int(($0.latitude * 1e6).rounded()), Int(($0.longitude * 1e6).rounded())]) } }
+            }.map(\.way)
+            let difficulty = ways.compactMap { wayDifficulty[$0.id] }.max()
+            let id = ways.map(\.id).min().map { "u\($0)" } ?? "u"
+            trails.append(Trail(id: id, name: "Unnamed path" + (difficulty.map { " (\($0.grade))" } ?? ""), kind: .path,
+                                lines: [line], difficulty: difficulty,
+                                isPartial: ways.contains { $0.geometry?.contains(where: { $0 == nil }) ?? false }))
         }
         return trails.filter { $0.mappedLength >= minLength }
     }

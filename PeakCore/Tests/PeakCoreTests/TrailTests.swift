@@ -53,11 +53,22 @@ final class TrailTests: XCTestCase {
           {"type":"way","id":21,"tags":{"highway":"path","name":"Lake Path"},
            "geometry":[{"lat":46.108,"lon":7.10},{"lat":46.104,"lon":7.10},null,{"lat":46.2,"lon":7.2}]},
           {"type":"way","id":30,"tags":{"highway":"path","name":"Short Cut"},
-           "geometry":[{"lat":46.30,"lon":7.30},{"lat":46.301,"lon":7.30}]}
+           "geometry":[{"lat":46.30,"lon":7.30},{"lat":46.301,"lon":7.30}]},
+          {"type":"way","id":41,"tags":{"highway":"path","sac_scale":"demanding_alpine_hiking"},
+           "geometry":[{"lat":46.40,"lon":7.40},{"lat":46.403,"lon":7.40}]},
+          {"type":"way","id":40,"tags":{"highway":"path","sac_scale":"alpine_hiking"},
+           "geometry":[{"lat":46.403,"lon":7.40},{"lat":46.406,"lon":7.40}]}
         ]}
         """
         let trails = try Overpass.trails(fromJSON: Data(json.utf8)).sorted { $0.name < $1.name }
-        XCTAssertEqual(trails.map(\.name), ["Hörnli Trail", "Lake Path"])
+        XCTAssertEqual(trails.map(\.name), ["Hörnli Trail", "Lake Path", "Unnamed path (T5)"])
+
+        // Two unnamed graded ways that meet make one path, as hard as its hardest part.
+        let unnamed = trails[2]
+        XCTAssertEqual(unnamed.id, "u40")
+        XCTAssertEqual(unnamed.lines.count, 1)
+        XCTAssertEqual(unnamed.lines[0].count, 3)
+        XCTAssertEqual(unnamed.difficulty, .demandingAlpineHiking)
 
         let route = trails[0]
         XCTAssertEqual(route.id, "r10")
@@ -79,6 +90,7 @@ final class TrailTests: XCTestCase {
         let query = Overpass.trailsQuery(latitude: 45.9763, longitude: 7.6586, radius: 5_000, clip: 12_000)
         XCTAssertTrue(query.contains("around:5000,45.976300,7.658600"))
         XCTAssertTrue(query.contains("out tags geom("))
+        XCTAssertTrue(query.contains("[!\"name\"](around:400,45.976300,7.658600)"))
     }
 
     /// A trail straight up a cone climbs the cone's height and starts at its foot.
