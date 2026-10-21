@@ -18,8 +18,11 @@ peakbench: desk test harness for skyline matching.
 
   peakbench bench --dem DIR --lat L --lon L [--runs N] [--spread-km K] [--gps-error M]
                   [--mode arkit|photo] [--aim far|any] [--seed S] [--markdown FILE] [--save DIR]
+                  [--compass-sigma D] [--compass-max D] [--heading-range D]
       Monte Carlo test on synthetic photos of the real terrain around a point. By default
       the camera aims where the skyline is at least 5 km away, as when pointing at peaks.
+      Compass errors are Gaussian (default σ 8°, at most 18°); --heading-range overrides
+      the matcher's heading search (± degrees).
 
   peakbench detect IMAGE [--width W] [--debug FILE]
       Run only the skyline detector and draw what it found.
@@ -512,6 +515,7 @@ func benchCommand(_ args: Arguments) throws {
     let gpsError = args.double("gps-error") ?? 15
     let mode = args.string("mode") ?? "arkit"
     let aim = args.string("aim") ?? "far"
+    let compassSigma = args.double("compass-sigma") ?? 8, compassMax = args.double("compass-max") ?? 18
     var rng = SplitMix64(seed: UInt64(args.int("seed") ?? 1))
     var results: [BenchRun] = []
 
@@ -546,7 +550,7 @@ func benchCommand(_ args: Arguments) throws {
         let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth), scene: scene)
         let horizon = renderer.render(from: believed)
 
-        let compassError = max(-18, min(18, 8 * rng.gaussian()))
+        let compassError = max(-compassMax, min(compassMax, compassSigma * rng.gaussian()))
         var prior = truth
         prior.heading = normalizedAzimuth(truth.heading + compassError)
         var matcher = SkylineMatcher()
@@ -558,6 +562,7 @@ func benchCommand(_ args: Arguments) throws {
             prior.pitch += 0.4 * rng.gaussian()
             prior.roll += 0.4 * rng.gaussian()
         }
+        if let range = args.double("heading-range") { matcher.settings.headingRange = range }
         let m = matcher.match(photo, intrinsics: k, prior: prior, horizon: horizon)
         let after = azimuthDifference(m.alignment.attitude.heading, truth.heading)
         // Median distance of the skyline across the view.

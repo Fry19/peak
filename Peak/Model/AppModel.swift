@@ -26,10 +26,16 @@ final class AppModel {
 
         /// The compass error, degrees.
         var heading = 0.0
-        /// Pitch and roll for the phone held upright and held sideways. A camera mounted a
-        /// little askew tilts the view one way upright and another way sideways, so each
-        /// keeps its own; they're saved, since they belong to the phone.
+        /// Pitch and roll for the phone held upright and held sideways, as skyline matches
+        /// have measured them. A camera mounted a little askew tilts the view one way upright
+        /// and another way sideways, so each keeps its own; they're saved, since they belong
+        /// to the phone. A phone's camera is never more than `maxLevel` off its sensors, so
+        /// anything beyond is a bad fit and isn't kept.
         var level = [Level(), Level()]
+        static let maxLevel = 2.0
+        /// What lining up by hand added to the level, for now only: a guess made against a
+        /// misread mountain, or to make up for the compass, mustn't stay with the phone.
+        var byHandLevel = [Level(), Level()]
         var matches = 0
         var lastMatch: Date?
         var lastRMS = 0.0
@@ -45,8 +51,9 @@ final class AppModel {
         }
 
         func view(sideways: Bool) -> ViewCorrection {
-            let l = level[sideways ? 1 : 0]
-            return ViewCorrection(heading: heading, pitch: l.pitch, roll: l.roll)
+            let i = sideways ? 1 : 0
+            return ViewCorrection(heading: heading, pitch: level[i].pitch + byHandLevel[i].pitch,
+                                  roll: level[i].roll + byHandLevel[i].roll)
         }
 
         mutating func add(_ o: SkylineCorrector.Outcome) {
@@ -56,11 +63,22 @@ final class AppModel {
             let first = matches == 0
             heading += first ? o.delta : 0.5 * o.delta
             let i = o.sideways ? 1 : 0
-            level[i].pitch = max(-10, min(10, level[i].pitch + (first ? 0.5 : 0.3) * o.pitchDelta))
-            level[i].roll = max(-10, min(10, level[i].roll + (first ? 0.5 : 0.3) * o.rollDelta))
+            let gain = first ? 0.5 : 0.3
+            // The match measures the whole level, the part from lining up by hand included:
+            // the saved level moves toward what it measured, and the hand's part fades out.
+            let pitch = level[i].pitch + byHandLevel[i].pitch + o.pitchDelta
+            let roll = level[i].roll + byHandLevel[i].roll + o.rollDelta
+            level[i].pitch = Self.bounded(level[i].pitch + gain * (pitch - level[i].pitch))
+            level[i].roll = Self.bounded(level[i].roll + gain * (roll - level[i].roll))
+            byHandLevel[i].pitch *= 1 - gain
+            byHandLevel[i].roll *= 1 - gain
             matches += 1
             lastMatch = Date()
             lastRMS = o.rms
+        }
+
+        static func bounded(_ degrees: Double) -> Double {
+            max(-maxLevel, min(maxLevel, degrees))
         }
     }
 
@@ -311,39 +329,52 @@ final class AppModel {
         aligning = false
         frozen = nil
         correction.byHand = Date()
-        saveCalibration()
         updateCorrector()
     }
 
-    /// Back to the plain compass and level for the way the phone is held.
+    /// Back to the plain compass and level for the way the phone is held, the saved level
+    /// included.
     func resetAlignment() {
-        let sideways = CameraGeometry.isSideways(frozen?.pose ?? motion.pose)
-        let before = correction.view(sideways: sideways)
-        adjust(heading: -before.heading, pitch: -before.pitch, roll: -before.roll)
+        let i = CameraGeometry.isSideways(frozen?.pose ?? motion.pose) ? 1 : 0
+        let before = correction.view(sideways: i == 1)
+        correction.heading = 0
+        correction.level[i] = .init()
+        correction.byHandLevel[i] = .init()
+        if frozen != nil {
+            frozen?.correction.heading -= before.heading
+            frozen?.correction.pitch -= before.pitch
+            frozen?.correction.roll -= before.roll
+        }
         correction.lastMatch = nil
         correction.byHand = nil
+        saveCalibration()
     }
 
-    /// Moves the lines: heading, pitch and roll changes in degrees.
+    /// Moves the lines: heading, pitch and roll changes in degrees. Only for now: the level
+    /// saved with the phone is what skyline matches measure.
     func adjust(heading: Double, pitch: Double, roll: Double) {
         let i = CameraGeometry.isSideways(frozen?.pose ?? motion.pose) ? 1 : 0
         correction.heading += heading
-        let level = correction.level[i]
-        correction.level[i].pitch = max(-10, min(10, level.pitch + pitch))
-        correction.level[i].roll = max(-10, min(10, level.roll + roll))
+        let before = correction.byHandLevel[i]
+        correction.byHandLevel[i].pitch = max(-10, min(10, before.pitch + pitch))
+        correction.byHandLevel[i].roll = max(-10, min(10, before.roll + roll))
         if frozen != nil {
             frozen?.correction.heading += heading
-            frozen?.correction.pitch += correction.level[i].pitch - level.pitch
-            frozen?.correction.roll += correction.level[i].roll - level.roll
+            frozen?.correction.pitch += correction.byHandLevel[i].pitch - before.pitch
+            frozen?.correction.roll += correction.byHandLevel[i].roll - before.roll
         }
     }
 
-    private static let calibrationKey = "levelCalibration"
+    /// Lining up by hand used to be saved into the level too, so what's under the old key
+    /// may hold a guess; it's dropped, and matches measure the level again.
+    private static let calibrationKey = "measuredLevel"
+    private static let oldCalibrationKey = "levelCalibration"
 
     private func loadCalibration() {
+        UserDefaults.standard.removeObject(forKey: Self.oldCalibrationKey)
         guard let data = UserDefaults.standard.data(forKey: Self.calibrationKey),
               let level = try? JSONDecoder().decode([Correction.Level].self, from: data), level.count == 2 else { return }
-        correction.level = level
+        correction.level = level.map { .init(pitch: Correction.bounded($0.pitch), roll: Correction.bounded($0.roll)) }
     }
 
     private func saveCalibration() {
@@ -812,6 +843,10 @@ final class AppModel {
         lines.append(String(format: "correction: heading %+.2f° (skyline %+.2f°, north %+.2f°), pitch %+.2f°, roll %+.2f° (%@)",
                             c.heading, correction.heading, motion.northCorrection, c.pitch, c.roll,
                             CameraGeometry.isSideways(motion.pose) ? "sideways" : "upright"))
+        let i = CameraGeometry.isSideways(motion.pose) ? 1 : 0
+        lines.append(String(format: "level: measured pitch %+.2f° roll %+.2f°, by hand pitch %+.2f° roll %+.2f°",
+                            correction.level[i].pitch, correction.level[i].roll,
+                            correction.byHandLevel[i].pitch, correction.byHandLevel[i].roll))
         lines.append(String(format: "%ld matches", correction.matches))
         if let o = lastOutcome {
             lines.append(o.accepted ? String(format: "last match: ok %+.2f°, %.2f° rms, %.0f ms", o.delta, o.rms, o.seconds * 1000)
