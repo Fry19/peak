@@ -2,13 +2,13 @@
 
 An iPhone app that labels the mountains in your camera view and stays lined up with them. Phone compasses are often 5–15° off, which is why other peak apps drift. Peak corrects the heading by matching the skyline the camera sees against the skyline the terrain says should be there.
 
-This repo holds the skyline matching from the [project brief](CLAUDE.md), built and measured at a desk first, and the iPhone app (0.7) that uses it in a live camera view, with peak details and hikes.
+This repo holds the skyline matching from the [project brief](CLAUDE.md), built and measured at a desk first, and the iPhone app (0.8) that uses it in a live camera view, with peak details and hikes.
 
 ![Synthetic photo toward the Matterhorn from Gornergrat. Red: the horizon where an 8° wrong compass puts it. Green: after skyline matching. Yellow: the detected skyline. Cyan: ridges behind the skyline.](docs/matterhorn-aligned.jpg)
 
 *Red is where an 8° wrong compass puts the horizon, green is after correction (0.02° off), yellow is the detected skyline, and cyan marks ridges behind it.*
 
-## The app (0.7)
+## The app (0.8)
 
 Peak opens straight into the camera. The lines and labels stay on the mountains as you move the phone, the way PeakVisor's do: the phone's motion sensors (gyroscope, accelerometer and compass) give its orientation. Since the mountains are kilometers away, only the phone's rotation matters, so there's no ARKit world tracking to wait for. It works in portrait and landscape.
 
@@ -21,9 +21,9 @@ The first time you use it somewhere, it downloads the terrain and the named peak
 
 The overlay costs the main thread about a millisecond a frame: the lines are drawn on the GPU with Metal (each segment an instanced quad, shaded with its line and glow in one pass), and each label is drawn once into an image that is then only moved. Skyline matching and building the view run below the interface's priority. Ridges nearer than 1 km aren't drawn (in town they're mostly houses and trees), and the sharp terrain around you blends into the coarser terrain beyond over its last few pixels, so its edges don't show up as lines.
 
-**Tap a label or a dot** for the peak's card: elevation, prominence, distance, bearing, how far above you it is, its range, first ascent and a Wikipedia summary and picture, and the **hikes nearby**: OpenStreetMap hiking routes and named paths within 5 km of the summit (10 km when there are none that close), plus unnamed paths up to it, with length, climb, difficulty on the SAC scale (T1–T6) and how far the start is from you. Those that reach the summit come first. A hike's card has a satellite map, an elevation profile and directions to the start. **Show on the mountain** lays the trail on the real slope in the camera view, leaving out the parts hidden behind nearer terrain.
+**Tap a label or a dot** for the peak's card: elevation, prominence, distance, bearing, how far above you it is, its range, first ascent and a Wikipedia summary and picture, and the **hikes nearby**: OpenStreetMap hiking routes and named paths within 8 km of the summit, plus unnamed paths up to it, with length, climb, difficulty on the SAC scale (T1–T6) and how far the start is from you. Those that reach the summit come first. A hike's card has a satellite map, an elevation profile and directions to the start. **Show on the mountain** lays the trail on the real slope in the camera view, leaving out the parts hidden behind nearer terrain.
 
-The **list button** (bottom left) lists every peak around you, those in view first, with search; picking one highlights it in the view, with an arrow at the edge when it's out of frame. **Settings** (bottom right): meters or feet, how many labels, ridges, the haptic tick, terrain on mobile data, saving the area for offline use, and storage.
+The **list button** (bottom left) lists every peak around you, those in view first, with search; picking one highlights it in the view, with an arrow at the edge when it's out of frame. **Settings** (bottom right): meters or feet, how many labels, ridges, the haptic tick, terrain on mobile data, **offline areas**, and storage.
 
 ### Staying lined up
 
@@ -38,9 +38,11 @@ Labels stand upright in the world whichever way you hold the phone, even with th
 
 **Tap the pill** to pause the view so you can lower the phone and look; tap it again to go live. **Long-press the pill** for diagnostics (sensor rate, heading, corrections, last skyline match, GPS, terrain detail, lens, frame timing); a screenshot of them says a lot when something looks off. A light tick marks a labeled peak crossing the middle of the screen.
 
-**Downloads:** the Copernicus tiles have lower-resolution copies built in, and the full 30 m image is stored in blocks of about 2.5 MB. Peak starts downloading as soon as it has a rough position, fetching tiles at 240 m (about 0.6 MB each) and 120 m within 30 km (2 MB), all at once, and shows the view as soon as the tile you're in arrives. Then it sharpens the terrain block by block: the full 30 m within 10 km, 60 m within 35 km and 120 m everywhere, and 30 m within 15–25 km on Wi-Fi (or on mobile data, unless you turn that off). Peaks and hikes come from OpenStreetMap through the Overpass API, facts from Wikidata and Wikipedia. Everything is cached on the phone; **Save this area for offline use** fetches the sharpest terrain for the whole area.
+**Downloads:** the Copernicus tiles have lower-resolution copies built in, and the full 30 m image is stored in blocks of about 2.5 MB. Peak starts downloading as soon as it has a rough position, fetching tiles at 240 m (about 0.6 MB each) and 120 m within 30 km (2 MB), all at once, and shows the view as soon as the tile you're in arrives. Then it sharpens the terrain block by block: the full 30 m within 10 km, 60 m within 35 km and 120 m everywhere, and 30 m within 15–25 km on Wi-Fi (or on mobile data, unless you turn that off). Peaks and hikes come from OpenStreetMap through the Overpass API, facts from Wikidata and Wikipedia. Everything is cached on the phone. The hikes search asks two Overpass servers at once and takes the first good answer (then tries two more); a server that answers but reports the query ran out of time counts as busy, not as "no hikes".
 
-Not in 0.7 yet: a learned skyline detector, your position on a trail, and lidar terrain.
+**Offline areas** (Settings): before a trip without a signal, pick a place on a map (search for, say, Great Smoky Mountains), choose a radius of 5–50 km and download it. Peak fetches what the view needs anywhere in the circle: 30 m terrain within 10 km of it, 60 m within 35 km, 120 m for everything that can be seen from it (80 km), the peaks in that range, and the hikes of every peak in it. It shows the size first (about 70 MB for 25 km in the Smokies), the progress while downloading, and resumes a download that stopped. Inside a saved area the peaks and hikes come from the phone, without waiting on the network. Deleting an area keeps the terrain another area, or the place you are, still uses.
+
+Not in 0.8 yet: a learned skyline detector, your position on a trail, and lidar terrain.
 
 ## Installing on your iPhone
 
@@ -144,10 +146,10 @@ iPhone photos record where they were taken and which way the camera faced (the c
 ```
 Peak.xcodeproj
 Peak/                      The iPhone app (SwiftUI)
-  Model/                   Motion sensors, camera and lens, location, downloads and caching, skyline
-                           correction, settings
+  Model/                   Motion sensors, camera and lens, location, downloads, caching and offline
+                           areas, skyline correction, settings
   Views/                   Camera screen and overlay (ridgelines, labels, trails), status pill, peak
-                           and hike cards, peak list, settings
+                           and hike cards, peak list, settings, offline areas
 PeakCore/                  Swift package, no iOS dependencies (builds on macOS and Linux)
   Sources/PeakCore/
     Geodesy.swift          WGS84, east-north-up frames, conformal-sphere rays
@@ -181,7 +183,7 @@ GitHub Actions runs on every push:
 
 - **PeakCore tests** on macOS and on Linux.
 - **Build app**: archives the app for iPhone and uploads the unsigned `Peak.ipa` as an artifact (not zipped).
-- **Skyline matching benchmark** on macOS: downloads the DEM (cached between runs), runs the three benchmarks above, and posts the tables in the job summary. It also checks live data: decoding a Copernicus tile block by block against the whole image, the hikes near the Matterhorn from Overpass (with their climb and how much of each is in sight from Gornergrat), and the Matterhorn's Wikidata and Wikipedia facts. The panorama, the Matterhorn example, the benchmark frames and the live data are saved as a `skyline-matching` artifact.
+- **Skyline matching benchmark** on macOS: downloads the DEM (cached between runs), runs the three benchmarks above, and posts the tables in the job summary. It also checks live data: decoding a Copernicus tile block by block against the whole image, the hikes near the Matterhorn from Overpass (with their climb and how much of each is in sight from Gornergrat), the hikes near Mount Le Conte in the Smokies, the download for a 30 km offline area there, and the Matterhorn's Wikidata and Wikipedia facts. The panorama, the Matterhorn example, the benchmark frames and the live data are saved as a `skyline-matching` artifact.
 
 **Release** runs when a `v*` tag is pushed (or by hand with a tag name): it builds `Peak_<version>.ipa` and publishes it on the Releases page.
 
@@ -191,7 +193,6 @@ GitHub Actions runs on every push:
 - Match the detected boundary against the rendered ridges too, not just the skyline. In haze, the far skyline can fade into the sky while a nearer ridge stays sharp.
 - A small Core ML sky segmentation model in place of the heuristic.
 - Try the app on a phone in the mountains, and tune matching on real camera frames.
-- Prebuilt offline region packs, including the hikes for every peak.
 - Lidar terrain where it's free: swissALTI3D, and USGS 3DEP (10 m) in the US.
 - Your live position on a trail drawn in the view.
 

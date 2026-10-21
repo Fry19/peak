@@ -3,6 +3,7 @@ import Network
 import Observation
 import PeakCore
 import SwiftUI
+import UIKit
 
 @Observable
 final class AppModel {
@@ -115,8 +116,19 @@ final class AppModel {
     static let maxZoom = 6.0
     /// The last skyline match, for diagnostics.
     var lastOutcome: SkylineCorrector.Outcome?
-    var offlineStatus: String?
     var storageBytes: Int?
+    /// Areas saved for offline use, newest first.
+    var areas: [OfflineArea] = []
+    /// The area downloading now, and how far along it is.
+    var areaProgress: AreaProgress?
+    /// Why an area's download stopped, by area.
+    var areaFailures: [UUID: String] = [:]
+
+    struct AreaProgress: Equatable {
+        var id: UUID
+        var fraction = 0.0
+        var step = "Starting…"
+    }
 
     let camera = CameraFeed()
     let motion = MotionTracker()
@@ -166,6 +178,7 @@ final class AppModel {
         started = true
 
         loadCalibration()
+        Task { @MainActor in areas = await store.loadAreas() }
         locationDelegate.onLocation = { [weak self] in self?.locationChanged($0) }
         locationDelegate.onHeading = { [weak self] heading in
             // True heading minus magnetic heading is the declination here.
@@ -381,8 +394,9 @@ final class AppModel {
     /// Gets what's needed to draw the view. A small first download (240 m terrain, about
     /// 0.6 MB a tile, and 120 m within 30 km) shows the view within seconds. Then the
     /// terrain around you is sharpened block by block: the full 30 m within 10 km, 60 m
-    /// within 35 km, and 120 m everywhere; further 30 m terrain on Wi-Fi.
-    private func load(_ start: CLLocation, everything: Bool = false) {
+    /// within 35 km, and 120 m everywhere; further 30 m terrain on Wi-Fi or in an area saved
+    /// for offline use (where it's all on the phone already).
+    private func load(_ start: CLLocation) {
         loading = true
         let lat = start.coordinate.latitude, lon = start.coordinate.longitude
         let keys = DataStore.tiles(latitude: lat, longitude: lon, radius: TerrainScene.radius)
@@ -398,10 +412,7 @@ final class AppModel {
         }
 
         Task { @MainActor in
-            defer {
-                loading = false
-                if everything { offlineStatus = "Saved for offline use" }
-            }
+            defer { loading = false }
             if scene == nil { phase = .loading("Getting terrain…") }
             var done = 0
             await withTaskGroup(of: (DataStore.Key, ElevationTile?).self) { group in
@@ -448,12 +459,12 @@ final class AppModel {
             phase = .ready
 
             // Sharper terrain, nearest first; each pass shows when it's done.
-            let generous = everything || onWiFi || settings.detailOnMobile
+            let saved = areas.contains { $0.complete && $0.contains(LatLon(lat, lon)) }
+            let generous = saved || onWiFi || settings.detailOnMobile
             await sharpen(keys, lat, lon, level: 0, radius: 10_000)
             await sharpen(keys, lat, lon, level: 1, radius: 35_000)
             await upgrade(keys, lat, lon, toLevel: 2, within: generous ? TerrainScene.radius + 50_000 : 60_000)
-            if generous { await sharpen(keys, lat, lon, level: 0, radius: everything || onWiFi ? 25_000 : 15_000) }
-            if everything { await sharpen(keys, lat, lon, level: 1, radius: 60_000) }
+            if generous { await sharpen(keys, lat, lon, level: 0, radius: saved || onWiFi ? 25_000 : 15_000) }
         }
     }
 
@@ -493,18 +504,131 @@ final class AppModel {
         if changed { await rebuild() }
     }
 
-    /// Downloads the sharpest terrain for the whole area around you, for use offline.
-    func saveAreaForOffline() {
-        guard let here = location ?? center else {
-            offlineStatus = "Waiting for your position…"
+    // MARK: Areas saved for offline use
+
+    /// How far around an area its terrain is saved at 30 m and at 60 m, meters (at 120 m,
+    /// everything that can be seen from it). The view uses 30 m within 10 km and 60 m
+    /// within 35 km, so this is what it needs anywhere in the area.
+    static let areaFullDetail = 10_000.0
+    static let areaMediumDetail = 35_000.0
+
+    @ObservationIgnored private var areaTask: Task<Void, Never>?
+    @ObservationIgnored private var areaQueue: [UUID] = []
+
+    /// Saves an area: adds it to the list and downloads it (after any download under way).
+    func saveArea(name: String, latitude: Double, longitude: Double, radius: Double) {
+        let area = OfflineArea(name: name, latitude: latitude, longitude: longitude, radius: radius)
+        areas.insert(area, at: 0)
+        persistAreas()
+        download(area)
+    }
+
+    /// Downloads what an area needs that isn't on the phone yet (also to resume one).
+    func download(_ area: OfflineArea) {
+        areaFailures[area.id] = nil
+        guard areaProgress == nil else {
+            if !areaQueue.contains(area.id) { areaQueue.append(area.id) }
             return
         }
-        guard !loading else {
-            offlineStatus = "Still loading; try again in a moment"
-            return
+        areaProgress = AreaProgress(id: area.id)
+        areaTask = Task { @MainActor in
+            // Keep going for a while if Peak is sent to the background.
+            let background = BackgroundTime(name: "Save area")
+            defer { background.end() }
+            await fetch(area)
+            guard !Task.isCancelled else { return }   // deleted; deleting moves the queue on
+            areaProgress = nil
+            areaTask = nil
+            startNextArea()
         }
-        offlineStatus = "Downloading…"
-        load(here, everything: true)
+    }
+
+    private func startNextArea() {
+        while areaProgress == nil, !areaQueue.isEmpty {
+            let next = areaQueue.removeFirst()
+            if let area = areas.first(where: { $0.id == next }) { download(area) }
+        }
+    }
+
+    @MainActor private func fetch(_ area: OfflineArea) async {
+        let store = self.store
+        let far = area.tiles
+        let medium = DataStore.tiles(latitude: area.latitude, longitude: area.longitude, radius: area.radius + Self.areaMediumDetail)
+        let near = DataStore.tiles(latitude: area.latitude, longitude: area.longitude, radius: area.radius + Self.areaFullDetail)
+        let steps = Double(far.count + medium.count + near.count + 2)
+        var done = 0.0
+        var failure: String?
+        func report(_ step: String) {
+            areaProgress = AreaProgress(id: area.id, fraction: done / steps, step: step)
+        }
+        func failed(_ error: Error) {
+            if !(error is CancellationError) { failure = error.localizedDescription }
+        }
+
+        // Peaks and hikes first: small, and from a different server than the terrain.
+        report("Peaks")
+        do { try await store.downloadAreaPeaks(area) } catch { failed(error) }
+        done += 1
+        report("Hikes")
+        do { try await store.downloadAreaTrails(area) } catch { failed(error) }
+        done += 1
+        for (i, key) in far.enumerated() where !Task.isCancelled {
+            report("Terrain \(i + 1) of \(far.count) · 120 m")
+            do { _ = try await store.tile(key, level: 2) } catch { failed(error) }
+            done += 1
+        }
+        for (i, key) in medium.enumerated() where !Task.isCancelled {
+            report("Terrain \(i + 1) of \(medium.count) · 60 m")
+            do {
+                _ = try await store.patch(key, level: 1, latitude: area.latitude, longitude: area.longitude,
+                                          radius: area.radius + Self.areaMediumDetail, strict: true)
+            } catch { failed(error) }
+            done += 1
+        }
+        for (i, key) in near.enumerated() where !Task.isCancelled {
+            report("Terrain \(i + 1) of \(near.count) · 30 m")
+            do {
+                _ = try await store.patch(key, level: 0, latitude: area.latitude, longitude: area.longitude,
+                                          radius: area.radius + Self.areaFullDetail, strict: true)
+            } catch { failed(error) }
+            done += 1
+        }
+        bytesDownloaded = await store.bytesDownloaded
+        guard !Task.isCancelled, let index = areas.firstIndex(where: { $0.id == area.id }) else { return }
+        areas[index].complete = failure == nil
+        areas[index].bytes = await store.size(of: area)
+        areas[index].saved = Date()
+        if let failure { areaFailures[area.id] = failure }
+        persistAreas()
+        storageBytes = await store.storageUsed()
+    }
+
+    /// Deletes an area, with the terrain that no other area (and not where you are) uses.
+    func deleteArea(_ area: OfflineArea) {
+        if areaProgress?.id == area.id {
+            areaTask?.cancel()
+            areaTask = nil
+            areaProgress = nil
+        }
+        areaQueue.removeAll { $0 == area.id }
+        areas.removeAll { $0.id == area.id }
+        areaFailures[area.id] = nil
+        persistAreas()
+        let others = areas
+        let here = (location ?? center).map { LatLon($0.coordinate.latitude, $0.coordinate.longitude) }
+        Task { @MainActor in
+            await store.deleteArea(area, keeping: others, near: here)
+            storageBytes = await store.storageUsed()
+        }
+        startNextArea()
+    }
+
+    func isQueued(_ area: OfflineArea) -> Bool {
+        areaQueue.contains(area.id)
+    }
+
+    private func persistAreas() {
+        store.saveAreas(areas)
     }
 
     func refreshStorage() {
@@ -512,11 +636,16 @@ final class AppModel {
     }
 
     func clearDownloads() {
+        areaTask?.cancel()
+        areaTask = nil
+        areaProgress = nil
+        areaQueue.removeAll()
+        areas.removeAll()
+        areaFailures.removeAll()
         Task { @MainActor in
             await store.clear()
             details.removeAll()
             storageBytes = await store.storageUsed()
-            offlineStatus = nil
         }
     }
 
@@ -667,10 +796,35 @@ final class PeakDetails {
                     .sorted { ($0.reachesSummit ? 0 : 1, $0.distanceFromPeak) < ($1.reachesSummit ? 0 : 1, $1.distanceFromPeak) }
                 }.value
                 hikesState = .loaded
+            } catch let error as URLError {
+                switch error.code {
+                case .notConnectedToInternet, .dataNotAllowed, .networkConnectionLost, .internationalRoamingOff:
+                    hikesState = .failed("No connection. To have hikes without a signal, save the area beforehand in Settings › Offline areas.")
+                case .timedOut:
+                    hikesState = .failed("OpenStreetMap didn't answer in time. Try again in a minute.")
+                default:
+                    hikesState = .failed("Couldn't reach OpenStreetMap (\(error.localizedDescription)).")
+                }
             } catch {
-                hikesState = .failed("Couldn't load hikes. Check your connection.")
+                hikesState = .failed(error.localizedDescription)
             }
         }
+    }
+}
+
+/// Time to finish work after Peak goes to the background (about half a minute), given back
+/// when done or when the time is up.
+private final class BackgroundTime {
+    private var id = UIBackgroundTaskIdentifier.invalid
+
+    init(name: String) {
+        id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in self?.end() }
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }
 

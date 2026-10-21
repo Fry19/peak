@@ -395,8 +395,15 @@ func geotiffCommand(_ args: Arguments) throws {
 
 func trailsCommand(_ args: Arguments) throws {
     if args.options["query"] != nil {
-        // The app's own query, to fetch a response with.
-        print(Overpass.trailsQuery(latitude: try args.required("lat"), longitude: try args.required("lon"), radius: 5_000, clip: 15_000))
+        // The app's own query, to fetch a response with: hikes for one peak, or with
+        // --area METERS, everything saved for an offline area of that radius.
+        let lat = try args.required("lat"), lon = try args.required("lon")
+        if let r = args.double("area") {
+            let dlat = r / 111_000, dlon = r / (111_000 * max(cos(lat * .pi / 180), 0.05))
+            print(Overpass.trailsQuery(south: lat - dlat, west: lon - dlon, north: lat + dlat, east: lon + dlon, timeout: 180))
+        } else {
+            print(Overpass.trailsQuery(latitude: lat, longitude: lon, radius: 8_000))
+        }
         return
     }
     guard let path = args.positional.first else { throw HarnessError("which Overpass response?") }

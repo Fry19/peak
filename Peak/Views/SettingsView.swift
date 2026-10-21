@@ -19,17 +19,24 @@ struct SettingsView: View {
             }
 
             Section {
-                Toggle("Sharpest terrain on mobile data", isOn: $model.settings.detailOnMobile)
-                Button("Save this area for offline use") { model.saveAreaForOffline() }
-                if let status = model.offlineStatus {
-                    Text(status).foregroundStyle(.secondary)
+                NavigationLink {
+                    OfflineAreasView(model: model)
+                } label: {
+                    LabeledContent("Offline areas") {
+                        if model.areaProgress != nil {
+                            ProgressView()
+                        } else {
+                            Text(model.areas.isEmpty ? "None" : "\(model.areas.count)")
+                        }
+                    }
                 }
+                Toggle("Sharpest terrain on mobile data", isOn: $model.settings.detailOnMobile)
                 LabeledContent("Stored on this iPhone", value: model.storageBytes.map(Format.bytes) ?? "…")
                 Button("Delete downloaded data", role: .destructive) { confirmClear = true }
             } header: {
                 Text("Terrain and offline use")
             } footer: {
-                Text("Peak keeps the terrain, peaks and hikes it downloads, so places you've visited work without a signal. Saving an area fetches the sharpest terrain for 80 km around you (often 50–150 MB).")
+                Text("Peak keeps the terrain, peaks and hikes it downloads, so places you've been work without a signal. Going somewhere without one? Save it in Offline areas before you go.")
             }
 
             Section {
@@ -56,7 +63,7 @@ struct SettingsView: View {
             }
         }
         .onAppear { model.refreshStorage() }
-        .confirmationDialog("Delete all downloaded terrain, peaks and hikes?", isPresented: $confirmClear, titleVisibility: .visible) {
+        .confirmationDialog("Delete all downloaded terrain, peaks and hikes, and your offline areas?", isPresented: $confirmClear, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { model.clearDownloads() }
         }
     }

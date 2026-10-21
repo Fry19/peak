@@ -136,7 +136,7 @@ struct PeakDetailView: View {
         case .loading:
             HStack(spacing: 10) {
                 ProgressView()
-                Text("Finding hikes…").foregroundStyle(.secondary)
+                Text("Searching OpenStreetMap for hikes…").foregroundStyle(.secondary)
             }
         case let .failed(message):
             VStack(alignment: .leading, spacing: 8) {
@@ -153,7 +153,7 @@ struct PeakDetailView: View {
                     }
                 }
             } else {
-                Text("No mapped hikes near this peak.").foregroundStyle(.secondary)
+                Text("No hikes mapped within \(Format.distance(DataStore.hikeRadius, units)) of this peak.").foregroundStyle(.secondary)
             }
         }
     }

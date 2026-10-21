@@ -273,28 +273,45 @@ extension Trail {
 }
 
 extension Overpass {
-    /// Hiking routes and named paths within `radius` meters of a point, and paths without
-    /// a name within `summitRadius` (often the way up a summit), with their geometry
-    /// clipped to `clip` meters around it.
-    public static func trailsQuery(latitude: Double, longitude: Double, radius: Double, clip: Double,
-                                   summitRadius: Double = 400) -> String {
-        let dlat = clip / 111_000, dlon = clip / (111_000 * max(cos(latitude * .pi / 180), 0.05))
-        let box = String(format: "%.5f,%.5f,%.5f,%.5f", latitude - dlat, longitude - dlon, latitude + dlat, longitude + dlon)
-        let around = String(format: "around:%.0f,%.6f,%.6f", radius, latitude, longitude)
-        let summit = String(format: "around:%.0f,%.6f,%.6f", summitRadius, latitude, longitude)
+    /// Hiking routes and named paths within `radius` meters of a peak (a box around it),
+    /// and paths without a name within `summitRadius` of it (often the way up).
+    public static func trailsQuery(latitude: Double, longitude: Double, radius: Double, summitRadius: Double = 400) -> String {
+        let dlat = radius / 111_000, dlon = radius / (111_000 * max(cos(latitude * .pi / 180), 0.05))
+        return trailsQuery(south: latitude - dlat, west: longitude - dlon, north: latitude + dlat, east: longitude + dlon,
+                           summit: LatLon(latitude, longitude), summitRadius: summitRadius)
+    }
+
+    /// Hiking routes and named paths in a box (degrees), with their geometry clipped to it;
+    /// with a `summit`, also paths without a name near it. Boxes are what Overpass indexes,
+    /// so this is much quicker than searching around a point.
+    public static func trailsQuery(south: Double, west: Double, north: Double, east: Double,
+                                   summit: LatLon? = nil, summitRadius: Double = 400, timeout: Int = 25) -> String {
+        let box = String(format: "%.5f,%.5f,%.5f,%.5f", south, west, north, east)
+        let unnamed = summit.map {
+            String(format: "\n  way[\"highway\"~\"^(path|footway|steps|bridleway)$\"][!\"name\"](around:%.0f,%.6f,%.6f);",
+                   summitRadius, $0.latitude, $0.longitude)
+        } ?? ""
         return """
-        [out:json][timeout:60];
-        relation["route"~"^(hiking|foot)$"](\(around))->.routes;
+        [out:json][timeout:\(timeout)];
+        relation["route"~"^(hiking|foot)$"](\(box))->.routes;
         .routes out tags geom(\(box));
         way(r.routes)["sac_scale"];
         out tags;
         (
-          way["highway"~"^(path|bridleway)$"]["name"](\(around));
-          way["highway"~"^(footway|steps|track)$"]["name"]["sac_scale"](\(around));
-          way["highway"~"^(path|footway|steps|bridleway)$"][!"name"](\(summit));
+          way["highway"~"^(path|bridleway)$"]["name"](\(box));
+          way["highway"~"^(footway|steps|track)$"]["name"]["sac_scale"](\(box));\(unnamed)
         );
         out tags geom(\(box));
         """
+    }
+
+    /// The error an Overpass server reports in an otherwise normal response (it answers
+    /// 200 with a "remark" when a query runs out of time or memory), or nil.
+    public static func failure(inJSON data: Data) -> String? {
+        struct Response: Decodable { var remark: String? }
+        guard let remark = (try? JSONDecoder().decode(Response.self, from: data))?.remark,
+              remark.lowercased().contains("error") else { return nil }
+        return remark
     }
 
     /// Trails in an Overpass response to `trailsQuery`. Named paths that belong to a route

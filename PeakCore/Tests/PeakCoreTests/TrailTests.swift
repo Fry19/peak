@@ -87,10 +87,20 @@ final class TrailTests: XCTestCase {
         XCTAssertEqual(path.difficulty, .hiking)
         XCTAssertTrue(path.isPartial)
 
-        let query = Overpass.trailsQuery(latitude: 45.9763, longitude: 7.6586, radius: 5_000, clip: 12_000)
-        XCTAssertTrue(query.contains("around:5000,45.976300,7.658600"))
+        let query = Overpass.trailsQuery(latitude: 45.9763, longitude: 7.6586, radius: 5_000)
+        XCTAssertTrue(query.contains("(45.93125,7.59378,46.02135,7.72342)"), query)
         XCTAssertTrue(query.contains("out tags geom("))
         XCTAssertTrue(query.contains("[!\"name\"](around:400,45.976300,7.658600)"))
+        let area = Overpass.trailsQuery(south: 35.5, west: -83.6, north: 35.8, east: -83.2)
+        XCTAssertTrue(area.contains("(35.50000,-83.60000,35.80000,-83.20000)"))
+        XCTAssertFalse(area.contains("!\"name\""), "no summit, no unnamed paths")
+    }
+
+    func testOverpassFailures() {
+        let timedOut = Data(#"{"version":0.6,"remark":"runtime error: Query timed out in \"query\" at line 3 after 26 seconds.","elements":[]}"#.utf8)
+        XCTAssertNotNil(Overpass.failure(inJSON: timedOut))
+        XCTAssertNil(Overpass.failure(inJSON: Data(#"{"elements":[]}"#.utf8)))
+        XCTAssertNil(Overpass.failure(inJSON: Data("not json".utf8)))
     }
 
     /// A trail straight up a cone climbs the cone's height and starts at its foot.
