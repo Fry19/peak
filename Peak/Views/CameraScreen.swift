@@ -46,7 +46,9 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         }
     }
 
-    func gestureRecognizerShouldBegin(_ gesture: UIGestureRecognizer) -> Bool {
+    // UIView asks itself this for its own gesture recognizers; dragging and turning only
+    // work while lining up.
+    override func gestureRecognizerShouldBegin(_ gesture: UIGestureRecognizer) -> Bool {
         gesture is UITapGestureRecognizer || model?.aligning == true
     }
 
