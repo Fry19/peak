@@ -159,6 +159,48 @@ public struct ReliefMap: Sendable {
         return shade
     }
 
+    // MARK: Ridges and hollows
+
+    /// How far each grid point stands above (positive) or below (negative) the mean of the
+    /// ground within `radius` meters of it, in meters: ridges, knolls and spurs stand out,
+    /// gullies and hollows sink in. Near the grid's edges the window shrinks to stay
+    /// centered, so a plane is 0 everywhere. NaN where there's no terrain.
+    public func relativeHeight(radius: Double) -> [Float] {
+        let r = max(1, Int((radius / cellSize).rounded()))
+        // Sums and counts of the known heights above and left of each grid corner.
+        let w = cols + 1
+        var sums = [Double](repeating: 0, count: (rows + 1) * w)
+        var counts = [Int32](repeating: 0, count: (rows + 1) * w)
+        for row in 0..<rows {
+            var rowSum = 0.0
+            var rowCount: Int32 = 0
+            for col in 0..<cols {
+                let v = heights[row * cols + col]
+                if v.isFinite {
+                    rowSum += Double(v)
+                    rowCount += 1
+                }
+                sums[(row + 1) * w + col + 1] = sums[row * w + col + 1] + rowSum
+                counts[(row + 1) * w + col + 1] = counts[row * w + col + 1] + rowCount
+            }
+        }
+        var out = [Float](repeating: .nan, count: rows * cols)
+        for row in 0..<rows {
+            let dr = min(r, row, rows - 1 - row)
+            let top = (row - dr) * w, bottom = (row + dr + 1) * w
+            for col in 0..<cols {
+                let v = heights[row * cols + col]
+                guard v.isFinite else { continue }
+                let dc = min(r, col, cols - 1 - col)
+                let left = col - dc, right = col + dc + 1
+                let sum = sums[bottom + right] - sums[top + right] - sums[bottom + left] + sums[top + left]
+                let count = counts[bottom + right] - counts[top + right] - counts[bottom + left] + counts[top + left]
+                out[row * cols + col] = v - Float(sum / Double(max(1, count)))
+            }
+        }
+        return out
+    }
+
     // MARK: Crests
 
     /// The crests of the ridges: grid points higher than their neighbors across the ridge,

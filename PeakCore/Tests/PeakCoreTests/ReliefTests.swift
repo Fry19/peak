@@ -149,6 +149,34 @@ final class ReliefTests: XCTestCase {
         }
     }
 
+    /// A crest stands above the ground around it by the mean drop across the window, a
+    /// valley sinks below it by as much, and a plane is level with it everywhere.
+    func testRelativeHeightOfRidgesValleysAndPlanes() {
+        func grid(_ f: (Double, Double) -> Double) -> ReliefMap {
+            var heights: [Float] = []
+            for r in 0..<21 {
+                for c in 0..<21 { heights.append(Float(f(Double(c - 10) * 30, Double(10 - r) * 30))) }
+            }
+            return ReliefMap(center: center, cellSize: 30, rows: 21, cols: 21, heights: heights)
+        }
+        // A window 3 points each way: the mean distance from the middle of 7 points 30 m
+        // apart is 30·3·4/7 m.
+        let meanOffset = 30.0 * 12 / 7
+        let ridge = grid { x, _ in 1_000 - 0.5 * abs(x) }.relativeHeight(radius: 90)
+        let valley = grid { x, _ in 1_000 + 0.5 * abs(x) }.relativeHeight(radius: 90)
+        let middle = 10 * 21 + 10
+        XCTAssertEqual(Double(ridge[middle]), 0.5 * meanOffset, accuracy: 1e-3)
+        XCTAssertEqual(Double(valley[middle]), -0.5 * meanOffset, accuracy: 1e-3)
+        XCTAssertEqual(Double(ridge[middle + 5]), 0, accuracy: 1e-3, "on the even flank, level")
+        let plane = grid { x, y in 2_000 + 0.3 * x - 0.7 * y }.relativeHeight(radius: 150)
+        XCTAssertTrue(plane.allSatisfy { abs($0) < 1e-3 }, "edges included")
+        var holes = grid { _, _ in 500 }.heights
+        holes[middle] = .nan
+        let map = ReliefMap(center: center, cellSize: 30, rows: 21, cols: 21, heights: holes).relativeHeight(radius: 90)
+        XCTAssertTrue(map[middle].isNaN)
+        XCTAssertEqual(map[middle + 1], 0, "points without terrain are left out of the mean")
+    }
+
     func testTraceSplitsAtBranchesAndFollowsLoops() {
         func mask(_ rows: [String]) -> ([Bool], Int, Int) {
             (rows.flatMap { $0.map { $0 == "#" } }, rows.count, rows[0].count)

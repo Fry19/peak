@@ -42,6 +42,16 @@ final class TrailWalkTests: XCTestCase {
         }
     }
 
+    /// Squares inside a hole are left for a sharper mesh; those across its edge stay.
+    func testMeshLeavesAHoleForASharperMesh() {
+        let map = grid { _, _ in 300 }
+        let mesh = map.mesh(hole: (low: SIMD2(-150, -150), high: SIMD2(150, 150)))
+        // Grid points are 100 m apart, so the squares from −100 to 100 m each way, 2×2 of
+        // them, lie inside; those reaching out to ±200 m cross its edge and stay.
+        XCTAssertEqual(mesh.indices.count, (100 - 4) * 6)
+        XCTAssertEqual(mesh.positions.count, 121, "vertices stay, so neighbors still share them")
+    }
+
     func testMeshStepsAndHoles() {
         // Every third point, keeping the last row and column.
         let coarse = grid { _, _ in 300 }.mesh(step: 3)
@@ -119,18 +129,40 @@ final class TrailWalkTests: XCTestCase {
         XCTAssertGreaterThan(corner.y, 0.2)
     }
 
+    /// A camera low behind a walker on a level path stays low: the walker stands on the
+    /// ground, so the line of sight needn't clear it there.
+    func testLowCameraStaysLowOverLevelGround() {
+        let walk = TrailWalk(points: [SIMD3(0, 0, 1_000), SIMD3(0, 2_000, 1_000)])
+        let view = walk.camera(at: 1_000, range: 400, pitch: 9, clearance: 40) { _ in 1_000 }
+        XCTAssertEqual(view.eye.z, 1_000 + 400 * sin(9 * .pi / 180), accuracy: 1e-6)
+    }
+
+    /// Tight switchbacks gain height fast as the crow flies but climb gently along the path,
+    /// and the camera goes by the path.
+    func testCameraGoesByTheGradeAlongTheTrail() {
+        // Zigzags 100 m wide, 20 m apart, each leg rising 10 m: a 10% grade.
+        var points: [SIMD3<Double>] = []
+        for k in 0...20 { points.append(SIMD3(k % 2 == 0 ? 0 : 100, Double(k) * 20, Double(k) * 10)) }
+        let walk = TrailWalk(points: points)
+        let view = walk.camera(at: 1_000, range: 500, pitch: 10, maxPitch: 60, clearance: 0) { _ in -10_000 }
+        let look = view.target - view.eye
+        let pitch = atan2(-look.z, (look.x * look.x + look.y * look.y).squareRoot()) * 180 / .pi
+        XCTAssertLessThan(pitch, 14, "about 10° + half of a 6° grade, not the 27° the crow sees")
+    }
+
     /// With a hill between the camera and the walker, the camera rises to see over it.
     func testCameraClearsTheGround() {
         let walk = TrailWalk(points: [SIMD3(0, 0, 1_000), SIMD3(0, 2_000, 1_000)])
         let hill: (SIMD2<Double>) -> Double = { p in 900 + 400 * max(0, 1 - abs(p.y - 700) / 150) }
         let view = walk.camera(at: 900, range: 500, pitch: 20, clearance: 40, ground: hill)
         // The line from the eye to the walker (at y = 900) clears the hill, by the clearance
-        // give or take what falls between the points checked.
+        // tapering to nothing at the walker, give or take what falls between the points
+        // checked.
         let y0 = view.eye.y
         XCTAssertLessThan(y0, 550)
         for y in stride(from: y0, through: 880, by: 5) {
             let f = (y - y0) / (900 - y0)
-            XCTAssertGreaterThan(view.eye.z * (1 - f) + 1_000 * f, hill(SIMD2(0, y)) + 15, "at y = \(y)")
+            XCTAssertGreaterThan(view.eye.z * (1 - f) + 1_000 * f, hill(SIMD2(0, y)) + 40 * (1 - f) - 5, "at y = \(y)")
         }
         // Over flat ground well below, the camera stays where the pitch puts it.
         let free = walk.camera(at: 900, range: 500, pitch: 20, clearance: 40) { _ in 900 }

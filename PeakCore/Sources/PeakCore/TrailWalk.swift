@@ -28,9 +28,10 @@ extension ReliefMap {
 
     /// The terrain as a mesh, using every `step`-th grid point each way (at least 1), so it
     /// can be kept to a size the GPU draws smoothly. Squares with a corner without terrain
-    /// are left out. Each square is split along its higher diagonal, so ridges, which make
+    /// are left out, and so are squares entirely inside `hole` (map meters, lowest and
+    /// highest corner), where a sharper mesh takes over. Each square is split along its higher diagonal, so ridges, which make
     /// the skylines, stay sharp instead of zigzagging.
-    public func mesh(step: Int = 1) -> TerrainMesh {
+    public func mesh(step: Int = 1, hole: (low: SIMD2<Double>, high: SIMD2<Double>)? = nil) -> TerrainMesh {
         let step = max(1, step)
         let rowIndex = Array(stride(from: 0, to: rows, by: step)) + ((rows - 1) % step == 0 ? [] : [rows - 1])
         let colIndex = Array(stride(from: 0, to: cols, by: step)) + ((cols - 1) % step == 0 ? [] : [cols - 1])
@@ -66,6 +67,10 @@ extension ReliefMap {
             for j in 0..<(m - 1) {
                 let r0 = rowIndex[i], r1 = rowIndex[i + 1], c0 = colIndex[j], c1 = colIndex[j + 1]
                 guard h(r0, c0).isFinite, h(r0, c1).isFinite, h(r1, c0).isFinite, h(r1, c1).isFinite else { continue }
+                if let hole {
+                    let a = position(row: Double(r1), col: Double(c0)), b = position(row: Double(r0), col: Double(c1))
+                    if a.x >= hole.low.x, a.y >= hole.low.y, b.x <= hole.high.x, b.y <= hole.high.y { continue }
+                }
                 // Corners: nw, ne, sw, se. Counter-clockwise seen from above (north up).
                 let nw = UInt32(i * m + j), ne = nw + 1, sw = UInt32((i + 1) * m + j), se = sw + 1
                 if h(r0, c0) + h(r1, c1) >= h(r0, c1) + h(r1, c0) {
@@ -135,20 +140,24 @@ public struct TrailWalk: Sendable {
     }
 
     /// A camera following the walker at `distance`, like a drone: `range` meters away, behind
-    /// and above, looking down at `pitch` degrees onto a point a little ahead of the walker.
+    /// and above, looking down at `pitch` degrees onto a point `lead` times the range ahead
+    /// of the walker, so more of the way ahead is in view.
     /// Where the trail climbs ahead, the camera looks down more steeply (up to `maxPitch`),
     /// so a face being climbed is seen rather than looked into. It is raised where needed to stay
     /// `clearance` meters above the ground, at its own spot and along its line of sight.
     /// `ground` gives the terrain's height at a map position (NaN for none).
     public func camera(at distance: Double, range: Double = 600, pitch: Double = 35, maxPitch: Double = 60,
-                       clearance: Double = 40, ground: (SIMD2<Double>) -> Double) -> (eye: SIMD3<Double>, target: SIMD3<Double>) {
+                       lead: Double = 0.12, clearance: Double = 40,
+                       ground: (SIMD2<Double>) -> Double) -> (eye: SIMD3<Double>, target: SIMD3<Double>) {
         let p = point(at: distance)
         let dir = heading(at: distance)
-        let ahead = point(at: distance + 200), before = point(at: distance - 50)
-        let run = Self.flat(ahead - before)
-        let climb = run > 1 ? atan((ahead.z - before.z) / run) * 180 / .pi : 0
+        // The grade along the path, not across it: switchbacks climb gently, however fast
+        // they gain height as the crow flies.
+        let from = max(0, distance - 50), to = min(length, distance + 200)
+        let rise = point(at: to).z - point(at: from).z
+        let climb = to - from > 1 ? atan(rise / (to - from)) * 180 / .pi : 0
         let angle = min(maxPitch, max(pitch, pitch + climb * 0.5)) * .pi / 180
-        let focus = SIMD2(p.x, p.y) + dir * (range * 0.12)
+        let focus = SIMD2(p.x, p.y) + dir * (range * lead)
         func groundOr(_ q: SIMD2<Double>, _ fallback: Double) -> Double {
             let g = ground(q)
             return g.isFinite ? g : fallback
@@ -158,12 +167,14 @@ public struct TrailWalk: Sendable {
         var eye = SIMD3(spot.x, spot.y, target.z + range * sin(angle))
         eye.z = max(eye.z, groundOr(spot, target.z) + clearance)
         // The line from the eye to the walker must pass over the ground in between, checked
-        // every 15 m or so.
-        let from = SIMD2(spot.x, spot.y), to = SIMD2(p.x, p.y)
-        let samples = max(8, Int(Self.flat(SIMD3(to - from, 0)) / 15))
+        // every 15 m or so: by `clearance` near the camera, tapering to nothing at the walker,
+        // who stands on the ground. (A full clearance right beside the walker would hoist a
+        // low camera hundreds of meters.)
+        let start = SIMD2(spot.x, spot.y), end = SIMD2(p.x, p.y)
+        let samples = max(8, Int(Self.flat(SIMD3(end - start, 0)) / 15))
         for k in 1..<samples {
             let f = Double(k) / Double(samples)
-            let need = groundOr(from + (to - from) * f, -.infinity) + clearance
+            let need = groundOr(start + (end - start) * f, -.infinity) + clearance * (1 - f)
             // eye.z·(1−f) + p.z·f ≥ need
             eye.z = max(eye.z, (need - p.z * f) / (1 - f))
         }

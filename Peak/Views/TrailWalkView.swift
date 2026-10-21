@@ -109,8 +109,10 @@ final class WalkWorld: @unchecked Sendable {
     /// The ground's height at a map position, meters.
     func ground(_ p: SIMD2<Double>) -> Double { relief.height(at: p) }
 
+    /// Following the walker low, near the horizon, so the slopes and the ranges ahead stand
+    /// up in 3D; steep climbs tilt it down a little, and ridges in the way lift it.
     func follow(at distance: Double) -> (eye: SIMD3<Double>, target: SIMD3<Double>) {
-        walk.camera(at: distance, range: range, pitch: 21) { [relief] in relief.height(at: $0) }
+        walk.camera(at: distance, range: range, pitch: 9, maxPitch: 30, lead: 0.3) { [relief] in relief.height(at: $0) }
     }
 
     func walkerPosition(at distance: Double) -> SIMD3<Double> {
@@ -119,11 +121,14 @@ final class WalkWorld: @unchecked Sendable {
 
     static func build(trail: Trail, peak: Peak?, terrain: Terrain, units: AppSettings.Units) -> WalkWorld? {
         guard let frame = OverheadMap.frame(trail: trail, around: peak.map { [$0.position] } ?? []) else { return nil }
-        // The trail with several kilometers around it: enough to see where it goes, with the
-        // far edge lost in the haze. At the terrain's own 30 m at most, under 500 points across.
-        let side = min(40_000, max(14_000, max(frame.width, frame.height) + 12_000))
-        let cell = max(30, side / 480)
-        let relief = ReliefMap(terrain: terrain, extent: MapExtent(center: frame.center, width: side, height: side), cellSize: cell)
+        // The trail with a few kilometers around it at the terrain's own 30 m where it can,
+        // and around that a wide, coarser ring out to where the haze swallows it, so a view
+        // toward the horizon shows the ranges beyond instead of the terrain's edge.
+        let side = min(26_000, max(10_000, max(frame.width, frame.height) + 6_000))
+        let relief = ReliefMap(terrain: terrain, extent: MapExtent(center: frame.center, width: side, height: side),
+                               cellSize: max(30, side / 640))
+        let wide = ReliefMap(terrain: terrain, extent: MapExtent(center: frame.center, width: 70_000, height: 70_000),
+                             cellSize: 150)
         let projection = relief.projection
         let known = relief.heights.filter(\.isFinite)
         guard let low = known.min(), let high = known.max() else { return nil }
@@ -145,18 +150,24 @@ final class WalkWorld: @unchecked Sendable {
         }
         let walk = TrailWalk(points: route)
         guard walk.length > 0 else { return nil }
-        let range = min(1_800, max(800, walk.length * 0.35))
+        let range = min(750, max(380, walk.length * 0.15))
 
         let scene = SCNScene()
         scene.background.contents = haze
         scene.fogColor = haze
         scene.fogStartDistance = 3_000
-        scene.fogEndDistance = 24_000
-        scene.fogDensityExponent = 1.3
+        scene.fogEndDistance = 30_000
+        scene.fogDensityExponent = 1.2
 
+        // The ring stops where the sharp terrain begins, a little inside its edge, and sits a
+        // few meters lower, so the sharp terrain always covers the seam.
+        let edge = side / 2 - 2 * wide.cellSize
+        let hole = (low: SIMD2(-edge, -edge), high: SIMD2(edge, edge))
         scene.rootNode.addChildNode(terrainNode(relief, low: low, high: high))
+        scene.rootNode.addChildNode(terrainNode(wide, low: low, high: high, hole: hole, sink: 15))
         for node in crestNodes(relief) { scene.rootNode.addChildNode(node) }
-        for node in trailNodes(trail, relief, width: max(3, range / 110)) { scene.rootNode.addChildNode(node) }
+        for node in crestNodes(wide, outside: hole) { scene.rootNode.addChildNode(node) }
+        for node in trailNodes(trail, relief, width: max(2, range / 180)) { scene.rootNode.addChildNode(node) }
 
         // Light from the north-west, low enough to model the slopes, and a cool fill.
         let sun = SCNNode()
@@ -164,8 +175,9 @@ final class WalkWorld: @unchecked Sendable {
         sun.light!.type = .directional
         sun.light!.intensity = 1_400
         sun.light!.color = UIColor(red: 1, green: 0.97, blue: 0.93, alpha: 1)
-        // From the north-west and 40° up (SceneKit's z points south).
-        sun.position = SCNVector3(-1, 1.19, -1)
+        // From the north-west and 35° up (SceneKit's z points south): low enough that the
+        // light rakes across the slopes and shows their shapes.
+        sun.position = SCNVector3(-1, 0.99, -1)
         sun.look(at: SCNVector3(0, 0, 0), up: SCNVector3(0, 1, 0), localFront: SCNVector3(0, 0, -1))
         scene.rootNode.addChildNode(sun)
         let fill = SCNNode()
@@ -227,9 +239,31 @@ final class WalkWorld: @unchecked Sendable {
                          overhead: overhead, range: range)
     }
 
-    /// The terrain: shaded by the light, a little lighter higher up.
-    private static func terrainNode(_ relief: ReliefMap, low: Float, high: Float) -> SCNNode {
-        let mesh = relief.mesh()
+    /// Faint contour lines on the ground, every 50 m with a stronger one every 250 m, drawn
+    /// per pixel from the height so they stay crisp at any distance. They fade out where they
+    /// would crowd together: far away and on cliffs.
+    static let contourShader = """
+    #pragma body
+    float4 world = scn_frame.inverseViewTransform * float4(_surface.position, 1.0);
+    float h = world.y;
+    float w = max(fwidth(h), 0.0001);
+    float minorDistance = abs(fract(h / 50.0 + 0.5) - 0.5) * 50.0 / w;
+    float majorDistance = abs(fract(h / 250.0 + 0.5) - 0.5) * 250.0 / w;
+    float minor = (1.0 - smoothstep(0.35, 1.0, minorDistance)) * smoothstep(9.0, 22.0, 50.0 / w);
+    float major = (1.0 - smoothstep(0.45, 1.3, majorDistance)) * smoothstep(7.0, 16.0, 250.0 / w);
+    _surface.emission.rgb += float3(0.86, 0.94, 1.0) * max(minor * 0.018, major * 0.045);
+    """
+
+    /// The terrain, lit by the sun and colored per point: lighter higher up, as from above;
+    /// rock faces lighter than the gentle ground around them; spurs and ridges lighter and
+    /// gullies darker, at two scales, which brings out the small shapes the light alone
+    /// leaves flat. Squares inside `hole` are left out; `sink` lowers it all, in meters.
+    private static func terrainNode(_ relief: ReliefMap, low: Float, high: Float,
+                                    hole: (low: SIMD2<Double>, high: SIMD2<Double>)? = nil, sink: Float = 0) -> SCNNode {
+        let mesh = relief.mesh(hole: hole)
+        // One vertex per grid point, in grid order, so these line up with the vertices.
+        let fine = relief.relativeHeight(radius: max(90, 2 * relief.cellSize))
+        let broad = relief.relativeHeight(radius: max(450, 4 * relief.cellSize))
         var positions = [Float](), normals = [Float](), colors = [Float]()
         positions.reserveCapacity(mesh.positions.count * 3)
         normals.reserveCapacity(mesh.positions.count * 3)
@@ -237,12 +271,18 @@ final class WalkWorld: @unchecked Sendable {
         let range = max(1, high - low)
         for i in mesh.positions.indices {
             let p = mesh.positions[i], n = mesh.normals[i]
-            positions.append(p.x); positions.append(p.z); positions.append(-p.y)
+            positions.append(p.x); positions.append(p.z - sink); positions.append(-p.y)
             normals.append(n.x); normals.append(n.z); normals.append(-n.y)
-            // Linear values (SceneKit lights in linear color): dark slate low down, lighter
-            // high up, like the hillshade from above.
-            let t = pow((mesh.heights[i] - low) / range, 1.3)
-            colors.append(0.016 + 0.10 * t); colors.append(0.019 + 0.11 * t); colors.append(0.026 + 0.12 * t)
+            // Linear values (SceneKit lights in linear color): dark slate low down.
+            let t = pow(min(1, max(0, (mesh.heights[i] - low) / range)), 1.3)
+            var v = 0.016 + 0.10 * t
+            // Steeper than about 35°: bare rock, which catches more light.
+            let steep = min(1, max(0, (0.82 - n.z) / 0.22))
+            v *= 1 + 0.7 * steep
+            let f = fine[i].isFinite ? fine[i] : 0, b = broad[i].isFinite ? broad[i] : 0
+            let form = 0.4 * min(1, max(-1, f / 25)) + 0.3 * min(1, max(-1, b / 120))
+            v *= max(0.3, 1 + form)
+            colors.append(v); colors.append(v * 1.12); colors.append(v * 1.45)
         }
         let count = mesh.positions.count
         func source(_ values: [Float], _ semantic: SCNGeometrySource.Semantic, _ components: Int) -> SCNGeometrySource {
@@ -256,28 +296,49 @@ final class WalkWorld: @unchecked Sendable {
         let material = SCNMaterial()
         material.lightingModel = .lambert
         material.diffuse.contents = UIColor.white
+        material.emission.contents = UIColor.black
+        material.shaderModifiers = [.surface: contourShader]
         geometry.firstMaterial = material
         return SCNNode(geometry: geometry)
     }
 
     /// The ridge crests as thin pale lines laid along them, brighter the more a ridge stands
-    /// out, adding light to the terrain so they glow faintly through the haze.
-    private static func crestNodes(_ relief: ReliefMap) -> [SCNNode] {
+    /// out, adding light to the terrain so they glow faintly through the haze. On the wide
+    /// ring only the bigger ridges outside `outside` are drawn, wider, so they still show
+    /// far off, along the horizon.
+    private static func crestNodes(_ relief: ReliefMap,
+                                   outside hole: (low: SIMD2<Double>, high: SIMD2<Double>)? = nil) -> [SCNNode] {
         let steps = OverheadMap.bandSteps
         var bands = [(positions: [Float], indices: [UInt32])](repeating: ([], []), count: steps.count)
+        func inside(_ p: SIMD2<Double>) -> Bool {
+            guard let hole else { return false }
+            return p.x > hole.low.x && p.y > hole.low.y && p.x < hole.high.x && p.y < hole.high.y
+        }
         for line in relief.crestLines(minLength: max(300, 10 * relief.cellSize)) {
-            guard let k = steps.firstIndex(where: { line.relief >= $0.relief }) else { continue }
-            let band = TrailWalk.ribbon(line.points, width: 1.6 + 1.2 * Double(steps[k].width), lift: 4) { relief.height(at: $0) }
-            let base = UInt32(bands[k].positions.count / 3)
-            for p in band.positions { bands[k].positions += [p.x, p.z, -p.y] }
-            bands[k].indices += band.indices.map { $0 + base }
+            guard let k = steps.firstIndex(where: { line.relief >= $0.relief }), hole == nil || k <= 1 else { continue }
+            let width = hole == nil ? 0.8 + 0.9 * Double(steps[k].width) : 0.25 * relief.cellSize * Double(steps[k].width)
+            // The stretches outside the hole, each its own band.
+            var runs: [[SIMD2<Double>]] = [[]]
+            for p in line.points {
+                if inside(p) {
+                    if !runs[runs.count - 1].isEmpty { runs.append([]) }
+                } else {
+                    runs[runs.count - 1].append(p)
+                }
+            }
+            for run in runs where run.count > 1 {
+                let band = TrailWalk.ribbon(run, width: width, lift: hole == nil ? 4 : 10) { relief.height(at: $0) }
+                let base = UInt32(bands[k].positions.count / 3)
+                for p in band.positions { bands[k].positions += [p.x, p.z, -p.y] }
+                bands[k].indices += band.indices.map { $0 + base }
+            }
         }
         return bands.indices.compactMap { k in
             guard !bands[k].indices.isEmpty else { return nil }
             let material = SCNMaterial()
             material.lightingModel = .constant
             material.diffuse.contents = UIColor(red: 0.86, green: 0.94, blue: 1.0, alpha: 1)
-            material.transparency = steps[k].opacity * 0.8
+            material.transparency = steps[k].opacity * 0.45
             material.blendMode = .add
             material.writesToDepthBuffer = false
             material.isDoubleSided = true
