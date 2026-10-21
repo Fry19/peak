@@ -827,6 +827,44 @@ final class AppModel {
 
     // MARK: Diagnostics
 
+    /// Waiting for a steady frame to save for testing.
+    var savingTestFrame = false
+
+    /// Saves the next frame the skyline matcher looks at (it only looks while the phone is
+    /// held steady) as a PNG and a case file for `peakbench align`, and hands back the two
+    /// files to share. Asking again before then just keeps waiting.
+    func saveTestFrame(_ done: @escaping ([URL]) -> Void) {
+        savingTestFrame = true
+        corrector.captureNext { [weak self] frame in
+            self?.savingTestFrame = false
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Test frames", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let png = dir.appendingPathComponent(frame.imageName + ".png")
+            let json = dir.appendingPathComponent(frame.imageName + ".json")
+            guard let data = Self.pngData(frame.image), (try? data.write(to: png)) != nil,
+                  (try? frame.caseFile.write(to: json)) != nil else { return }
+            done([png, json])
+        }
+    }
+
+    private static func pngData(_ image: RGBImage) -> Data? {
+        let n = image.width * image.height
+        var rgba = [UInt8](repeating: 255, count: n * 4)
+        for i in 0..<n {
+            rgba[4 * i] = image.pixels[3 * i]
+            rgba[4 * i + 1] = image.pixels[3 * i + 1]
+            rgba[4 * i + 2] = image.pixels[3 * i + 2]
+        }
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let cg = CGImage(width: image.width, height: image.height, bitsPerComponent: 8, bitsPerPixel: 32,
+                               bytesPerRow: image.width * 4, space: space,
+                               bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                               provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { return nil }
+        return UIImage(cgImage: cg).pngData()
+    }
+
     /// What the app is doing, for the diagnostics panel (long-press the pill).
     var debugLines: [String] {
         var lines: [String] = []

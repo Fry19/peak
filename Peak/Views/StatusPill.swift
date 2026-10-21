@@ -1,5 +1,6 @@
 import PeakCore
 import SwiftUI
+import UIKit
 
 /// The floating status: what the app is doing, which way you're facing, and whether the
 /// labels are locked to the skyline or following the compass. Tap it to pause the view;
@@ -64,22 +65,39 @@ struct StatusPill: View {
     }
 }
 
-/// What the app is doing under the hood, to screenshot when something looks wrong.
+/// What the app is doing under the hood, to screenshot when something looks wrong, and a
+/// button that saves the frame the skyline matcher looks at for testing at a desk.
 struct DebugPanel: View {
     let model: AppModel
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(model.debugLines.enumerated()), id: \.offset) { _, line in
-                    Text(line)
+        VStack(alignment: .leading, spacing: 6) {
+            TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(model.debugLines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                    }
                 }
+                .font(.system(size: 10, design: .monospaced))
             }
-            .font(.system(size: 10, design: .monospaced))
-            .foregroundStyle(.white)
-            .padding(8)
-            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+            .allowsHitTesting(false)
+            Button(model.savingTestFrame ? "Hold the phone steady…" : "Save frame for testing") {
+                model.saveTestFrame { Self.share($0) }
+            }
+            .font(.system(size: 12, weight: .semibold))
         }
-        .allowsHitTesting(false)
+        .foregroundStyle(.white)
+        .padding(8)
+        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// The share sheet, from whatever is on screen, to AirDrop the files to a Mac.
+    private static func share(_ urls: [URL]) {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        guard var top = scene?.keyWindow?.rootViewController else { return }
+        while let presented = top.presentedViewController { top = presented }
+        let sheet = UIActivityViewController(activityItems: urls, applicationActivities: nil)
+        sheet.popoverPresentationController?.sourceView = top.view
+        top.present(sheet, animated: true)
     }
 }

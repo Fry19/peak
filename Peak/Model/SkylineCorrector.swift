@@ -23,6 +23,24 @@ final class SkylineCorrector: @unchecked Sendable {
     /// Called on the main thread with each finished match.
     var onResult: ((Outcome) -> Void)?
 
+    /// A frame kept for testing at a desk: the upright picture the matcher looked at, larger,
+    /// and a case file for `peakbench align` that names it as `imageName`.
+    struct TestFrame {
+        var image: RGBImage
+        var caseFile: Data
+        var imageName: String
+    }
+
+    private var capture: ((TestFrame) -> Void)?
+
+    /// Keeps the next frame matched, with what the sensors said and how the match went.
+    /// `done` runs on the main thread.
+    func captureNext(_ done: @escaping (TestFrame) -> Void) {
+        lock.lock()
+        capture = done
+        lock.unlock()
+    }
+
     // Below the interface's priority, so matching never makes the screen stutter.
     private let work = DispatchQueue(label: "peak.skyline", qos: .utility)
     private let lock = NSLock()
@@ -61,6 +79,8 @@ final class SkylineCorrector: @unchecked Sendable {
         // The correction covers both the compass's north (magnetic or true) and its error.
         let isSideways = CameraGeometry.isSideways(pose)
         let correction = isSideways ? sideways : upright
+        let capture = self.capture
+        self.capture = nil
         lock.unlock()
 
         let pixels = frame.pixels
@@ -83,10 +103,67 @@ final class SkylineCorrector: @unchecked Sendable {
             prior.roll += correction.roll
             let m = self.matcher.match(upright.image, intrinsics: upright.camera.intrinsics, prior: prior, horizon: horizon)
             let a = m.alignment
-            self.finish(Outcome(delta: a.headingCorrection, pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
-                                sideways: isSideways, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
-                                seconds: m.seconds))
+            let outcome = Outcome(delta: a.headingCorrection, pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
+                                  sideways: isSideways, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
+                                  seconds: m.seconds)
+            if let capture, let frame = Self.testFrame(pixels, lens: lens, axes: axes, correction: correction,
+                                                       horizon: horizon, outcome: outcome) {
+                DispatchQueue.main.async { capture(frame) }
+            }
+            self.finish(outcome)
         }
+    }
+
+    /// The frame upright at up to 1920 pixels, and its case: where it was taken and the
+    /// attitude the matcher started from (the sensors with the corrections in use).
+    private static func testFrame(_ pixels: CVPixelBuffer, lens: CameraFeed.Lens,
+                                  axes: (right: SIMD3<Double>, down: SIMD3<Double>, forward: SIMD3<Double>),
+                                  correction: ViewCorrection, horizon: HorizonProfile, outcome: Outcome) -> TestFrame? {
+        guard let image = rgbImage(pixels, maxSide: 1920) else { return nil }
+        let frame = UprightFrame(image: image, intrinsics: lens.intrinsics.scaled(toWidth: image.width, height: image.height),
+                                 right: axes.right, down: axes.down, forward: axes.forward)
+        let sensors = frame.camera.attitude
+        let k = frame.camera.intrinsics
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        let name = "peak-frame-\(formatter.string(from: Date()))"
+        struct Case: Encodable {
+            var image: String
+            var latitude: Double
+            var longitude: Double
+            var altitude: Double
+            var heading: Double
+            var pitch: Double
+            var roll: Double
+            var horizontalFOV: Double
+            var note: String
+            var app: App
+        }
+        struct App: Encodable {
+            var sensors: [String: Double]
+            var correction: [String: Double]
+            var intrinsics: [String: Double]
+            var measuredLens: Bool
+            var match: [String: String]
+        }
+        let file = Case(
+            image: name + ".png", latitude: horizon.observer.latitude, longitude: horizon.observer.longitude,
+            altitude: horizon.observer.height,
+            heading: normalizedAzimuth(sensors.heading + correction.heading), pitch: sensors.pitch + correction.pitch,
+            roll: sensors.roll + correction.roll, horizontalFOV: k.horizontalFOV,
+            note: "Saved by the app. heading/pitch/roll are what the matcher started from: the sensors plus the " +
+                "corrections in use. Add anchors (marked summits) to measure the error.",
+            app: App(sensors: ["heading": sensors.heading, "pitch": sensors.pitch, "roll": sensors.roll],
+                     correction: ["heading": correction.heading, "pitch": correction.pitch, "roll": correction.roll],
+                     intrinsics: ["width": Double(k.width), "height": Double(k.height), "fx": k.fx, "fy": k.fy, "cx": k.cx, "cy": k.cy],
+                     measuredLens: lens.measured,
+                     match: ["accepted": outcome.accepted ? "yes" : "no", "reason": outcome.reason ?? "",
+                             "heading": String(format: "%+.3f", outcome.delta), "pitch": String(format: "%+.3f", outcome.pitchDelta),
+                             "roll": String(format: "%+.3f", outcome.rollDelta), "rms": String(format: "%.3f", outcome.rms)]))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(file) else { return nil }
+        return TestFrame(image: frame.image, caseFile: data, imageName: name)
     }
 
     private func finish(_ outcome: Outcome?) {
