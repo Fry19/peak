@@ -143,6 +143,15 @@ final class AppModel {
     @ObservationIgnored private var started = false
     @ObservationIgnored private var active = false
     @ObservationIgnored private var loading = false
+    /// Where the terrain and peaks were last loaded around (they're loaded again after
+    /// moving `reloadDistance` from it), the load under way, and a count of loads so a
+    /// superseded one stops.
+    @ObservationIgnored private var loadedAt: CLLocation?
+    @ObservationIgnored private var loadTask: Task<Void, Never>?
+    @ObservationIgnored private var loadGeneration = 0
+    static let reloadDistance = 2_000.0
+    /// A load for a place this far behind is dropped for one where you are.
+    static let restartDistance = 8_000.0
     @ObservationIgnored private(set) var onWiFi = false
     /// The best location so far, and the one the scene is built for.
     @ObservationIgnored private(set) var location: CLLocation?
@@ -381,11 +390,15 @@ final class AppModel {
            new.distance(from: old) < old.horizontalAccuracy { return }
         location = new
         // Tiles are 1° wide, so a rough first fix is enough to start downloading.
-        if !loading, new.horizontalAccuracy < 2_000, center.map({ new.distance(from: $0) > 1_000 }) ?? true {
+        guard new.horizontalAccuracy < 2_000 else { return }
+        let moved = loadedAt.map { new.distance(from: $0) } ?? .infinity
+        if moved > Self.reloadDistance, !loading || moved > Self.restartDistance {
+            // Somewhere new: sharp terrain and peaks around it. (A load under way for a spot
+            // nearby finishes first, and then loads again around where you are.)
             load(new)
         } else if let center, scene != nil, new.horizontalAccuracy < 50,
                   new.distance(from: center) > max(50, new.horizontalAccuracy) {
-            // A better fix nearby: rebuild for the exact spot (the terrain is already here).
+            // Moved a little, or a better fix: rebuild for the exact spot (the terrain is here).
             self.center = new
             Task { @MainActor in await rebuild() }
         }
@@ -397,7 +410,11 @@ final class AppModel {
     /// within 35 km, and 120 m everywhere; further 30 m terrain on Wi-Fi or in an area saved
     /// for offline use (where it's all on the phone already).
     private func load(_ start: CLLocation) {
+        loadTask?.cancel()
+        loadGeneration += 1
+        let generation = loadGeneration
         loading = true
+        loadedAt = start
         let lat = start.coordinate.latitude, lon = start.coordinate.longitude
         let keys = DataStore.tiles(latitude: lat, longitude: lon, radius: TerrainScene.radius)
             .sorted { DataStore.distance(from: lat, lon, to: $0) < DataStore.distance(from: lat, lon, to: $1) }
@@ -407,17 +424,33 @@ final class AppModel {
         // Peaks come from a different server; don't wait for them to show the terrain.
         Task { @MainActor in
             let found = await store.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
+            guard generation == loadGeneration else { return }
             peaks = found
             if scene != nil { await rebuild() }
         }
 
-        Task { @MainActor in
-            defer { loading = false }
+        loadTask = Task { @MainActor in
+            // A newer load has taken over from this one.
+            var superseded: Bool { generation != self.loadGeneration }
+            defer {
+                if !superseded {
+                    loading = false
+                    loadTask = nil
+                    // Moved on while this ran: load around where you are now.
+                    if let location = self.location, location.horizontalAccuracy < 2_000,
+                       location.distance(from: start) > Self.reloadDistance { self.load(location) }
+                }
+            }
             if scene == nil { phase = .loading("Getting terrain…") }
             var done = 0
             await withTaskGroup(of: (DataStore.Key, ElevationTile?).self) { group in
                 for key in keys {
                     let level = key == here || DataStore.distance(from: lat, lon, to: key) < 30_000 ? 2 : 3
+                    // Already here from a load nearby.
+                    if let have = tiles[key], have.rows <= 4 || Self.level(of: have) <= level {
+                        done += 1
+                        continue
+                    }
                     group.addTask {
                         var tile: ElevationTile?
                         do {
@@ -433,6 +466,10 @@ final class AppModel {
                     }
                 }
                 for await (key, tile) in group {
+                    if superseded {
+                        group.cancelAll()
+                        break
+                    }
                     done += 1
                     if let tile, tiles[key].map({ $0.rows < tile.rows }) ?? true { tiles[key] = tile }
                     bytesDownloaded = await store.bytesDownloaded
@@ -442,14 +479,20 @@ final class AppModel {
                     }
                     // Show the view as soon as the terrain around you is in; the rest fills in.
                     if key == here, tile != nil {
-                        if center == nil { center = location ?? start }
+                        center = location ?? start
                         await rebuild()
                         phase = .ready
                     }
                 }
             }
+            guard !superseded else { return }
             for key in tiles.keys where !keys.contains(key) { tiles[key] = nil }
-            for key in detail.keys where !keys.contains(key) { detail[key] = nil }
+            // Sharper patches from earlier places that are now too far to matter.
+            for (key, patches) in detail {
+                let d = DataStore.distance(from: lat, lon, to: key)
+                if !keys.contains(key) { detail[key] = nil; continue }
+                for level in patches.keys where d > (level == 0 ? 25_000 : 60_000) { detail[key]?[level] = nil }
+            }
             if tiles[here] == nil {
                 if scene == nil { phase = .failed("Couldn't download the terrain here. Check your connection and reopen Peak.") }
                 return
@@ -461,22 +504,26 @@ final class AppModel {
             // Sharper terrain, nearest first; each pass shows when it's done.
             let saved = areas.contains { $0.complete && $0.contains(LatLon(lat, lon)) }
             let generous = saved || onWiFi || settings.detailOnMobile
-            await sharpen(keys, lat, lon, level: 0, radius: 10_000)
-            await sharpen(keys, lat, lon, level: 1, radius: 35_000)
-            await upgrade(keys, lat, lon, toLevel: 2, within: generous ? TerrainScene.radius + 50_000 : 60_000)
-            if generous { await sharpen(keys, lat, lon, level: 0, radius: saved || onWiFi ? 25_000 : 15_000) }
+            await sharpen(keys, lat, lon, level: 0, radius: 10_000, generation: generation)
+            await sharpen(keys, lat, lon, level: 1, radius: 35_000, generation: generation)
+            await upgrade(keys, lat, lon, toLevel: 2, within: generous ? TerrainScene.radius + 50_000 : 60_000, generation: generation)
+            if generous { await sharpen(keys, lat, lon, level: 0, radius: saved || onWiFi ? 25_000 : 15_000, generation: generation) }
         }
     }
 
     /// Fetches `level` patches for the part of each tile within `radius` of the point.
-    @MainActor private func sharpen(_ keys: [DataStore.Key], _ lat: Double, _ lon: Double, level: Int, radius: Double) async {
+    @MainActor private func sharpen(_ keys: [DataStore.Key], _ lat: Double, _ lon: Double, level: Int, radius: Double,
+                                    generation: Int) async {
         var changed = false
         for key in keys where DataStore.distance(from: lat, lon, to: key) < radius {
+            guard generation == loadGeneration else { return }
             if let have = tiles[key], have.rows <= 4 || Self.level(of: have) <= level { continue }
             do {
                 if let patch = try await store.patch(key, level: level, latitude: lat, longitude: lon, radius: radius) {
-                    // Keep the bigger patch if one from an earlier pass covers more.
-                    if let old = detail[key]?[level], old.rows * old.cols > patch.rows * patch.cols { continue }
+                    guard generation == loadGeneration else { return }
+                    // Keep an earlier patch only if it already covers all of this one (a wider
+                    // pass here); one from where you were before gives way.
+                    if let old = detail[key]?[level], Self.covers(old, patch) { continue }
                     detail[key, default: [:]][level] = patch
                     changed = true
                 }
@@ -489,11 +536,13 @@ final class AppModel {
     }
 
     /// Fetches whole tiles at `level` for tiles within `within` meters that are coarser.
-    @MainActor private func upgrade(_ keys: [DataStore.Key], _ lat: Double, _ lon: Double, toLevel level: Int, within: Double) async {
+    @MainActor private func upgrade(_ keys: [DataStore.Key], _ lat: Double, _ lon: Double, toLevel level: Int, within: Double,
+                                    generation: Int) async {
         var changed = false
         for key in keys where DataStore.distance(from: lat, lon, to: key) < within {
+            guard generation == loadGeneration else { return }
             if let have = tiles[key], have.rows <= 4 || Self.level(of: have) <= level { continue }
-            if let tile = try? await store.tile(key, level: level) {
+            if let tile = try? await store.tile(key, level: level), generation == loadGeneration {
                 tiles[key] = tile
                 changed = true
             } else if tiles[key] == nil, await store.isSea(key) {
@@ -677,6 +726,15 @@ final class AppModel {
     }
 
     /// 0 for a full 30 m tile, 1 for 60 m, 2 for 120 m, 3 for 240 m.
+    /// Whether patch `a` covers all of patch `b` (both of one tile, at one level).
+    private static func covers(_ a: ElevationTile, _ b: ElevationTile) -> Bool {
+        let ey = a.stepLatitude / 2, ex = a.stepLongitude / 2
+        return a.originLatitude + ey >= b.originLatitude &&
+            a.originLongitude - ex <= b.originLongitude &&
+            a.originLatitude - Double(a.rows - 1) * a.stepLatitude - ey <= b.originLatitude - Double(b.rows - 1) * b.stepLatitude &&
+            a.originLongitude + Double(a.cols - 1) * a.stepLongitude + ex >= b.originLongitude + Double(b.cols - 1) * b.stepLongitude
+    }
+
     static func level(of tile: ElevationTile) -> Int {
         let pixel = tile.stepLatitude * 3600
         return pixel < 1.5 ? 0 : pixel < 3 ? 1 : pixel < 6 ? 2 : 3
