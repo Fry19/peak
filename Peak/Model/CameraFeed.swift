@@ -42,6 +42,21 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
     private var device: AVCaptureDevice?
     /// Called on the camera queue for every frame. Must return quickly.
     var onFrame: ((Frame) -> Void)?
+    /// Called on the main thread when the camera stops or comes back by itself (another app
+    /// takes it, an error, the phone too hot).
+    var onStateChange: ((AppStatus.Camera) -> Void)?
+    /// Running is wanted (between `start` and `stop`); only touched on `queue`.
+    private var wantsRunning = false
+    private var pressureObservation: NSKeyValueObservation?
+
+    override init() {
+        super.init()
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(interrupted), name: AVCaptureSession.wasInterruptedNotification, object: session)
+        center.addObserver(self, selector: #selector(interruptionEnded), name: AVCaptureSession.interruptionEndedNotification,
+                           object: session)
+        center.addObserver(self, selector: #selector(runtimeError), name: AVCaptureSession.runtimeErrorNotification, object: session)
+    }
 
     /// The lens of the latest frame.
     var lens: Lens? {
@@ -51,25 +66,60 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
     }
 
     /// Asks for camera access and starts the camera. `completion` runs on the main thread
-    /// with whether the camera is running.
-    func start(completion: @escaping (Bool) -> Void) {
+    /// with whether the camera is running, not allowed, or didn't start.
+    func start(completion: @escaping (AppStatus.Camera) -> Void) {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
             guard let self, granted else {
-                DispatchQueue.main.async { completion(false) }
+                DispatchQueue.main.async { completion(.denied) }
                 return
             }
             self.queue.async {
+                self.wantsRunning = true
                 if self.session.inputs.isEmpty { self.configure() }
                 if !self.session.isRunning { self.session.startRunning() }
                 let running = self.session.isRunning
-                DispatchQueue.main.async { completion(running) }
+                DispatchQueue.main.async { completion(running ? .running : .failed) }
             }
         }
     }
 
     func stop() {
-        queue.async { [session] in
+        queue.async { [self] in
+            wantsRunning = false
             if session.isRunning { session.stopRunning() }
+        }
+    }
+
+    private func report(_ state: AppStatus.Camera) {
+        DispatchQueue.main.async { [weak self] in self?.onStateChange?(state) }
+    }
+
+    @objc private func interrupted(_ note: Notification) {
+        let raw = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
+        let message: String?
+        switch raw.flatMap(AVCaptureSession.InterruptionReason.init(rawValue:)) {
+        case .videoDeviceInUseByAnotherClient: message = "Another app is using the camera."
+        case .videoDeviceNotAvailableWithMultipleForegroundApps: message = "The camera pauses while another app shares the screen."
+        case .videoDeviceNotAvailableDueToSystemPressure: message = "The phone is too hot for the camera. It comes back as it cools."
+        default: message = nil   // going to the background, which stops the camera anyway
+        }
+        if let message { report(.interrupted(message)) }
+    }
+
+    @objc private func interruptionEnded(_ note: Notification) {
+        queue.async { [self] in
+            if wantsRunning, !session.isRunning { session.startRunning() }
+            report(session.isRunning || !wantsRunning ? .running : .failed)
+        }
+    }
+
+    /// The session stopped on an error (most often the media services restarting): start it
+    /// again, once, after a moment; if that doesn't work the pill offers to retry.
+    @objc private func runtimeError(_ note: Notification) {
+        queue.asyncAfter(deadline: .now() + 0.5) { [self] in
+            guard wantsRunning else { return }
+            if !session.isRunning { session.startRunning() }
+            report(session.isRunning ? .running : .failed)
         }
     }
 
@@ -94,26 +144,67 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
         self.output = output
         configureConnection()
         configureFocus()
+        // When the phone heats up, ease off before the system stops the camera.
+        pressureObservation = device.observe(\.systemPressureState, options: [.initial, .new]) { [weak self] device, _ in
+            let level = device.systemPressureState.level
+            self?.queue.async {
+                guard let self else { return }
+                let throttled = level == .serious || level == .critical || level == .shutdown
+                guard throttled != self.throttled else { return }
+                self.throttled = throttled
+                self.applyFormat()
+            }
+        }
     }
 
     private var output: AVCaptureVideoDataOutput?
     private var highResolution = false
+    private var wantsHighResolution = false
+    /// The phone is hot: no 4K, and fewer frames a second.
+    private var throttled = false
+    /// Whether the frame rate set is the slow one.
+    private var slowFrames = false
 
     /// Records in 4K (when the phone can) so a zoomed-in picture stays sharp, or back in
     /// 1080p. Switching takes a moment, so it's only done when the zoom crosses a threshold.
     func setHighResolution(_ on: Bool) {
         queue.async { [self] in
-            guard on != highResolution, !session.inputs.isEmpty else { return }
-            let preset: AVCaptureSession.Preset = on ? .hd4K3840x2160 : .hd1920x1080
-            guard session.canSetSessionPreset(preset) else { return }
-            highResolution = on
-            session.beginConfiguration()
-            session.sessionPreset = preset
-            session.commitConfiguration()
-            // A new format can reset these.
-            configureConnection()
-            configureFocus()
+            wantsHighResolution = on
+            applyFormat()
         }
+    }
+
+    /// Sets the resolution and frame rate for what's wanted and how hot the phone is. On `queue`.
+    private func applyFormat() {
+        guard !session.inputs.isEmpty else { return }
+        let high = wantsHighResolution && !throttled
+        var newFormat = false
+        if high != highResolution {
+            let preset: AVCaptureSession.Preset = high ? .hd4K3840x2160 : .hd1920x1080
+            if session.canSetSessionPreset(preset) {
+                highResolution = high
+                newFormat = true
+                session.beginConfiguration()
+                session.sessionPreset = preset
+                session.commitConfiguration()
+                // A new format can reset these.
+                configureConnection()
+                configureFocus()
+            }
+        }
+        // 15 frames a second while hot; otherwise the format's own rate (an invalid time
+        // puts it back). A new format starts at its own rate.
+        guard throttled != slowFrames || (newFormat && throttled),
+              let device, (try? device.lockForConfiguration()) != nil else { return }
+        slowFrames = throttled
+        if throttled, device.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 15 && 15 <= $0.maxFrameRate }) {
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 15)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 15)
+        } else {
+            device.activeVideoMinFrameDuration = .invalid
+            device.activeVideoMaxFrameDuration = .invalid
+        }
+        device.unlockForConfiguration()
     }
 
     private func configureConnection() {

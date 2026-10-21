@@ -14,9 +14,22 @@
 		7E4A00000000000000000001 /* Peak.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Peak.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		7E4A0000000000000000001A /* Exceptions for "Peak" folder in "Peak" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 7E4A00000000000000000006 /* Peak */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		7E4A00000000000000000002 /* Peak */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				7E4A0000000000000000001A /* Exceptions for "Peak" folder in "Peak" target */,
+			);
 			path = Peak;
 			sourceTree = "<group>";
 		};
@@ -204,6 +217,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Peak/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Peak;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Peak shows the names of the mountains in front of you on the camera picture.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Peak uses your location to work out which mountains you can see.";
@@ -237,6 +251,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Peak/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Peak;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Peak shows the names of the mountains in front of you on the camera picture.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Peak uses your location to work out which mountains you can see.";

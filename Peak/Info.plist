@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyLists-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSLocationTemporaryUsageDescriptionDictionary</key>
+	<dict>
+		<key>MountainLabels</key>
+		<string>Peak needs your precise location to tell which mountains you see and to line the labels up with them.</string>
+	</dict>
+</dict>
+</plist>

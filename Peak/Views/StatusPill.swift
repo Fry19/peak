@@ -43,23 +43,36 @@ struct StatusPill: View {
             Image(systemName: "pause.fill").font(.system(size: 10))
             Text("Paused" + (heading.map { " · \($0)" } ?? ""))
         } else {
-            switch model.phase {
+            switch model.status {
             case .locating:
                 ProgressView().controlSize(.small).tint(.white)
                 Text("Finding your position…")
             case let .loading(text):
                 ProgressView().controlSize(.small).tint(.white)
                 Text(text)
-            case let .needsPermission(text), let .failed(text):
+            case let .problem(text, action):
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-                Text(text).multilineTextAlignment(.leading).frame(maxWidth: 260)
-            case .ready:
+                Text(text).multilineTextAlignment(.leading).frame(maxWidth: 220)
+                if let action {
+                    Button(action == .openSettings ? "Settings" : "Retry") {
+                        if action == .openSettings, let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        } else {
+                            model.retry()
+                        }
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(.white.opacity(0.2), in: Capsule())
+                }
+            case let .ready(note):
                 let state = model.correction.state
                 Circle()
                     .fill(state == .locked ? Color.green : state == .byHand ? Color.cyan : Color.orange)
                     .frame(width: 7, height: 7)
                 Text((heading.map { "\($0) · " } ?? "") + (state == .locked ? "Locked" : state == .byHand ? "Lined up" : "Compass")
-                     + (model.waitingForPeaks ? " · Getting peaks…" : ""))
+                     + (model.waitingForPeaks ? " · Getting peaks…" : "") + (note.map { " · \($0)" } ?? ""))
             }
         }
     }

@@ -7,14 +7,6 @@ import UIKit
 
 @Observable
 final class AppModel {
-    enum Phase: Equatable {
-        case locating
-        case loading(String)
-        case ready
-        case needsPermission(String)
-        case failed(String)
-    }
-
     /// The corrections from skyline matching (smoothed over frames) and from lining the
     /// view up by hand.
     struct Correction {
@@ -130,11 +122,23 @@ final class AppModel {
         case loaded
     }
 
-    var phase: Phase = .locating
+    /// How getting the view ready is going. With the camera and location permissions, each
+    /// kept apart so none overwrites another, it decides what the pill shows (`status`).
+    private(set) var loadState: AppStatus.Load = .locating
+    private(set) var cameraState: AppStatus.Camera = .starting
+    private(set) var locationPermission: AppStatus.Permission = .undetermined
+    /// Precise Location is on, or allowed for now.
+    private(set) var preciseLocation = true
+    var status: AppStatus {
+        AppStatus.resolve(camera: cameraState, location: locationPermission, preciseLocation: preciseLocation, load: loadState)
+    }
     private(set) var peaksState: PeaksState = .loading
     var scene: TerrainScene?
     var correction = Correction()
-    var frozen: Frozen?
+    var frozen: Frozen? {
+        // A frozen view throws matches away, so don't make them.
+        didSet { corrector.paused = frozen != nil }
+    }
     var settings = AppSettings.load()
     var sheet: Sheet?
     /// The peak highlighted in the view (tapped, or picked from the list).
@@ -182,10 +186,23 @@ final class AppModel {
     @ObservationIgnored private var loadedAt: CLLocation?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var loadGeneration = 0
+    /// The tiles the latest load wanted, to try again for the ones that failed.
+    @ObservationIgnored private var loadKeys: [DataStore.Key] = []
+    /// Where a load last failed to get the terrain (`loadedAt` is cleared then, so it's
+    /// tried again), so new fixes nearby don't each start another.
+    @ObservationIgnored private var failedAt: CLLocation?
+    @ObservationIgnored private var terrainBackoff = Backoff(initial: 5, maximum: 300)
+    @ObservationIgnored private var retryTask: Task<Void, Never>?
+    @ObservationIgnored private var fillingGaps = false
     static let reloadDistance = 2_000.0
     /// A load for a place this far behind is dropped for one where you are.
     static let restartDistance = 8_000.0
     @ObservationIgnored private(set) var onWiFi = false
+    @ObservationIgnored private var online = false
+    /// Temporary full accuracy has been asked for since Peak last came to the front.
+    @ObservationIgnored private var askedForPrecision = false
+    /// The accuracy of the fix the view on screen was built from, meters.
+    @ObservationIgnored private(set) var sceneAccuracy = Double.infinity
     /// The best location so far, and the one the scene is built for.
     @ObservationIgnored private(set) var location: CLLocation?
     @ObservationIgnored private var center: CLLocation?
@@ -212,7 +229,9 @@ final class AppModel {
         var upright = correction.view(sideways: false), sideways = correction.view(sideways: true)
         upright.heading += north
         sideways.heading += north
-        corrector.update(horizon: scene?.horizon, upright: upright, sideways: sideways)
+        // Matching against the horizon from a rough fix would lock onto the wrong one.
+        let horizon = sceneAccuracy < LocationQuality.matchingAccuracy ? scene?.horizon : nil
+        corrector.update(horizon: horizon, upright: upright, sideways: sideways)
     }
 
     func start() {
@@ -220,7 +239,11 @@ final class AppModel {
         started = true
 
         loadCalibration()
-        Task { @MainActor in areas = await store.loadAreas() }
+        Task { @MainActor in
+            areas = await store.loadAreas()
+            // Areas whose download stopped partway (Peak was closed, or it failed) go on.
+            for area in areas where !area.complete { download(area) }
+        }
         locationDelegate.onLocation = { [weak self] in self?.locationChanged($0) }
         locationDelegate.onHeading = { [weak self] heading in
             // True heading minus magnetic heading is the declination here.
@@ -230,34 +253,25 @@ final class AppModel {
                 self?.motion.setDeclination(d)
             }
         }
-        locationDelegate.onAuthorization = { [weak self] status in
-            guard let self else { return }
-            switch status {
-            case .denied, .restricted:
-                self.phase = .needsPermission("Peak needs your location to know which mountains you see. Allow it in Settings.")
-            case .authorizedWhenInUse, .authorizedAlways:
-                // With the location known, the sensors can reference true north.
-                if self.active { self.motion.start(trueNorth: true) }
-            default:
-                break
-            }
-        }
+        locationDelegate.onAuthorization = { [weak self] _ in self?.authorizationChanged() }
         locationManager.delegate = locationDelegate
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
         locationManager.distanceFilter = 10
         locationManager.requestWhenInUseAuthorization()
 
         network.pathUpdateHandler = { [weak self] path in
-            let wifi = path.status == .satisfied && !path.isExpensive
-            DispatchQueue.main.async { self?.onWiFi = wifi }
+            let online = path.status == .satisfied
+            let wifi = online && !path.isExpensive
+            DispatchQueue.main.async { self?.networkChanged(online: online, wifi: wifi) }
         }
         network.start(queue: DispatchQueue(label: "peak.network"))
 
         // Every frame goes to the screen with the moment it was taken; about one a second
         // also goes to skyline matching, with the phone's pose at that moment.
+        camera.onStateChange = { [weak self] in self?.cameraState = $0 }
         camera.onFrame = { [weak self] frame in
             guard let self else { return }
-            if let pose = self.motion.pose(at: frame.time) {
+            if !self.corrector.paused, let pose = self.motion.pose(at: frame.time) {
                 self.corrector.offer(frame, pose: pose, steady: self.motion.isSteady)
             }
             self.mailbox.post(frame) { [weak self] in self?.screen?.show($0) }
@@ -282,18 +296,80 @@ final class AppModel {
             motion.start(trueNorth: status == .authorizedWhenInUse || status == .authorizedAlways)
             locationManager.startUpdatingLocation()
             locationManager.startUpdatingHeading()
-            camera.start { [weak self] running in
-                if !running {
-                    self?.phase = .needsPermission("Peak needs the camera to label the mountains. Allow it in Settings.")
-                }
-            }
+            startCamera()
+            authorizationChanged()
+            // What failed or was cut short while away: try again now.
+            terrainBackoff.reset()
+            retryMissing()
+            resumeAreas()
         } else {
+            askedForPrecision = false
             saveCalibration()
             camera.stop()
             motion.stop()
             locationManager.stopUpdatingHeading()
             locationManager.stopUpdatingLocation()
         }
+    }
+
+    private func startCamera() {
+        if cameraState != .running { cameraState = .starting }
+        camera.start { [weak self] in self?.cameraState = $0 }
+    }
+
+    /// What the pill's Retry does: start the camera again, or load what failed.
+    func retry() {
+        if cameraState == .failed { startCamera() }
+        if case .failed = loadState {
+            terrainBackoff.reset()
+            retryMissing()
+        }
+    }
+
+    // MARK: Permissions and connection
+
+    private func authorizationChanged() {
+        switch locationManager.authorizationStatus {
+        case .denied, .restricted:
+            locationPermission = .denied
+        case .authorizedWhenInUse, .authorizedAlways:
+            locationPermission = .granted
+            // With the location known, the sensors can reference true north.
+            if active { motion.start(trueNorth: true) }
+            checkPrecision()
+        default:
+            locationPermission = .undetermined
+        }
+    }
+
+    /// With Precise Location off, fixes are kilometers out, too rough to tell which
+    /// mountains are which: ask for full accuracy while Peak is in use (once each time it
+    /// comes to the front). If that's turned down, the pill says so.
+    private func checkPrecision() {
+        if locationManager.accuracyAuthorization == .fullAccuracy {
+            preciseLocation = true
+            return
+        }
+        preciseLocation = false
+        guard active, !askedForPrecision else { return }
+        askedForPrecision = true
+        locationManager.requestTemporaryFullAccuracyAuthorization(withPurposeKey: "MountainLabels") { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.preciseLocation = self.locationManager.accuracyAuthorization == .fullAccuracy
+            }
+        }
+    }
+
+    private func networkChanged(online: Bool, wifi: Bool) {
+        let back = online && !self.online
+        self.online = online
+        onWiFi = wifi
+        guard back else { return }
+        // The connection came back: try again now for what failed.
+        terrainBackoff.reset()
+        retryMissing()
+        if case .retrying = peaksState, let place = peaksPlace { loadPeaks(place.lat, place.lon, generation: place.generation) }
     }
 
     // MARK: Freeze frame
@@ -454,15 +530,17 @@ final class AppModel {
            new.distance(from: old) < old.horizontalAccuracy { return }
         location = new
         // Tiles are 1° wide, so a rough first fix is enough to start downloading.
-        guard new.horizontalAccuracy < 2_000 else { return }
-        let moved = loadedAt.map { new.distance(from: $0) } ?? .infinity
+        guard LocationQuality.usableForLoading(accuracy: new.horizontalAccuracy, precise: preciseLocation) else { return }
+        // After a failed load, nearby fixes leave it to the retries.
+        let moved = (loadedAt ?? failedAt).map { new.distance(from: $0) } ?? .infinity
         if moved > Self.reloadDistance, !loading || moved > Self.restartDistance {
             // Somewhere new: sharp terrain and peaks around it. (A load under way for a spot
             // nearby finishes first, and then loads again around where you are.)
             load(new)
-        } else if let center, scene != nil, new.horizontalAccuracy < 50,
-                  new.distance(from: center) > max(50, new.horizontalAccuracy) {
-            // Moved a little, or a better fix: rebuild for the exact spot (the terrain is here).
+        } else if let center, scene != nil,
+                  LocationQuality.shouldRefine(sceneAccuracy: center.horizontalAccuracy, newAccuracy: new.horizontalAccuracy,
+                                               moved: new.distance(from: center)) {
+            // Moved a little, or a much better fix: rebuild for the exact spot (the terrain is here).
             self.center = new
             Task { @MainActor in await rebuild() }
         }
@@ -475,41 +553,22 @@ final class AppModel {
     /// for offline use (where it's all on the phone already).
     private func load(_ start: CLLocation) {
         loadTask?.cancel()
+        retryTask?.cancel()
+        retryTask = nil
         loadGeneration += 1
         let generation = loadGeneration
         loading = true
         loadedAt = start
+        failedAt = nil
         let lat = start.coordinate.latitude, lon = start.coordinate.longitude
         let keys = DataStore.tiles(latitude: lat, longitude: lon, radius: TerrainScene.radius)
             .sorted { DataStore.distance(from: lat, lon, to: $0) < DataStore.distance(from: lat, lon, to: $1) }
+        loadKeys = keys
         let here = DataStore.Key(south: Int(lat.rounded(.down)), west: Int(lon.rounded(.down)))
         let store = self.store
 
-        // Peaks come from a different server; don't wait for them to show the terrain. With
-        // no signal or the servers busy, keep trying until a newer load takes over.
-        peaksState = .loading
-        Task { @MainActor in
-            var wait = 10.0
-            while true {
-                do {
-                    let found = try await store.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
-                    // A newer load's peaks win, but these, from a few km away, do until then.
-                    let current = generation == loadGeneration
-                    guard current || peaks.isEmpty else { return }
-                    peaks = found
-                    if current { peaksState = .loaded }
-                    if scene != nil { await rebuild() }
-                    return
-                } catch {
-                    guard generation == loadGeneration else { return }
-                    peaksState = .retrying(at: Date().addingTimeInterval(wait), reason: error.localizedDescription)
-                    try? await Task.sleep(for: .seconds(wait))
-                    guard generation == loadGeneration else { return }
-                    peaksState = .loading
-                    wait = min(wait * 2, 60)
-                }
-            }
-        }
+        // Peaks come from a different server; don't wait for them to show the terrain.
+        loadPeaks(lat, lon, generation: generation)
 
         loadTask = Task { @MainActor in
             // A newer load has taken over from this one.
@@ -533,9 +592,10 @@ final class AppModel {
             } else if scene != nil {
                 center = nil
                 scene = nil
+                sceneAccuracy = .infinity
                 updateCorrector()
             }
-            if scene == nil { phase = .loading("Getting terrain…") }
+            if scene == nil { loadState = .loading("Getting terrain…") }
             var done = 0
             await withTaskGroup(of: (DataStore.Key, ElevationTile?).self) { group in
                 for key in keys {
@@ -569,13 +629,13 @@ final class AppModel {
                     bytesDownloaded = await store.bytesDownloaded
                     if scene == nil {
                         let mb = String(format: "%.1f", Double(bytesDownloaded) / 1_000_000)
-                        phase = .loading("Downloading terrain · \(done) of \(keys.count) · \(mb) MB")
+                        loadState = .loading("Downloading terrain · \(done) of \(keys.count) · \(mb) MB")
                     }
                     // Show the view as soon as the terrain around you is in; the rest fills in.
                     if key == here, tile != nil {
                         center = location ?? start
                         await rebuild()
-                        phase = .ready
+                        loadState = .ready
                     }
                 }
             }
@@ -588,12 +648,17 @@ final class AppModel {
                 for level in patches.keys where d > (level == 0 ? 25_000 : 60_000) { detail[key]?[level] = nil }
             }
             if tiles[here] == nil {
-                if scene == nil { phase = .failed("Couldn't download the terrain here. Check your connection and reopen Peak.") }
+                // Not loaded after all: tried again with a growing wait, when the connection
+                // comes back, and when Peak comes back to the front.
+                loadedAt = nil
+                failedAt = start
+                if scene == nil { loadState = .failed("Couldn't download the terrain here. Trying again…") }
+                scheduleTerrainRetry()
                 return
             }
             center = location ?? start
             await rebuild()
-            phase = .ready
+            loadState = .ready
 
             // Sharper terrain, nearest first; each pass shows when it's done.
             let saved = areas.contains { $0.complete && $0.contains(LatLon(lat, lon)) }
@@ -602,7 +667,100 @@ final class AppModel {
             await sharpen(keys, lat, lon, level: 1, radius: 35_000, generation: generation)
             await upgrade(keys, lat, lon, toLevel: 2, within: generous ? TerrainScene.radius + 50_000 : 60_000, generation: generation)
             if generous { await sharpen(keys, lat, lon, level: 0, radius: saved || onWiFi ? 25_000 : 15_000, generation: generation) }
+            guard !superseded else { return }
+            // Tiles that failed further out (the passes above only reach so far on mobile data).
+            if keys.contains(where: { tiles[$0] == nil }) { scheduleTerrainRetry() } else { terrainBackoff.reset() }
         }
+    }
+
+    /// Where and for which load the peaks are being fetched.
+    @ObservationIgnored private var peaksPlace: (lat: Double, lon: Double, generation: Int)?
+    @ObservationIgnored private var peaksTask: Task<Void, Never>?
+
+    /// Gets the peaks around a point. With no signal or the servers busy, keeps trying
+    /// until a newer load takes over (or right away when the connection comes back).
+    private func loadPeaks(_ lat: Double, _ lon: Double, generation: Int) {
+        // An earlier load's fetch carries on (its peaks do until these come); this load's
+        // own, waiting to try again, starts over.
+        if peaksPlace?.generation == generation { peaksTask?.cancel() }
+        peaksPlace = (lat, lon, generation)
+        peaksState = .loading
+        let store = self.store
+        peaksTask = Task { @MainActor in
+            var wait = 10.0
+            while !Task.isCancelled {
+                do {
+                    let found = try await store.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
+                    guard !Task.isCancelled else { return }
+                    // A newer load's peaks win, but these, from a few km away, do until then.
+                    let current = generation == loadGeneration
+                    guard current || peaks.isEmpty else { return }
+                    peaks = found
+                    if current { peaksState = .loaded }
+                    if scene != nil { await rebuild() }
+                    return
+                } catch {
+                    guard generation == loadGeneration, !Task.isCancelled else { return }
+                    peaksState = .retrying(at: Date().addingTimeInterval(wait), reason: error.localizedDescription)
+                    try? await Task.sleep(for: .seconds(wait))
+                    guard generation == loadGeneration, !Task.isCancelled else { return }
+                    peaksState = .loading
+                    wait = min(wait * 2, 60)
+                }
+            }
+        }
+    }
+
+    /// Tries again for terrain that failed after a wait that grows each time.
+    private func scheduleTerrainRetry() {
+        let wait = terrainBackoff.next()
+        retryTask?.cancel()
+        retryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled, let self else { return }
+            self.retryTask = nil
+            self.retryMissing()
+        }
+    }
+
+    /// Loads what's missing: everything when the terrain here never came, otherwise the
+    /// tiles of the latest load that failed. Only while Peak is in use.
+    private func retryMissing() {
+        retryTask?.cancel()
+        retryTask = nil
+        guard active, !loading, let location,
+              LocationQuality.usableForLoading(accuracy: location.horizontalAccuracy, precise: preciseLocation) else { return }
+        if loadedAt == nil {
+            load(location)
+        } else if !fillingGaps, loadKeys.contains(where: { tiles[$0] == nil }) {
+            Task { @MainActor in await fillGaps(generation: loadGeneration) }
+        }
+    }
+
+    /// Fetches the tiles of the latest load that failed, as that load would have.
+    @MainActor private func fillGaps(generation: Int) async {
+        guard let start = loadedAt else { return }
+        fillingGaps = true
+        defer { fillingGaps = false }
+        let lat = start.coordinate.latitude, lon = start.coordinate.longitude
+        let here = DataStore.Key(south: Int(lat.rounded(.down)), west: Int(lon.rounded(.down)))
+        var changed = false, failed = false
+        for key in loadKeys where tiles[key] == nil {
+            guard generation == loadGeneration else { return }
+            let level = key == here || DataStore.distance(from: lat, lon, to: key) < 30_000 ? 2 : 3
+            do {
+                var tile: ElevationTile?
+                if !(await store.isSea(key)) { tile = try await store.tile(key, level: level) }
+                guard generation == loadGeneration else { return }
+                tiles[key] = tile ?? Self.seaTile(key)
+                changed = true
+            } catch {
+                failed = true
+            }
+        }
+        bytesDownloaded = await store.bytesDownloaded
+        if changed { await rebuild() }
+        if failed { scheduleTerrainRetry() } else { terrainBackoff.reset() }
     }
 
     /// Fetches `level` patches for the part of each tile within `radius` of the point.
@@ -675,14 +833,27 @@ final class AppModel {
         }
         areaProgress = AreaProgress(id: area.id)
         areaTask = Task { @MainActor in
-            // Keep going for a while if Peak is sent to the background.
-            let background = BackgroundTime(name: "Save area")
+            // Keep going for a while if Peak is sent to the background; if that time runs
+            // out, it goes on when Peak comes back.
+            let background = BackgroundTime(name: "Save area") { [weak self] in self?.cutShort.insert(area.id) }
             defer { background.end() }
             await fetch(area)
             guard !Task.isCancelled else { return }   // deleted; deleting moves the queue on
             areaProgress = nil
             areaTask = nil
+            if active { resumeAreas() }
             startNextArea()
+        }
+    }
+
+    /// Areas whose download ran out of time in the background.
+    @ObservationIgnored private var cutShort: Set<UUID> = []
+
+    /// Downloads again the areas cut short in the background (for what didn't come).
+    private func resumeAreas() {
+        for id in cutShort where areaProgress?.id != id {
+            cutShort.remove(id)
+            if let area = areas.first(where: { $0.id == id }), !area.complete { download(area) }
         }
     }
 
@@ -754,6 +925,7 @@ final class AppModel {
             areaProgress = nil
         }
         areaQueue.removeAll { $0 == area.id }
+        cutShort.remove(area.id)
         areas.removeAll { $0.id == area.id }
         areaFailures[area.id] = nil
         persistAreas()
@@ -783,6 +955,7 @@ final class AppModel {
         areaTask = nil
         areaProgress = nil
         areaQueue.removeAll()
+        cutShort.removeAll()
         areas.removeAll()
         areaFailures.removeAll()
         Task { @MainActor in
@@ -816,6 +989,7 @@ final class AppModel {
             // Moved far on while building, or somewhere the terrain isn't in yet: not from the old spot.
             guard let now = self.center, now.distance(from: center) < Self.reloadDistance else { continue }
             scene = built
+            sceneAccuracy = center.horizontalAccuracy
             updateCorrector()
             if arTrail != nil { drapeTrail() }
         } while rebuildAgain
@@ -908,7 +1082,9 @@ final class AppModel {
                                     : "last match: \(o.reason ?? "rejected")")
         }
         if let l = location {
-            lines.append(String(format: "GPS ±%.0f m, %.4f, %.4f", l.horizontalAccuracy, l.coordinate.latitude, l.coordinate.longitude))
+            lines.append(String(format: "GPS ±%.0f m, %.4f, %.4f%@; view built from ±%.0f m%@", l.horizontalAccuracy,
+                                l.coordinate.latitude, l.coordinate.longitude, preciseLocation ? "" : " (approximate)", sceneAccuracy,
+                                sceneAccuracy < LocationQuality.matchingAccuracy ? "" : ", too rough to match"))
         }
         let levels = tiles.values.filter { $0.rows > 4 }.map { ["30", "60", "120", "240"][Self.level(of: $0)] }
         lines.append("terrain: \(tiles.count) tiles (\(levels.sorted().joined(separator: " ")) m), " +
@@ -1022,8 +1198,12 @@ final class PeakDetails {
 @MainActor private final class BackgroundTime {
     private var id = UIBackgroundTaskIdentifier.invalid
 
-    init(name: String) {
-        id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in self?.end() }
+    /// `expired` runs if the time runs out before the work is done.
+    init(name: String, expired: (() -> Void)? = nil) {
+        id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            expired?()
+            self?.end()
+        }
     }
 
     func end() {

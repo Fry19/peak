@@ -65,12 +65,21 @@ final class SkylineCorrector: @unchecked Sendable {
         lock.unlock()
     }
 
+    private var isPaused = false
+
+    /// No frames are matched while paused (the view is frozen, so the results would be
+    /// thrown away). Call on any thread.
+    var paused: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return isPaused }
+        set { lock.lock(); isPaused = newValue; lock.unlock() }
+    }
+
     /// Offers a camera frame (on the camera queue) with the phone's pose when it was taken.
-    /// Most are skipped: one is taken at a time, at most about once a second, and only
-    /// while the phone is steady.
+    /// Most are skipped: one is taken at a time, at most about once a second, only while
+    /// the phone is steady, and none while paused.
     func offer(_ frame: CameraFeed.Frame, pose: MotionTracker.Pose, steady: Bool) {
         lock.lock()
-        guard !busy, steady, let horizon, Date().timeIntervalSince(lastStart) > 0.8 else {
+        guard !busy, !isPaused, steady, let horizon, Date().timeIntervalSince(lastStart) > 0.8 else {
             lock.unlock()
             return
         }

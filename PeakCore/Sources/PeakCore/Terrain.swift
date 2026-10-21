@@ -109,7 +109,8 @@ public final class ElevationTile: @unchecked Sendable {
         for v in [originLatitude, originLongitude, stepLatitude, stepLongitude] { append(v.bitPattern) }
         data.append(Data(count: Self.headerSize - data.count))
         data.append(UnsafeBufferPointer(heights))
-        try data.write(to: url)
+        // Atomic, so a write cut short (the app killed, the disk full) leaves no half a tile.
+        try data.write(to: url, options: .atomic)
     }
 
     /// Joins patches of one cell with the same pixel grid (such as neighboring blocks of a

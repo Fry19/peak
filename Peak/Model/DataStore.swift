@@ -121,6 +121,12 @@ actor DataStore {
         for dir in [demDirectory, peakDirectory, trailDirectory, factDirectory, areaDirectory] {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
+        // Everything here can be downloaded again: keep it out of iCloud backups, which it
+        // could fill.
+        var base = baseDirectory
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? base.setResourceValues(values)
     }
 
     /// 1° tiles covering `radius` meters around a point.
@@ -159,28 +165,38 @@ actor DataStore {
     /// Bytes downloaded so far, for showing progress.
     private(set) var bytesDownloaded = 0
 
+    /// The bucket said it has no such tile, not too long ago (then it's asked again).
     func isSea(_ key: Key) -> Bool {
-        FileManager.default.fileExists(atPath: seaURL(key).path)
+        let url = seaURL(key)
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        if age(of: url) < CopernicusBucket.seaLifetime { return true }
+        try? FileManager.default.removeItem(at: url)
+        return false
     }
 
     /// A whole tile at `level` or finer: from the phone if there, otherwise downloaded. Nil
     /// for open sea, where the bucket has no tile.
     func tile(_ key: Key, level: Level) async throws -> ElevationTile? {
         if isSea(key) { return nil }
-        if let have = cachedLevel(key), have <= level {
-            return try ElevationTile(contentsOf: tileURL(key, have))
+        while let have = cachedLevel(key), have <= level {
+            let file = tileURL(key, have)
+            if let tile = try? ElevationTile(contentsOf: file) { return tile }
+            // Unreadable (cut short, or damaged): download it again.
+            try? FileManager.default.removeItem(at: file)
         }
         guard let layout = try await layout(key) else { return nil }
         let lvl = min(level, layout.images.count - 1)
         let range = layout.images[lvl].byteRange
-        let (body, status) = try await fetch(remoteURL(key), range: range)
+        let (body, response) = try await fetch(remoteURL(key), range: range)
+        let status = response?.statusCode ?? 0
         let tile: ElevationTile
         switch status {
         case 206: tile = try GeoTIFF.decode(layout, level: lvl, bytes: [UInt8](body), base: range.lowerBound)
         case 200: tile = try GeoTIFF.decode(layout, level: lvl, bytes: [UInt8](body), base: 0)
         default: throw Failure.download("terrain (HTTP \(status))")
         }
-        try tile.write(to: tileURL(key, lvl))
+        // A full disk only means it isn't kept: the tile is good for now.
+        try? tile.write(to: tileURL(key, lvl))
         return tile
     }
 
@@ -207,14 +223,16 @@ actor DataStore {
                     parts.append(cached)
                     continue
                 }
+                try? FileManager.default.removeItem(at: file)   // unreadable, if there at all
                 let range = layout.images[level].byteRange(ofBlock: block)
                 group.addTask {
                     do {
-                        let (data, status) = try await self.fetch(url, range: range)
+                        let (data, response) = try await self.fetch(url, range: range)
+                        let status = response?.statusCode ?? 0
                         guard status == 206 else { throw Failure.download("terrain (HTTP \(status))") }
                         let bytes = [UInt8](data)
                         let tile = try GeoTIFF.decode(layout, level: level, blocks: [block]) { _ in bytes[...] }
-                        try tile.write(to: file)
+                        try? tile.write(to: file)   // not kept if the disk is full, but good for now
                         return .success(tile)
                     } catch {
                         return .failure(error)
@@ -241,14 +259,19 @@ actor DataStore {
             layouts[key] = layout
             return layout
         }
-        let (head, status) = try await fetch(remoteURL(key), range: 0..<16_384)
-        if status == 403 || status == 404 {
+        let (head, response) = try await fetch(remoteURL(key), range: 0..<16_384)
+        let status = response?.statusCode ?? 0
+        switch CopernicusBucket.answer(status: status, server: response?.value(forHTTPHeaderField: "Server"), body: head) {
+        case .sea:
             FileManager.default.createFile(atPath: seaURL(key).path, contents: nil)
             return nil
+        case .error:
+            throw Failure.download("terrain (HTTP \(status))")
+        case .data:
+            break
         }
-        guard status == 206 || status == 200 else { throw Failure.download("terrain (HTTP \(status))") }
         let layout = try GeoTIFF.layout([UInt8](head.prefix(16_384)))
-        try? head.prefix(16_384).write(to: file)
+        try? head.prefix(16_384).write(to: file, options: .atomic)
         layouts[key] = layout
         return layout
     }
@@ -275,13 +298,13 @@ actor DataStore {
         demDirectory.appendingPathComponent(key.name + ".sea")
     }
 
-    private func fetch(_ url: URL, range: Range<Int>?) async throws -> (Data, Int) {
+    private func fetch(_ url: URL, range: Range<Int>?) async throws -> (body: Data, response: HTTPURLResponse?) {
         var request = URLRequest(url: url)
         request.timeoutInterval = 60
         if let range { request.setValue("bytes=\(range.lowerBound)-\(range.upperBound - 1)", forHTTPHeaderField: "Range") }
         let (data, response) = try await URLSession.shared.data(for: request)
         bytesDownloaded += data.count
-        return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+        return (data, response as? HTTPURLResponse)
     }
 
     // MARK: OpenStreetMap
@@ -403,7 +426,7 @@ actor DataStore {
         let download = Task {
             let data = try await self.overpass(query, timeout: 90)
             let peaks = try Overpass.peaks(fromJSON: data)
-            try? data.write(to: cache)
+            try? data.write(to: cache, options: .atomic)
             return peaks
         }
         peakDownloads[cache] = download
@@ -429,7 +452,7 @@ actor DataStore {
             let data = try await overpass(Overpass.trailsQuery(latitude: peak.latitude, longitude: peak.longitude,
                                                                radius: Self.hikeRadius))
             let trails = try Overpass.trails(fromJSON: data)
-            try? data.write(to: cache)
+            try? data.write(to: cache, options: .atomic)
             return nearby(trails, peak)
         } catch {
             if let data = try? Data(contentsOf: cache), let trails = try? Overpass.trails(fromJSON: data) { return nearby(trails, peak) }
@@ -472,7 +495,7 @@ actor DataStore {
         let data = try await overpass(Overpass.peaksQuery(south: box.south, west: box.west, north: box.north, east: box.east),
                                       timeout: 150)
         areaPeakCache[area.id] = try Overpass.peaks(fromJSON: data)
-        try data.write(to: areaFile(area, "peaks"))
+        try data.write(to: areaFile(area, "peaks"), options: .atomic)
     }
 
     /// Downloads the hiking routes and named paths for every peak in an area.
@@ -481,7 +504,7 @@ actor DataStore {
         let query = Overpass.trailsQuery(south: box.south, west: box.west, north: box.north, east: box.east, timeout: 180)
         let data = try await overpass(query, timeout: 200)
         areaTrailCache[area.id] = try Overpass.trails(fromJSON: data)
-        try data.write(to: areaFile(area, "trails"))
+        try data.write(to: areaFile(area, "trails"), options: .atomic)
     }
 
     /// Deletes an area's peaks and hikes, and the terrain no other area (and not the place
@@ -580,7 +603,7 @@ actor DataStore {
                let data = try? await get(url) {
                 try? Wikipedia.addSummary(fromJSON: data, to: &facts)
             }
-            if let data = try? JSONEncoder().encode(facts) { try? data.write(to: cache) }
+            if let data = try? JSONEncoder().encode(facts) { try? data.write(to: cache, options: .atomic) }
             return facts
         } catch {
             if let data = try? Data(contentsOf: cache), let facts = try? JSONDecoder().decode(PeakFacts.self, from: data) {
