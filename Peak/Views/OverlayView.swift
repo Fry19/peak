@@ -104,7 +104,9 @@ final class OverlayCanvas: UIView {
         super.layoutSubviews()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for l in layer.sublayers ?? [] { l.frame = bounds }
+        // The edge arrow is sized and placed by `update`; giving it the view's frame would
+        // stretch its picture across the whole screen.
+        for l in layer.sublayers ?? [] where l !== arrowLayer { l.frame = bounds }
         renderer?.resize(to: bounds.size, scale: displayScale)
         CATransaction.commit()
         needsUpdate = true
