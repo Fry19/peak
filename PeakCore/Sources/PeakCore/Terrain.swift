@@ -146,9 +146,10 @@ public final class ElevationTile: @unchecked Sendable {
     @inline(__always)
     func value(row: Int, col: Int) -> Int16 { heights[row * cols + col] }
 
-    /// Bilinear height inside the patch, or nil near its edges or where it has no data.
+    /// Bilinear height inside the patch and how far in from its nearest edge, in pixels;
+    /// nil past its last pixels or where it has no data.
     @inline(__always)
-    func interiorHeight(_ latitude: Double, _ longitude: Double) -> Double? {
+    func interiorSample(_ latitude: Double, _ longitude: Double) -> (height: Double, edge: Double)? {
         let y = (originLatitude - latitude) / stepLatitude
         let x = (longitude - originLongitude) / stepLongitude
         guard y >= 0, x >= 0 else { return nil }
@@ -158,7 +159,14 @@ public final class ElevationTile: @unchecked Sendable {
         let a = heights[i], b = heights[i + 1], c = heights[i + cols], d = heights[i + cols + 1]
         if a == Self.noData || b == Self.noData || c == Self.noData || d == Self.noData { return nil }
         let fy = y - Double(r0), fx = x - Double(c0)
-        return (Double(a) * (1 - fx) + Double(b) * fx) * (1 - fy) + (Double(c) * (1 - fx) + Double(d) * fx) * fy
+        let h = (Double(a) * (1 - fx) + Double(b) * fx) * (1 - fy) + (Double(c) * (1 - fx) + Double(d) * fx) * fy
+        return (h, min(min(y, x), min(Double(rows - 1) - y, Double(cols - 1) - x)))
+    }
+
+    /// Bilinear height inside the patch, or nil past its last pixels or where it has no data.
+    @inline(__always)
+    func interiorHeight(_ latitude: Double, _ longitude: Double) -> Double? {
+        interiorSample(latitude, longitude)?.height
     }
 
     /// The share of the 1° cell this tile covers with data, 0 to 1.
@@ -248,14 +256,37 @@ public final class Terrain: @unchecked Sendable {
         let li = south - minSouth, wi = west - minWest
         guard li >= 0, li < latCount, wi >= 0, wi < lonCount else { return .nan }
         let cell = li * lonCount + wi
-        if !patches.isEmpty {
-            var k = patchStart[cell]
-            let end = patchStart[cell + 1]
-            while k < end {
-                if let h = patches[k].interiorHeight(latitude, longitude) { return h }
-                k += 1
-            }
+        if !patches.isEmpty, patchStart[cell] < patchStart[cell + 1] {
+            return patchHeight(latitude, longitude, cell: cell, from: patchStart[cell])
         }
+        return baseHeight(latitude, longitude, cell: cell)
+    }
+
+    /// Patches blend into what lies under them over this many of their pixels from their
+    /// edges. A hard switch from sharp to coarse terrain leaves a step along the patch's
+    /// edge, which the horizon renderer sees as a ridge: a straight line drawn across the view.
+    static let patchBlend = 8.0
+
+    /// The height from patch `k` of the cell onward (finest first), blended near each
+    /// patch's edges into the ones under it and finally the 1° tile.
+    func patchHeight(_ latitude: Double, _ longitude: Double, cell: Int, from k: Int) -> Double {
+        var k = k
+        let end = patchStart[cell + 1]
+        while k < end {
+            if let (h, edge) = patches[k].interiorSample(latitude, longitude) {
+                let w = edge / Self.patchBlend
+                if w >= 1 { return h }
+                let below = patchHeight(latitude, longitude, cell: cell, from: k + 1)
+                return below.isFinite ? h * w + below * (1 - w) : h
+            }
+            k += 1
+        }
+        return baseHeight(latitude, longitude, cell: cell)
+    }
+
+    /// The height from the cell's 1° tile.
+    @inline(__always)
+    func baseHeight(_ latitude: Double, _ longitude: Double, cell: Int) -> Double {
         guard let tile = grid[cell] else { return missing }
         let y = (tile.originLatitude - latitude) / tile.stepLatitude
         let x = (longitude - tile.originLongitude) / tile.stepLongitude
@@ -341,11 +372,14 @@ extension Terrain {
             let x = (peak.longitude - tile.originLongitude) / tile.stepLongitude
             let reachRows = Int(radius / (tile.stepLatitude * metersPerLat)) + 1
             let reachCols = Int(radius / (tile.stepLongitude * metersPerLon)) + 1
-            let rows = max(0, Int(y) - reachRows)...min(tile.rows - 1, Int(y) + reachRows)
-            let cols = max(0, Int(x) - reachCols)...min(tile.cols - 1, Int(x) + reachCols)
-            guard !rows.isEmpty, !cols.isEmpty else { continue }
+            let rowLow: Int = max(0, Int(y) - reachRows), rowHigh: Int = min(tile.rows - 1, Int(y) + reachRows)
+            let colLow: Int = max(0, Int(x) - reachCols), colHigh: Int = min(tile.cols - 1, Int(x) + reachCols)
+            guard rowLow <= rowHigh, colLow <= colHigh else { continue }
+            let rows = rowLow...rowHigh, cols = colLow...colHigh
+            let rowMeters: Double = tile.stepLatitude * metersPerLat, colMeters: Double = tile.stepLongitude * metersPerLon
             func distance(_ r: Int, _ c: Int) -> Double {
-                let dy = (Double(r) - y) * tile.stepLatitude * metersPerLat, dx = (Double(c) - x) * tile.stepLongitude * metersPerLon
+                let dy: Double = (Double(r) - y) * rowMeters
+                let dx: Double = (Double(c) - x) * colMeters
                 return (dx * dx + dy * dy).squareRoot()
             }
             // The model's top near the summit.

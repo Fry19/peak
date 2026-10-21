@@ -5,9 +5,9 @@ import UIKit
 /// labels for the most prominent visible peaks, and a trail laid on the mountain. Laid out
 /// for the frame on screen, with the phone's pose from the moment that frame was taken.
 ///
-/// Nothing is drawn by the app itself each frame: the lines are shape layers that Core
-/// Animation renders, and each label is drawn once into an image that is then only moved.
-/// Laying them out takes about a millisecond, so the main thread stays free.
+/// Nothing is drawn on the CPU each frame: the lines go to the GPU (Metal, with shape
+/// layers as a fallback), and each label is drawn once into an image that is then only
+/// moved. Laying them out takes about a millisecond, so the main thread stays free.
 final class OverlayCanvas: UIView {
     weak var model: AppModel?
     weak var screen: CameraScreenView?
@@ -45,6 +45,12 @@ final class OverlayCanvas: UIView {
         l.strokeColor = nil
         return l
     }()
+    /// Draws the lines on the GPU; nil if Metal isn't available, and the shape layers do.
+    private let renderer = LineRenderer()
+    private var segments: [LineSegment] = []
+    var drawsWithMetal: Bool { renderer != nil }
+    /// Line segments sent to the GPU for the last frame, for diagnostics.
+    var segmentCount: Int { segments.count }
     private let labelContainer = CALayer()
     private var labelLayers: [Int64: CALayer] = [:]
     /// The image each label layer shows, so unchanged ones aren't set again.
@@ -77,7 +83,11 @@ final class OverlayCanvas: UIView {
         backgroundColor = .clear
         isUserInteractionEnabled = false
         // Ridges first, the skyline over them, then the trail, dots and labels on top.
-        for l in bandGlow + bandLine + [skyGlow, skyLine, trailGlow, trailLine, dotLayer] { layer.addSublayer(l) }
+        if let renderer {
+            layer.addSublayer(renderer.layer)
+        } else {
+            for l in bandGlow + bandLine + [skyGlow, skyLine, trailGlow, trailLine, dotLayer] { layer.addSublayer(l) }
+        }
         layer.addSublayer(labelContainer)
         layer.addSublayer(arrowLayer)
     }
@@ -89,6 +99,7 @@ final class OverlayCanvas: UIView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for l in layer.sublayers ?? [] { l.frame = bounds }
+        renderer?.resize(to: bounds.size, scale: traitCollection.displayScale)
         CATransaction.commit()
         needsUpdate = true
     }
@@ -163,14 +174,17 @@ final class OverlayCanvas: UIView {
         let top = abs(camera.attitude.pitch) + half
         let reach = top >= 85 ? 180 : Int(min(180, half / cos(top * .pi / 180) + 3))
 
+        segments.removeAll(keepingCapacity: true)
         layoutRidges(scene, projector, heading: camera.attitude.heading, reach: reach, ridges: settings.showRidges)
         layoutTrail(model.arTrail?.runs, projector)
         let placed = layoutLabels(scene, projector, heading: camera.attitude.heading, reach: reach, model: model)
+        renderer?.draw(segments, size: bounds.size, scale: traitCollection.displayScale)
         if frozen == nil, settings.haptics { tickIfCrossing(placed, at: now) }
     }
 
     private func clear() {
         for l in bandGlow + bandLine + [skyGlow, skyLine, trailGlow, trailLine, dotLayer] { l.path = nil }
+        renderer?.draw([], size: bounds.size, scale: traitCollection.displayScale)
         labelLayers.values.forEach { $0.isHidden = true }
         arrowLayer.isHidden = true
         dots = []
@@ -203,6 +217,30 @@ final class OverlayCanvas: UIView {
         projector.pixel(azimuth: azimuth, elevation: elevation).map { CGPoint(x: $0.x, y: $0.y) }
     }
 
+    /// How a kind of line looks on the GPU.
+    private struct Style {
+        var color: SIMD4<Float>
+        var width: Float
+        var glow: Float
+        var glowAlpha: Float
+
+        func segment(_ a: CGPoint, _ b: CGPoint) -> LineSegment {
+            LineSegment(a: SIMD2(Float(a.x), Float(a.y)), b: SIMD2(Float(b.x), Float(b.y)), color: color,
+                        width: width, glow: glow, glowAlpha: glowAlpha)
+        }
+    }
+
+    private static let bandStyles = bands.map {
+        Style(color: SIMD4(0.86, 0.94, 1.0, Float($0.1)), width: 1, glow: 3.5, glowAlpha: Float($0.1) * 0.22)
+    }
+    private static let skylineStyle = Style(color: SIMD4(0.97, 0.99, 1.0, 0.95), width: 1.4, glow: 4.5, glowAlpha: 0.32)
+    private static let trailStyle = Style(color: SIMD4(1.0, 0.72, 0.28, 1), width: 2.5, glow: 6, glowAlpha: 0.38)
+    private static let dotStyle = Style(color: SIMD4(1, 1, 1, 0.55), width: 4, glow: 0, glowAlpha: 0)
+
+    /// Ridges this close are mostly the ground in front of you, houses and trees in
+    /// reality; only the skyline is drawn there.
+    private static let nearestRidge: Float = 1_000
+
     /// A path that joins segments end to end when they meet, so a ridge is one line
     /// rather than hundreds of pieces.
     private struct Polyline {
@@ -221,22 +259,45 @@ final class OverlayCanvas: UIView {
     }
 
     private func layoutRidges(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, reach: Int, ridges: Bool) {
+        let gpu = renderer != nil
+        // For the GPU, consecutive pieces of a line are merged into segments a few points
+        // long: the panorama's 0.1° steps are only about a point apart on screen.
+        var runs = [(start: CGPoint, end: CGPoint)?](repeating: nil, count: Self.bands.count + 1)
+        func styleFor(_ style: Int) -> Style { style < Self.bands.count ? Self.bandStyles[style] : Self.skylineStyle }
+        func emit(_ a: CGPoint, _ b: CGPoint, _ style: Int) {
+            if let run = runs[style], abs(run.end.x - a.x) < 0.5, abs(run.end.y - a.y) < 0.5,
+               hypot(b.x - run.start.x, b.y - run.start.y) < 4 {
+                runs[style] = (run.start, b)
+                return
+            }
+            if let run = runs[style] { segments.append(styleFor(style).segment(run.start, run.end)) }
+            runs[style] = (a, b)
+        }
         var bands = Self.bands.map { _ in Polyline() }
         var skyline = Polyline()
         let center = Int(heading.rounded())
         let span = reach >= 180 ? -180...179 : -reach...reach
         let bounds = self.bounds.insetBy(dx: -40, dy: -40)
         for offset in span {
-            for s in scene.segments[(center + offset + 720) % 360] where ridges || s.isSkyline {
+            for s in scene.segments[(center + offset + 720) % 360] where s.isSkyline || (ridges && s.distance >= Self.nearestRidge) {
                 guard let a = point(projector, Double(s.azimuth0), Double(s.elevation0)),
                       let b = point(projector, Double(s.azimuth1), Double(s.elevation1)),
                       bounds.contains(a) || bounds.contains(b) else { continue }
-                if s.isSkyline {
+                let band = s.isSkyline ? -1 : (Self.bands.firstIndex { s.distance < $0.0 } ?? Self.bands.count - 1)
+                if gpu {
+                    emit(a, b, band < 0 ? Self.bands.count : band)
+                } else if band < 0 {
                     skyline.add(a, b)
                 } else {
-                    bands[Self.bands.firstIndex { s.distance < $0.0 } ?? Self.bands.count - 1].add(a, b)
+                    bands[band].add(a, b)
                 }
             }
+        }
+        guard !gpu else {
+            for (style, run) in runs.enumerated() {
+                if let run { segments.append(styleFor(style).segment(run.start, run.end)) }
+            }
+            return
         }
         for i in bands.indices {
             bandGlow[i].path = bands[i].path
@@ -255,16 +316,21 @@ final class OverlayCanvas: UIView {
         }
         let path = CGMutablePath()
         for run in runs {
-            var pen = false
+            var last: CGPoint?
             for p in run {
                 guard let q = point(projector, Double(p.azimuth), Double(p.elevation)) else {
-                    pen = false
+                    last = nil
                     continue
                 }
-                if pen { path.addLine(to: q) } else { path.move(to: q) }
-                pen = true
+                if let last {
+                    if renderer != nil { segments.append(Self.trailStyle.segment(last, q)) } else { path.addLine(to: q) }
+                } else if renderer == nil {
+                    path.move(to: q)
+                }
+                last = q
             }
         }
+        guard renderer == nil else { return }
         trailGlow.path = path
         trailLine.path = path
     }
@@ -373,9 +439,13 @@ final class OverlayCanvas: UIView {
         dots = candidates
             .filter { c in placed.allSatisfy { abs($0.point.x - c.point.x) > 10 || abs($0.point.y - c.point.y) > 10 } }
             .map { (point: $0.point, id: $0.id) }
-        let dotPath = CGMutablePath()
-        for (p, _) in dots { dotPath.addEllipse(in: CGRect(x: p.x - 2, y: p.y - 2, width: 4, height: 4)) }
-        dotLayer.path = dotPath
+        if renderer != nil {
+            for (p, _) in dots { segments.append(Self.dotStyle.segment(p, p)) }
+        } else {
+            let dotPath = CGMutablePath()
+            for (p, _) in dots { dotPath.addEllipse(in: CGRect(x: p.x - 2, y: p.y - 2, width: 4, height: 4)) }
+            dotLayer.path = dotPath
+        }
 
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         return placed.map { ($0.id, upright(CGPoint(x: $0.point.x - center.x, y: $0.point.y - center.y)).x) }

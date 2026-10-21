@@ -600,6 +600,9 @@ final class AppModel {
                                 k.width, k.height))
         }
         if zoom > 1.01 { lines.append(String(format: "zoom %.1f×", zoom)) }
+        if let overlay = screen?.overlay {
+            lines.append(overlay.drawsWithMetal ? "lines: Metal, \(overlay.segmentCount) segments" : "lines: shape layers")
+        }
         if let shown = screen?.shown, let latest = motion.latestTime {
             lines.append(String(format: "frame drawn with the pose from %.0f ms before the newest", (latest - shown.time) * 1000))
         }
