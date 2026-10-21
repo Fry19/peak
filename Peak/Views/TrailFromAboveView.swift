@@ -17,6 +17,8 @@ struct TrailFromAboveView: View {
     @State private var camera = MapCamera()
     @State private var lastTranslation = CGSize.zero
     @State private var lastMagnification = 1.0
+    /// Walking the trail in 3D, over this view.
+    @State private var walking = false
 
     static let background = Color(red: 0.035, green: 0.043, blue: 0.058)
     static let trailColor = Color(red: 1, green: 0.72, blue: 0.28)
@@ -62,13 +64,33 @@ struct TrailFromAboveView: View {
                 await build(screen: full, content: content)
             }
         }
+        .overlay {
+            if walking {
+                TrailWalkView(model: model, trail: trail) { walking = false }
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.3), value: walking)
     }
 
     private func bottomBar(_ viewport: Viewport) -> some View {
         VStack(spacing: 8) {
-            HStack(alignment: .bottom) {
+            HStack(alignment: .center) {
                 ScaleBar(pointsPerMeter: viewport.pointsPerMeter(camera), units: model.settings.units)
-                Spacer()
+                Spacer(minLength: 8)
+                Button {
+                    walking = true
+                } label: {
+                    Label("Walk in 3D", systemImage: "view.3d")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .frame(height: 36)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .environment(\.colorScheme, .dark)
+                }
+                .accessibilityLabel("Walk the trail in 3D")
+                Spacer(minLength: 8)
                 if camera != MapCamera() {
                     RoundButton(systemImage: "scope", label: "Back to the whole trail") {
                         withAnimation(.easeInOut(duration: 0.35)) { camera = MapCamera() }
@@ -253,14 +275,7 @@ struct OverheadMap: @unchecked Sendable {
     /// Built for a screen of `screen` points, with the trail fitting inside `content`.
     static func build(trail: Trail, peak: Peak?, observer: LatLon?, terrain: Terrain,
                       screen: CGSize, content: EdgeInsets) -> OverheadMap? {
-        let points = trail.lines.flatMap { $0 } + (peak.map { [$0.position] } ?? [])
-        guard var frame = MapExtent.around(points, padding: 0.12, minimumSize: 1_500) else { return nil }
-        // Take you in too when you're close by; when far away, an arrow at the edge points
-        // your way instead, so the trail isn't shrunk to a speck.
-        if let observer, let both = MapExtent.around(points + [observer], padding: 0.12, minimumSize: 1_500),
-           both.width * both.height < 3 * frame.width * frame.height {
-            frame = both
-        }
+        guard let frame = frame(trail: trail, around: [peak?.position, observer].compactMap { $0 }) else { return nil }
         // Terrain for the whole screen when zoomed out as far as it goes, and a little more to
         // look around; at the terrain's own 30 m at most, and no more than 900 points across.
         let area = CGRect(x: content.leading, y: content.top,
@@ -301,6 +316,22 @@ struct OverheadMap: @unchecked Sendable {
                            peak: peak,
                            observer: observer.map(projection.point),
                            gain: profile?.gain)
+    }
+
+    /// The area to fit on screen: the trail, plus the summit and you where they're close by.
+    /// When one is far off, an arrow at the edge points to it instead, so the trail isn't
+    /// shrunk to a speck.
+    static func frame(trail: Trail, around extras: [LatLon]) -> MapExtent? {
+        var points = trail.lines.flatMap { $0 }
+        guard var frame = MapExtent.around(points.isEmpty ? extras : points, padding: 0.12, minimumSize: 1_500) else { return nil }
+        let area = frame.width * frame.height
+        for extra in extras {
+            if let wider = MapExtent.around(points + [extra], padding: 0.12, minimumSize: 1_500), wider.width * wider.height < 3 * area {
+                points.append(extra)
+                frame = wider
+            }
+        }
+        return frame
     }
 
     /// The hillshade as a dark, faintly blue picture; higher ground a touch lighter, like snow.
@@ -379,9 +410,14 @@ private struct MapLayer: View, Animatable {
             .allowsHitTesting(false)
             if let summit = map.summit, let peak = map.peak {
                 let p = viewport.screen(summit, camera)
-                // The name goes beside the dot on the side with more room.
-                SummitMarker(peak: peak, units: units, leftward: p.x > viewport.size.width * 0.6, action: onSummit)
-                    .position(p)
+                if viewport.inner.contains(p) {
+                    // The name goes beside the dot on the side with more room.
+                    SummitMarker(peak: peak, units: units, leftward: p.x > viewport.size.width * 0.6, action: onSummit)
+                        .position(p)
+                } else {
+                    EdgeArrow(viewport: viewport, camera: camera, at: summit, title: peak.name, color: .white, units: units)
+                        .onTapGesture(perform: onSummit)
+                }
             }
             if let observer = map.observer {
                 You(viewport: viewport, camera: camera, at: observer, units: units)
@@ -444,31 +480,48 @@ private struct You: View {
             .position(p)
             .accessibilityLabel("You are here")
         } else {
-            // Where the line from the middle to you leaves the screen.
-            let c = CGPoint(x: inner.midX, y: inner.midY)
-            let dx = p.x - c.x, dy = p.y - c.y
-            let s = min(inner.width / 2 / max(abs(dx), 1e-6), inner.height / 2 / max(abs(dy), 1e-6))
-            let edge = CGPoint(x: c.x + dx * s, y: c.y + dy * s)
-            let center = viewport.mapPoint(c, camera)
-            let distance = ((at - center) * (at - center)).sum().squareRoot()
-            HStack(spacing: 4) {
-                Image(systemName: "location.north.fill")
-                    .font(.system(size: 10, weight: .bold))
-                    .rotationEffect(.radians(atan2(dx, -dy)))
-                    .foregroundStyle(Color(red: 0.45, green: 0.72, blue: 1))
-                Text("You · \(Format.distance(distance, units))")
-                    .font(.system(size: 11, weight: .medium))
-                    .monospacedDigit()
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(.ultraThinMaterial, in: Capsule())
-            .environment(\.colorScheme, .dark)
-            .fixedSize()
-            .position(x: min(max(edge.x, inner.minX + 50), inner.maxX - 50), y: min(max(edge.y, inner.minY + 12), inner.maxY - 12))
-            .accessibilityLabel("You are \(Format.distance(distance, units)) away, off the map")
+            EdgeArrow(viewport: viewport, camera: camera, at: at, title: "You", color: Color(red: 0.45, green: 0.72, blue: 1), units: units)
         }
+    }
+}
+
+/// Something off the map: an arrow at the edge pointing its way, with its name and how far.
+private struct EdgeArrow: View {
+    let viewport: Viewport
+    let camera: MapCamera
+    let at: SIMD2<Double>
+    let title: String
+    let color: Color
+    let units: AppSettings.Units
+
+    var body: some View {
+        let p = viewport.screen(at, camera)
+        let inner = viewport.inner
+        // Where the line from the middle to it leaves the screen.
+        let c = CGPoint(x: inner.midX, y: inner.midY)
+        let dx = p.x - c.x, dy = p.y - c.y
+        let s = min(inner.width / 2 / max(abs(dx), 1e-6), inner.height / 2 / max(abs(dy), 1e-6))
+        let edge = CGPoint(x: c.x + dx * s, y: c.y + dy * s)
+        let center = viewport.mapPoint(c, camera)
+        let distance = ((at - center) * (at - center)).sum().squareRoot()
+        HStack(spacing: 4) {
+            Image(systemName: "location.north.fill")
+                .font(.system(size: 10, weight: .bold))
+                .rotationEffect(.radians(atan2(dx, -dy)))
+                .foregroundStyle(color)
+            Text("\(title) · \(Format.distance(distance, units))")
+                .font(.system(size: 11, weight: .medium))
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(.ultraThinMaterial, in: Capsule())
+        .environment(\.colorScheme, .dark)
+        .fixedSize()
+        .position(x: min(max(edge.x, inner.minX + 60), inner.maxX - 60), y: min(max(edge.y, inner.minY + 12), inner.maxY - 12))
+        .accessibilityLabel("\(title), \(Format.distance(distance, units)) away, off the map")
     }
 }
 
