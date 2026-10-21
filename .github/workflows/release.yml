@@ -1,0 +1,56 @@
+name: Release
+
+# Builds an unsigned Peak.ipa for sideloading (SideStore, AltStore, Sideloadly)
+# and attaches it to a GitHub release. Runs when a v* tag is pushed.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, like v0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    name: Build IPA
+    runs-on: macos-15
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project Peak.xcodeproj \
+            -scheme Peak \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Peak.xcarchive \
+            MARKETING_VERSION="${TAG#v}" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | xcbeautify --renderer github-actions
+
+      - name: Package
+        run: |
+          mkdir Payload
+          cp -R build/Peak.xcarchive/Products/Applications/Peak.app Payload/
+          # An ad-hoc signature; sideloading tools replace it with one from your Apple ID.
+          codesign --force --sign - Payload/Peak.app
+          zip -qry "Peak_${TAG#v}.ipa" Payload
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" "Peak_${TAG#v}.ipa" \
+            --target "$GITHUB_SHA" \
+            --title "Peak ${TAG#v}" \
+            --notes "Unsigned build for sideloading with SideStore, AltStore or Sideloadly. See the README's \"Installing on your iPhone\" section."
