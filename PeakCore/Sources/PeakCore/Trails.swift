@@ -273,9 +273,9 @@ extension Trail {
 }
 
 extension Overpass {
-    /// Hiking routes and named paths within `radius` meters of a point, and graded paths
-    /// without a name within `summitRadius` (often the way up a summit), with their
-    /// geometry clipped to `clip` meters around it.
+    /// Hiking routes and named paths within `radius` meters of a point, and paths without
+    /// a name within `summitRadius` (often the way up a summit), with their geometry
+    /// clipped to `clip` meters around it.
     public static func trailsQuery(latitude: Double, longitude: Double, radius: Double, clip: Double,
                                    summitRadius: Double = 400) -> String {
         let dlat = clip / 111_000, dlon = clip / (111_000 * max(cos(latitude * .pi / 180), 0.05))
@@ -291,7 +291,7 @@ extension Overpass {
         (
           way["highway"~"^(path|bridleway)$"]["name"](\(around));
           way["highway"~"^(footway|steps|track)$"]["name"]["sac_scale"](\(around));
-          way["highway"~"^(path|footway|steps)$"]["sac_scale"][!"name"](\(summit));
+          way["highway"~"^(path|footway|steps|bridleway)$"][!"name"](\(summit));
         );
         out tags geom(\(box));
         """
@@ -381,7 +381,7 @@ extension Overpass {
                                 difficulty: ways.compactMap { wayDifficulty[$0.id] }.max(),
                                 operatorName: ways.lazy.compactMap { $0.tags?["operator"] }.first, isPartial: partial))
         }
-        // Graded paths without a name (fetched only near the summit), joined where they meet.
+        // Paths without a name (fetched only near the summit), joined where they meet.
         let unnamed = elements.filter {
             $0.type == "way" && $0.geometry != nil && !routeWays.contains($0.id) && ($0.tags?["name"] ?? "").isEmpty
         }

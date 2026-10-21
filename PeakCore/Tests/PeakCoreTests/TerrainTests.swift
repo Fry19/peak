@@ -77,6 +77,23 @@ final class TerrainTests: XCTestCase {
         XCTAssertEqual(terrain.raiseSummits(peaks), 0, "raising again changes nothing")
     }
 
+    /// Peaks without an elevation take the terrain's top near them; the rest are untouched.
+    func testFillElevationsFromTheTerrain() {
+        let cone = TestTerrain.Cone(latitude: 45.5, longitude: 7.5, height: 1_000, radius: 3_000)
+        let terrain = TestTerrain.cones([cone])
+        var unknown = Peak(id: 1, name: "Knob", latitude: 45.5003, longitude: 7.5, elevation: 0)
+        unknown.estimatedElevation = true
+        let known = Peak(id: 2, name: "Known", latitude: 45.6, longitude: 7.6, elevation: 1_234)
+        var outside = unknown
+        outside.latitude = 30
+        let filled = terrain.fillElevations([unknown, known, outside])
+        XCTAssertEqual(filled.map(\.id), [1, 2])
+        // 33 m from the cone's tip; the search reaches the tip's grid neighborhood.
+        XCTAssertEqual(filled[0].elevation, 1_500, accuracy: 30)
+        XCTAssertTrue(filled[0].estimatedElevation)
+        XCTAssertEqual(filled[1].elevation, 1_234)
+    }
+
     func testPkdemRoundTrip() throws {
         let tile = ElevationTile(south: 46, west: 7, size: 90) { lat, lon in 100 * lat + 10 * lon }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("test-\(UUID()).pkdem")

@@ -111,7 +111,7 @@ struct PeakDetailView: View {
     }
 
     private func stats(_ peak: Peak, _ view: TerrainScene.PeakView?, _ facts: PeakFacts?, _ units: AppSettings.Units) -> [Stat] {
-        var stats = [Stat(title: "Elevation", value: Format.elevation(peak.elevation, units))]
+        var stats = [Stat(title: peak.estimatedElevation ? "Elevation (terrain)" : "Elevation", value: Format.elevation(of: peak, units))]
         if let prominence = peak.prominence ?? facts?.prominence {
             stats.append(Stat(title: "Prominence", value: Format.elevation(prominence, units)))
         }

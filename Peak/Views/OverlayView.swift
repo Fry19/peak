@@ -13,8 +13,9 @@ final class OverlayCanvas: UIView {
     private var lastSide: [Int64: Bool] = [:]
     private var lastTick = Date.distantPast
     private let haptics = UISelectionFeedbackGenerator()
-    /// Where each label was drawn, for taps.
+    /// Where each label was drawn, and the dots of peaks without one, for taps.
     private var labelHits: [(rect: CGRect, id: Int64)] = []
+    private var dots: [(point: CGPoint, id: Int64)] = []
     /// The last drawing's focal length in points, and which way is up in the world on
     /// screen (radians clockwise from the screen's up), for lining up by hand.
     private(set) var lastFocal: Double?
@@ -54,9 +55,16 @@ final class OverlayCanvas: UIView {
         if Date().timeIntervalSince(screen?.lastFrameDate ?? .distantPast) > 0.1 { setNeedsDisplay() }
     }
 
-    /// The peak whose label is at `point`, if any.
+    /// The peak whose label or dot is at `point`, if any: a label first, else the nearest
+    /// dot within reach of a finger.
     func peak(at point: CGPoint) -> Int64? {
-        labelHits.first { $0.rect.insetBy(dx: -12, dy: -12).contains(point) }?.id
+        if let hit = labelHits.first(where: { $0.rect.insetBy(dx: -12, dy: -12).contains(point) }) { return hit.id }
+        let near = dots.map { (d: hypot($0.point.x - point.x, $0.point.y - point.y), id: $0.id) }.min { $0.d < $1.d }
+        return near.flatMap { $0.d < 28 ? $0.id : nil }
+    }
+
+    static func height(_ peak: Peak, _ units: AppSettings.Units) -> String {
+        Format.elevation(of: peak, units)
     }
 
     override func draw(_ rect: CGRect) {
@@ -69,8 +77,9 @@ final class OverlayCanvas: UIView {
         let correction = frozen?.correction ?? smoothedCorrection(model.viewCorrection(for: pose), at: now)
         if frozen != nil { smoothed = correction }
         let orientation = screen?.interfaceOrientation ?? .portrait
-        let camera = CameraGeometry.screenCamera(pose: pose, lens: shown.lens, portraitFrame: shown.portrait,
+        var camera = CameraGeometry.screenCamera(pose: pose, lens: shown.lens, portraitFrame: shown.portrait,
                                                  orientation: orientation, size: bounds.size, correction: correction)
+        camera.intrinsics = camera.intrinsics.zoomed(by: model.zoom)
         let projector = camera.projector
         let settings = model.settings
         // Labels stand upright in the world, whichever way the phone is held and even with
@@ -191,8 +200,10 @@ final class OverlayCanvas: UIView {
     private func drawLabels(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double,
                             model: AppModel, in ctx: CGContext) -> [(Int64, CGFloat)] {
         let units = model.settings.units
-        let maxLabels = model.settings.labels.maxLabels
+        // Zoomed in, peaks spread apart and there's room for more labels.
+        let maxLabels = model.settings.labels.maxLabels + (model.zoom > 1.5 ? 6 : 0)
         var placed: [(id: Int64, point: CGPoint)] = []
+        dots = []
         // The label rises about 70 points above its peak, toward the world's up.
         func fits(_ p: CGPoint, margin: CGFloat) -> Bool {
             let top = CGPoint(x: p.x - 70 * worldDown.x, y: p.y - 70 * worldDown.y)
@@ -202,7 +213,7 @@ final class OverlayCanvas: UIView {
 
         if let id = model.selectedPeakID, let v = scene.allPeaks[id] {
             if abs(azimuthDifference(v.azimuth, heading)) < 80, let p = point(projector, v.azimuth, v.elevation), fits(p, margin: 8) {
-                drawLabel(name: v.peak.name, detail: Format.elevation(v.peak.elevation, units) + (v.isVisible ? "" : " · hidden"),
+                drawLabel(name: v.peak.name, detail: Self.height(v.peak, units) + (v.isVisible ? "" : " · hidden"),
                           at: p, selected: true, hidden: !v.isVisible, id: id, in: ctx)
                 placed.append((id, p))
             } else {
@@ -219,8 +230,22 @@ final class OverlayCanvas: UIView {
                       return abs(d.x) > 84 || abs(d.y) > 70
                   }) else { continue }
             placed.append((v.peak.id, p))
-            drawLabel(name: v.peak.name, detail: Format.elevation(v.peak.elevation, units), at: p,
+            drawLabel(name: v.peak.name, detail: Self.height(v.peak, units), at: p,
                       selected: false, hidden: false, id: v.id, in: ctx)
+        }
+        // Every other peak in sight gets a small dot, so it can be tapped too.
+        for v in scene.peaks where dots.count < 150 && !placed.contains(where: { $0.id == v.id }) {
+            guard abs(azimuthDifference(v.azimuth, heading)) < 70, let p = point(projector, v.azimuth, v.elevation),
+                  bounds.insetBy(dx: 4, dy: 4).contains(p),
+                  placed.allSatisfy({ abs($0.point.x - p.x) > 10 || abs($0.point.y - p.y) > 10 }) else { continue }
+            dots.append((p, v.id))
+        }
+        if !dots.isEmpty {
+            let path = CGMutablePath()
+            for (p, _) in dots { path.addEllipse(in: CGRect(x: p.x - 2, y: p.y - 2, width: 4, height: 4)) }
+            ctx.addPath(path)
+            ctx.setFillColor(UIColor.white.withAlphaComponent(0.55).cgColor)
+            ctx.fillPath()
         }
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         return placed.map { ($0.id, upright(CGPoint(x: $0.point.x - center.x, y: $0.point.y - center.y)).x) }

@@ -28,7 +28,7 @@ actor DataStore {
         }
     }
 
-    static let userAgent = "Peak/0.4 (iPhone app; github.com/Fry19/peak)"
+    static let userAgent = "Peak/0.5 (iPhone app; github.com/Fry19/peak)"
 
     let baseDirectory: URL
     private let demDirectory: URL
@@ -201,15 +201,21 @@ actor DataStore {
 
     // MARK: OpenStreetMap
 
-    /// Overpass servers, tried in turn when one is busy.
-    private static let overpassServers = [Overpass.endpoint, URL(string: "https://overpass.kumi.systems/api/interpreter")!]
+    /// Overpass servers, tried in turn when one is busy or down (the main one often answers
+    /// 502 or 504 under load).
+    private static let overpassServers = [
+        Overpass.endpoint,
+        URL(string: "https://maps.mail.ru/osm/tools/overpass/api/interpreter")!,
+        URL(string: "https://overpass.private.coffee/api/interpreter")!,
+        URL(string: "https://overpass.kumi.systems/api/interpreter")!,
+    ]
 
     private func overpass(_ query: String) async throws -> Data {
         var lastError: Error = Failure.download("map data")
         for server in Self.overpassServers {
             var request = URLRequest(url: server)
             request.httpMethod = "POST"
-            request.timeoutInterval = 60
+            request.timeoutInterval = 30
             request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
             request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
             request.httpBody = Data(("data=" + (query.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")).utf8)
@@ -251,14 +257,21 @@ actor DataStore {
         return []
     }
 
-    /// Hiking routes and named paths within 5 km of a peak, cached for a month.
+    /// Hiking routes and paths within 5 km of a peak, or 10 km when there are none that
+    /// close (small peaks often have none of their own). Cached for a month.
     func trails(near peak: Peak) async throws -> [Trail] {
         let cache = trailDirectory.appendingPathComponent("\(peak.id).json")
         if let data = cached(cache, maxAge: 30 * 86_400), let trails = try? Overpass.trails(fromJSON: data) { return trails }
-        let query = Overpass.trailsQuery(latitude: peak.latitude, longitude: peak.longitude, radius: 5_000, clip: 15_000)
         do {
-            let data = try await overpass(query)
-            let trails = try Overpass.trails(fromJSON: data)
+            var data = Data()
+            var trails: [Trail] = []
+            for radius in [5_000.0, 10_000] {
+                let query = Overpass.trailsQuery(latitude: peak.latitude, longitude: peak.longitude,
+                                                 radius: radius, clip: radius + 10_000)
+                data = try await overpass(query)
+                trails = try Overpass.trails(fromJSON: data)
+                if !trails.isEmpty { break }
+            }
             try? data.write(to: cache)
             return trails
         } catch {

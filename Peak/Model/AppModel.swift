@@ -110,6 +110,9 @@ final class AppModel {
     var arTrail: ARTrail?
     /// Lining the view up by hand: the picture is paused and dragging moves the lines.
     var aligning = false
+    /// How far the picture and the lines are zoomed in, 1 to `maxZoom`.
+    var zoom: Double = 1
+    static let maxZoom = 6.0
     /// The last skyline match, for diagnostics.
     var lastOutcome: SkylineCorrector.Outcome?
     var offlineStatus: String?
@@ -239,6 +242,12 @@ final class AppModel {
     }
 
     // MARK: Freeze frame
+
+    /// Zooms the picture and the lines, 1× to `maxZoom`.
+    func setZoom(_ value: Double) {
+        zoom = max(1, min(Self.maxZoom, value))
+        screen?.zoomChanged()
+    }
 
     func toggleFreeze() {
         guard !aligning else { return }
@@ -586,6 +595,7 @@ final class AppModel {
                                 lens.measured ? "measured" : "estimated", k.cx - Double(k.width) / 2, k.cy - Double(k.height) / 2,
                                 k.width, k.height))
         }
+        if zoom > 1.01 { lines.append(String(format: "zoom %.1f×", zoom)) }
         if let shown = screen?.shown, let latest = motion.latestTime {
             lines.append(String(format: "frame drawn with the pose from %.0f ms before the newest", (latest - shown.time) * 1000))
         }

@@ -39,6 +39,14 @@ public struct CameraIntrinsics: Equatable, Codable, Sendable {
         CameraIntrinsics(width: height, height: width, fx: fy, fy: fx, cx: Double(height) - cy, cy: cx)
     }
 
+    /// The same view magnified `factor` times about the image's center, as when the picture
+    /// is zoomed in on screen.
+    public func zoomed(by factor: Double) -> CameraIntrinsics {
+        let mx = Double(width) / 2, my = Double(height) / 2
+        return CameraIntrinsics(width: width, height: height, fx: fx * factor, fy: fy * factor,
+                                cx: mx + (cx - mx) * factor, cy: my + (cy - my) * factor)
+    }
+
     /// The camera for the image shown in a `width` × `height` view, scaled to fill it and
     /// centered (the parts that don't fit are cut off).
     public func aspectFilled(width: Double, height: Double) -> CameraIntrinsics {

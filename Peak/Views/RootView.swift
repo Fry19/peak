@@ -18,6 +18,21 @@ struct RootView: View {
                 } else if let trail = model.arTrail {
                     TrailChip(model: model, trail: trail)
                 }
+                if model.zoom > 1.05 {
+                    Button {
+                        model.setZoom(1)
+                    } label: {
+                        Text(String(format: "%.1f×", model.zoom))
+                            .font(.system(size: 13, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .environment(\.colorScheme, .dark)
+                    }
+                    .accessibilityLabel("Zoomed \(String(format: "%.1f", model.zoom)) times; tap to zoom out")
+                }
                 if model.settings.showDiagnostics {
                     DebugPanel(model: model)
                         .frame(maxWidth: .infinity, alignment: .leading)

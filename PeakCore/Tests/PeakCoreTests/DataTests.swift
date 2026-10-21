@@ -155,7 +155,11 @@ final class PeakDataTests: XCTestCase {
         ]}
         """
         let peaks = try Overpass.peaks(fromJSON: Data(json.utf8))
-        XCTAssertEqual(peaks, [Peak(id: 1, name: "Matterhorn", latitude: 45.9763, longitude: 7.6586, elevation: 4478)])
+        XCTAssertEqual(peaks.map(\.id), [1, 2], "unnamed peaks are left out")
+        XCTAssertEqual(peaks[0], Peak(id: 1, name: "Matterhorn", latitude: 45.9763, longitude: 7.6586, elevation: 4478))
+        // No elevation in OpenStreetMap: kept, for the terrain to fill in.
+        XCTAssertTrue(peaks[1].estimatedElevation)
+        XCTAssertFalse(peaks[0].estimatedElevation)
         XCTAssertTrue(Overpass.peaksQuery(south: 45, west: 7, north: 46, east: 8).contains("(45.0000,7.0000,46.0000,8.0000)"))
     }
 }

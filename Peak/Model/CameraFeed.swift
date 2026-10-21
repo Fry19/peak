@@ -76,11 +76,12 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
     private func configure() {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
-        session.sessionPreset = .high
         // The plain wide camera: a fixed lens, so the field of view stays known.
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else { return }
         session.addInput(input)
+        // 4K where the phone can, so zooming in on the picture stays sharp.
+        session.sessionPreset = session.canSetSessionPreset(.hd4K3840x2160) ? .hd4K3840x2160 : .high
         self.device = device
 
         let output = AVCaptureVideoDataOutput()

@@ -62,6 +62,11 @@ enum Format {
         units == .metric ? whole(meters) + " m" : whole(meters / 0.3048) + " ft"
     }
 
+    /// A peak's elevation: "4,478 m", or "≈ 1,234 m" when it's the terrain's estimate.
+    static func elevation(of peak: Peak, _ units: AppSettings.Units) -> String {
+        (peak.estimatedElevation ? "≈ " : "") + elevation(peak.elevation, units)
+    }
+
     /// "+2,350 m" for a height difference.
     static func climb(_ meters: Double, _ units: AppSettings.Units) -> String {
         (meters >= 0 ? "+" : "−") + elevation(abs(meters), units)

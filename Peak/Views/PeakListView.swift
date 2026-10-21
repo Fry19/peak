@@ -72,7 +72,7 @@ struct PeakListView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(Format.elevation(v.peak.elevation, units))
+                Text(Format.elevation(of: v.peak, units))
                     .font(.system(size: 15, weight: .medium))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)

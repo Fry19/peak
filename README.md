@@ -2,22 +2,24 @@
 
 An iPhone app that labels the mountains in your camera view and stays lined up with them. Phone compasses are often 5–15° off, which is why other peak apps drift. Peak corrects the heading by matching the skyline the camera sees against the skyline the terrain says should be there.
 
-This repo holds the skyline matching from the [project brief](CLAUDE.md), built and measured at a desk first, and the iPhone app (0.4) that uses it in a live camera view, with peak details and hikes.
+This repo holds the skyline matching from the [project brief](CLAUDE.md), built and measured at a desk first, and the iPhone app (0.5) that uses it in a live camera view, with peak details and hikes.
 
 ![Synthetic photo toward the Matterhorn from Gornergrat. Red: the horizon where an 8° wrong compass puts it. Green: after skyline matching. Yellow: the detected skyline. Cyan: ridges behind the skyline.](docs/matterhorn-aligned.jpg)
 
 *Red is where an 8° wrong compass puts the horizon, green is after correction (0.02° off), yellow is the detected skyline, and cyan marks ridges behind it.*
 
-## The app (0.4)
+## The app (0.5)
 
 Peak opens straight into the camera. The lines and labels stay on the mountains as you move the phone, the way PeakVisor's do: the phone's motion sensors (gyroscope, accelerometer and compass) give its orientation. Since the mountains are kilometers away, only the phone's rotation matters, so there's no ARKit world tracking to wait for. It works in portrait and landscape.
 
 The first time you use it somewhere, it downloads the terrain and the named peaks for 80 km around you and keeps them, so the same area works offline afterwards. Then it draws:
 
 - the skyline and the ridges in front of it as thin glowing lines, nearer ones brighter and farther ones fading;
-- labels (name and height) for the highest peaks you can actually see (6, 10 or 18, in Settings). Peaks hidden behind a nearer ridge aren't labeled.
+- labels (name and height) for the highest peaks you can actually see (6, 10 or 18, in Settings), and a small dot on every other peak in sight. Peaks hidden behind a nearer ridge aren't shown. Peaks OpenStreetMap has no elevation for show the terrain's, marked "≈".
 
-**Tap a label** for the peak's card: elevation, prominence, distance, bearing, how far above you it is, its range, first ascent and a Wikipedia summary and picture, and the **hikes nearby**: OpenStreetMap hiking routes and named paths within 5 km of the summit, with length, climb, difficulty on the SAC scale (T1–T6) and how far the start is from you. Those that reach the summit come first. A hike's card has a satellite map, an elevation profile and directions to the start. **Show on the mountain** lays the trail on the real slope in the camera view, leaving out the parts hidden behind nearer terrain.
+**Pinch** to zoom in on the picture and the lines together, up to 6× (the camera records in 4K where the phone can, so the picture stays sharp); more labels fit as the peaks spread apart. Tap the zoom chip at the top to zoom back out.
+
+**Tap a label or a dot** for the peak's card: elevation, prominence, distance, bearing, how far above you it is, its range, first ascent and a Wikipedia summary and picture, and the **hikes nearby**: OpenStreetMap hiking routes and named paths within 5 km of the summit (10 km when there are none that close), plus unnamed paths up to it, with length, climb, difficulty on the SAC scale (T1–T6) and how far the start is from you. Those that reach the summit come first. A hike's card has a satellite map, an elevation profile and directions to the start. **Show on the mountain** lays the trail on the real slope in the camera view, leaving out the parts hidden behind nearer terrain.
 
 The **list button** (bottom left) lists every peak around you, those in view first, with search; picking one highlights it in the view, with an arrow at the edge when it's out of frame. **Settings** (bottom right): meters or feet, how many labels, ridges, the haptic tick, terrain on mobile data, saving the area for offline use, and storage.
 
@@ -36,7 +38,7 @@ Labels stand upright in the world whichever way you hold the phone, even with th
 
 **Downloads:** the Copernicus tiles have lower-resolution copies built in, and the full 30 m image is stored in blocks of about 2.5 MB. Peak starts downloading as soon as it has a rough position, fetching tiles at 240 m (about 0.6 MB each) and 120 m within 30 km (2 MB), all at once, and shows the view as soon as the tile you're in arrives. Then it sharpens the terrain block by block: the full 30 m within 10 km, 60 m within 35 km and 120 m everywhere, and 30 m within 15–25 km on Wi-Fi (or on mobile data, unless you turn that off). Peaks and hikes come from OpenStreetMap through the Overpass API, facts from Wikidata and Wikipedia. Everything is cached on the phone; **Save this area for offline use** fetches the sharpest terrain for the whole area.
 
-Not in 0.4 yet: a learned skyline detector, your position on a trail, and lidar terrain.
+Not in 0.5 yet: a learned skyline detector, your position on a trail, and lidar terrain.
 
 ## Installing on your iPhone
 

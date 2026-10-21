@@ -31,6 +31,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         self.model = model
         super.init(frame: .zero)
         backgroundColor = .black
+        clipsToBounds = true   // the zoomed picture reaches past the edges
         video.videoGravity = .resizeAspectFill
         layer.addSublayer(video)
         overlay.screen = self
@@ -40,7 +41,9 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         // Lining up by hand: drag to move the lines, turn with two fingers to level them.
         let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
         let rotation = UIRotationGestureRecognizer(target: self, action: #selector(rotated(_:)))
-        for g in [pan, rotation] as [UIGestureRecognizer] {
+        // Pinch to zoom in on the picture and the lines together.
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
+        for g in [pan, rotation, pinch] as [UIGestureRecognizer] {
             g.delegate = self
             addGestureRecognizer(g)
         }
@@ -49,7 +52,19 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     // UIView asks itself this for its own gesture recognizers; dragging and turning only
     // work while lining up.
     override func gestureRecognizerShouldBegin(_ gesture: UIGestureRecognizer) -> Bool {
-        gesture is UITapGestureRecognizer || model?.aligning == true
+        gesture is UITapGestureRecognizer || gesture is UIPinchGestureRecognizer || model?.aligning == true
+    }
+
+    @objc private func pinched(_ gesture: UIPinchGestureRecognizer) {
+        guard let model else { return }
+        model.setZoom(model.zoom * Double(gesture.scale))
+        gesture.scale = 1
+    }
+
+    /// Shows the picture at the model's zoom.
+    func zoomChanged() {
+        layoutVideo()
+        overlay.setNeedsDisplay()
     }
 
     func gestureRecognizer(_ gesture: UIGestureRecognizer,
@@ -88,17 +103,22 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     override func layoutSubviews() {
         super.layoutSubviews()
         overlay.frame = bounds
-        // Turn the picture to match the interface: frames come in portrait (or the sensor's
-        // landscape orientation) whichever way the phone is held.
+        layoutVideo()
+        overlay.setNeedsDisplay()
+    }
+
+    /// Turns the picture to match the interface (frames come in portrait, or the sensor's
+    /// landscape orientation, whichever way the phone is held) and zooms it about the middle.
+    private func layoutVideo() {
         let portrait = model?.frozen?.shown.portrait ?? shown?.portrait ?? true
         let turns = (CameraGeometry.quarterTurns(interfaceOrientation) - (portrait ? 1 : 0) + 4) % 4
+        let zoom = CGFloat(model?.zoom ?? 1)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        video.setAffineTransform(CGAffineTransform(rotationAngle: CGFloat(turns) * .pi / 2))
+        video.setAffineTransform(CGAffineTransform(rotationAngle: CGFloat(turns) * .pi / 2).scaledBy(x: zoom, y: zoom))
         video.bounds = CGRect(origin: .zero, size: turns % 2 == 1 ? CGSize(width: bounds.height, height: bounds.width) : bounds.size)
         video.position = CGPoint(x: bounds.midX, y: bounds.midY)
         CATransaction.commit()
-        overlay.setNeedsDisplay()
     }
 
     /// Puts a frame on screen, unless the view is paused.

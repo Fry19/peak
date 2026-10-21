@@ -69,5 +69,10 @@ final class CameraTests: XCTestCase {
         let q = try XCTUnwrap(filled.projector.pixel(azimuth: 35, elevation: 4))
         XCTAssertEqual(q.x, 195 + (p.x - 540) * s, accuracy: 1e-6)
         XCTAssertEqual(q.y, 422 + (p.y - 960) * s, accuracy: 1e-6)
+        // Zooming in 3× magnifies about the middle of the view.
+        let zoomed = Camera(intrinsics: k.aspectFilled(width: 390, height: 844).zoomed(by: 3), attitude: a)
+        let z = try XCTUnwrap(zoomed.projector.pixel(azimuth: 35, elevation: 4))
+        XCTAssertEqual(z.x, 195 + (q.x - 195) * 3, accuracy: 1e-6)
+        XCTAssertEqual(z.y, 422 + (q.y - 422) * 3, accuracy: 1e-6)
     }
 }

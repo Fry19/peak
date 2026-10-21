@@ -303,6 +303,26 @@ extension Terrain {
         return grid[cell]
     }
 
+    /// Peaks with `estimatedElevation` get the terrain's highest point within `radius`
+    /// meters of them; those outside the terrain are left out. Others pass through.
+    public func fillElevations(_ peaks: [Peak], radius: Double = 60) -> [Peak] {
+        peaks.compactMap { peak in
+            guard peak.estimatedElevation else { return peak }
+            let dlat = radius / 111_320, dlon = radius / (111_320 * max(cos(peak.latitude * .pi / 180), 0.05))
+            var top = -Double.infinity
+            for i in -2...2 {
+                for j in -2...2 {
+                    let h = height(latitude: peak.latitude + dlat * Double(i) / 2, longitude: peak.longitude + dlon * Double(j) / 2)
+                    if h.isFinite { top = max(top, h) }
+                }
+            }
+            guard top.isFinite else { return nil }
+            var p = peak
+            p.elevation = top
+            return p
+        }
+    }
+
     /// A 30 m terrain model blunts sharp summits: the Matterhorn's top is 148 m short. Raises
     /// the terrain around each peak to a cone reaching the peak's surveyed elevation, so
     /// skylines and ridgelines have their real tips. The cone is about as steep as a sharp
@@ -313,7 +333,7 @@ extension Terrain {
     @discardableResult
     public func raiseSummits(_ peaks: [Peak], radius: Double = 250, minDeficit: Double = 8, maxDeficit: Double = 300) -> Int {
         var raised = 0
-        for peak in peaks {
+        for peak in peaks where !peak.estimatedElevation {
             guard let tile = finestTile(latitude: peak.latitude, longitude: peak.longitude) else { continue }
             let metersPerLat = 111_320.0, metersPerLon = 111_320 * cos(peak.latitude * .pi / 180)
             let pixel = max(tile.stepLatitude * metersPerLat, tile.stepLongitude * metersPerLon)
