@@ -62,9 +62,11 @@ jobs:
           APP=Payload/Peak.app
           ls -la "$APP"
           echo "Binary: $(stat -f%z "$APP/Peak") bytes; IPA: $(stat -f%z Peak.ipa) bytes"
-          # The skyline matcher and the terrain download must be in the binary.
-          strings "$APP/Peak" | grep -q "copernicus-dem-30m" || { echo "terrain download missing"; exit 1; }
-          nm "$APP/Peak" | grep -q "SkylineMatcher" || { echo "PeakCore missing"; exit 1; }
+          # The terrain download and PeakCore (peak data, alignment) must be in the binary.
+          # Release builds are stripped, so look for string literals rather than symbols.
+          for text in "copernicus-dem-30m" "overpass-api.de" "not enough distant skyline"; do
+            strings "$APP/Peak" | grep -q "$text" || { echo "missing from the binary: $text"; exit 1; }
+          done
           plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleShortVersionString|NSCameraUsageDescription|NSLocationWhenInUseUsageDescription"
       - name: Upload IPA
         uses: actions/upload-artifact@v4
