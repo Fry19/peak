@@ -82,3 +82,7 @@ Prototype skyline matching **before any UI**, since it decides whether the app b
 - After changing detection or alignment, run the benchmark before and after and compare. CI runs it on every push and puts the table in the job summary:
   `peakbench bench --dem DEM --lat 45.9837 --lon 7.7856 --runs 30` (ARKit mode) and `--mode photo`.
 - Angles are degrees, distances meters, azimuths clockwise from true north. Image coordinates have y down, and a row's top edge is at y = row.
+- On a Mac (set up with `Tools/setup-mac.sh`), build and install on a plugged-in iPhone without changing the project's signing settings:
+  `xcodebuild -project Peak.xcodeproj -scheme Peak -destination 'platform=iOS,name=<iPhone name>' -derivedDataPath build -allowProvisioningUpdates DEVELOPMENT_TEAM=<team ID> build`,
+  then `xcrun devicectl device install app --device '<iPhone name>' build/Build/Products/Debug-iphoneos/Peak.app` and `xcrun devicectl device process launch --device '<iPhone name>' com.fry19.peak`.
+  `xcrun devicectl list devices` names the iPhone. The personal team ID is the `OU` in `security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject` once Xcode has made a certificate (signing in under Xcode > Settings > Accounts and building once in Xcode makes one). Don't commit a team ID: CI builds unsigned.

@@ -63,6 +63,14 @@ The first time, also turn on **Settings → Privacy & Security → Developer Mod
 
 On a Mac with Xcode 16 or later: open `Peak.xcodeproj`, select the **Peak** target, set **Signing & Capabilities → Team** to your Apple ID (change the bundle identifier `com.fry19.peak` if Xcode says it's taken), pick your iPhone and press **Run**.
 
+**Setting up a Mac to work on Peak** (Xcode, the code, Claude Code and GitHub sign-in) takes one command in Terminal:
+
+```
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Fry19/peak/main/Tools/setup-mac.sh)"
+```
+
+It stops for the few things only you can do (your Mac password, getting Xcode from the App Store, signing in with your Apple ID, trusting the Mac on your iPhone), then starts Claude Code in the project to build Peak and install it on your iPhone. Running it again skips whatever is already set up.
+
 When Peak starts, allow the camera and your location.
 
 ## Where it stands
