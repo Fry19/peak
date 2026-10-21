@@ -28,7 +28,7 @@ actor DataStore {
         }
     }
 
-    static let userAgent = "Peak/0.5 (iPhone app; github.com/Fry19/peak)"
+    static let userAgent = "Peak/0.6 (iPhone app; github.com/Fry19/peak)"
 
     let baseDirectory: URL
     private let demDirectory: URL

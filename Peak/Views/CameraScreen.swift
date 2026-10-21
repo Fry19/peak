@@ -64,7 +64,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     /// Shows the picture at the model's zoom.
     func zoomChanged() {
         layoutVideo()
-        overlay.setNeedsDisplay()
+        overlay.update()
     }
 
     func gestureRecognizer(_ gesture: UIGestureRecognizer,
@@ -82,7 +82,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         // Lines follow the finger: turning the view left moves them right, tilting it up
         // moves them down.
         model.adjust(heading: -along / f * 180 / .pi, pitch: down / f * 180 / .pi, roll: 0)
-        overlay.setNeedsDisplay()
+        overlay.update()
     }
 
     @objc private func rotated(_ gesture: UIRotationGestureRecognizer) {
@@ -91,7 +91,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         gesture.rotation = 0
         // Turning the camera clockwise turns the picture's contents the other way.
         model.adjust(heading: 0, pitch: 0, roll: -r * 180 / .pi)
-        overlay.setNeedsDisplay()
+        overlay.update()
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -104,7 +104,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         super.layoutSubviews()
         overlay.frame = bounds
         layoutVideo()
-        overlay.setNeedsDisplay()
+        overlay.setNeedsUpdate()
     }
 
     /// Turns the picture to match the interface (frames come in portrait, or the sensor's
@@ -132,7 +132,8 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         shown = AppModel.Shown(time: frame.time, lens: frame.lens, portrait: frame.portrait)
         lastFrameDate = Date()
         if turned { setNeedsLayout() }
-        overlay.setNeedsDisplay()
+        // Lay the overlay out for this frame now, so both reach the screen together.
+        overlay.update()
     }
 
     /// Frames have no playback clock: show each as soon as it arrives.

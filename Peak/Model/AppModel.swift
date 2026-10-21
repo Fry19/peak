@@ -247,6 +247,9 @@ final class AppModel {
     func setZoom(_ value: Double) {
         zoom = max(1, min(Self.maxZoom, value))
         screen?.zoomChanged()
+        // Sharper frames only while zoomed in; the gap between the two keeps it from
+        // switching back and forth.
+        if zoom >= 2 { camera.setHighResolution(true) } else if zoom <= 1.3 { camera.setHighResolution(false) }
     }
 
     func toggleFreeze() {
@@ -352,7 +355,7 @@ final class AppModel {
     private func drapeTrail() {
         guard let trail = arTrail?.trail, let scene else { return }
         Task { @MainActor in
-            let runs = await Task.detached(priority: .userInitiated) { scene.drape(trail) }.value
+            let runs = await Task.detached(priority: .utility) { scene.drape(trail) }.value
             if arTrail?.trail.id == trail.id { arTrail?.runs = runs }
         }
     }
@@ -532,7 +535,8 @@ final class AppModel {
             let peaks = self.peaks
             let lat = center.coordinate.latitude, lon = center.coordinate.longitude
             let started = Date()
-            let built = await Task.detached(priority: .userInitiated) {
+            // Below the interface's priority, so building never makes the screen stutter.
+            let built = await Task.detached(priority: .utility) {
                 TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, peaks: peaks)
             }.value
             lastBuildSeconds = Date().timeIntervalSince(started)
@@ -652,7 +656,7 @@ final class PeakDetails {
             do {
                 let trails = try await store.trails(near: peak)
                 let ground = terrain()
-                hikes = await Task.detached(priority: .userInitiated) {
+                hikes = await Task.detached(priority: .utility) {
                     trails.map { t in
                         let d = t.distance(to: peak.position)
                         return Hike(trail: t, profile: ground.flatMap { t.profile(on: $0) }, reachesSummit: d < 250, distanceFromPeak: d)

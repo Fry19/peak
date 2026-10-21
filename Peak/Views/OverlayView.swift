@@ -2,21 +2,26 @@ import PeakCore
 import UIKit
 
 /// Thin glowing ridgelines, nearer ones brighter and farther ones fading like haze, a few
-/// labels for the most prominent visible peaks, and a trail laid on the mountain. Drawn for
-/// the frame on screen, with the phone's pose from the moment that frame was taken.
+/// labels for the most prominent visible peaks, and a trail laid on the mountain. Laid out
+/// for the frame on screen, with the phone's pose from the moment that frame was taken.
+///
+/// Nothing is drawn by the app itself each frame: the lines are shape layers that Core
+/// Animation renders, and each label is drawn once into an image that is then only moved.
+/// Laying them out takes about a millisecond, so the main thread stays free.
 final class OverlayCanvas: UIView {
     weak var model: AppModel?
     weak var screen: CameraScreenView?
     private var link: CADisplayLink?
+    private var needsUpdate = true
     private var smoothed: ViewCorrection?
-    private var lastDraw = Date()
+    private var lastUpdate = Date()
     private var lastSide: [Int64: Bool] = [:]
     private var lastTick = Date.distantPast
     private let haptics = UISelectionFeedbackGenerator()
-    /// Where each label was drawn, and the dots of peaks without one, for taps.
+    /// Where each label was placed, and the dots of peaks without one, for taps.
     private var labelHits: [(rect: CGRect, id: Int64)] = []
     private var dots: [(point: CGPoint, id: Int64)] = []
-    /// The last drawing's focal length in points, and which way is up in the world on
+    /// The last layout's focal length in points, and which way is up in the world on
     /// screen (radians clockwise from the screen's up), for lining up by hand.
     private(set) var lastFocal: Double?
     private(set) var upAngle: CGFloat = 0
@@ -27,32 +32,89 @@ final class OverlayCanvas: UIView {
     private static let trailColor = UIColor(red: 1.0, green: 0.72, blue: 0.28, alpha: 1)
     private static let accent = UIColor(red: 1.0, green: 0.84, blue: 0.45, alpha: 1)
 
+    // Under each line a wide faint stroke makes the glow (cheaper than a blurred shadow).
+    private let bandGlow = OverlayCanvas.bands.map { OverlayCanvas.stroke(OverlayCanvas.tint.withAlphaComponent($0.1 * 0.18), width: 4) }
+    private let bandLine = OverlayCanvas.bands.map { OverlayCanvas.stroke(OverlayCanvas.tint.withAlphaComponent($0.1), width: 1) }
+    private let skyGlow = OverlayCanvas.stroke(OverlayCanvas.tint.withAlphaComponent(0.3), width: 5)
+    private let skyLine = OverlayCanvas.stroke(UIColor.white.withAlphaComponent(0.95), width: 1.4)
+    private let trailGlow = OverlayCanvas.stroke(OverlayCanvas.trailColor.withAlphaComponent(0.3), width: 8)
+    private let trailLine = OverlayCanvas.stroke(OverlayCanvas.trailColor, width: 2.5)
+    private let dotLayer: CAShapeLayer = {
+        let l = CAShapeLayer()
+        l.fillColor = UIColor.white.withAlphaComponent(0.55).cgColor
+        l.strokeColor = nil
+        return l
+    }()
+    private let labelContainer = CALayer()
+    private var labelLayers: [Int64: CALayer] = [:]
+    /// The image each label layer shows, so unchanged ones aren't set again.
+    private var labelShows: [Int64: ObjectIdentifier] = [:]
+    private let arrowLayer = CALayer()
+
+    /// A label drawn once: the image, where the peak's dot is in it, and the part to tap
+    /// (relative to the dot).
+    private struct LabelImage {
+        var image: CGImage
+        var size: CGSize
+        var anchor: CGPoint
+        var box: CGRect
+    }
+    private var images: [String: LabelImage] = [:]
+
+    private static func stroke(_ color: UIColor, width: CGFloat) -> CAShapeLayer {
+        let l = CAShapeLayer()
+        l.strokeColor = color.cgColor
+        l.fillColor = nil
+        l.lineWidth = width
+        l.lineCap = .round
+        l.lineJoin = .round
+        return l
+    }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         isOpaque = false
         backgroundColor = .clear
         isUserInteractionEnabled = false
-        contentMode = .redraw
+        // Ridges first, the skyline over them, then the trail, dots and labels on top.
+        for l in bandGlow + bandLine + [skyGlow, skyLine, trailGlow, trailLine, dotLayer] { layer.addSublayer(l) }
+        layer.addSublayer(labelContainer)
+        layer.addSublayer(arrowLayer)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for l in layer.sublayers ?? [] { l.frame = bounds }
+        CATransaction.commit()
+        needsUpdate = true
+    }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
         link?.invalidate()
         link = nil
         if window != nil {
-            // New frames redraw the overlay; this keeps it alive when none come (paused, or
-            // the camera not running yet). The link holds its target until invalidated.
+            // New frames update the overlay as they arrive; this catches everything else
+            // (pinching, settings, the view paused or the camera not running yet). The link
+            // holds its target until invalidated.
             let link = CADisplayLink(target: self, selector: #selector(tick))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 10, maximum: 30, preferred: 20)
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 30)
             link.add(to: .main, forMode: .common)
             self.link = link
         }
     }
 
     @objc private func tick() {
-        if Date().timeIntervalSince(screen?.lastFrameDate ?? .distantPast) > 0.1 { setNeedsDisplay() }
+        if needsUpdate || Date().timeIntervalSince(screen?.lastFrameDate ?? .distantPast) > 0.1 { update() }
+    }
+
+    /// Lays the overlay out again at the next screen refresh.
+    func setNeedsUpdate() {
+        needsUpdate = true
     }
 
     /// The peak whose label or dot is at `point`, if any: a label first, else the nearest
@@ -63,17 +125,24 @@ final class OverlayCanvas: UIView {
         return near.flatMap { $0.d < 28 ? $0.id : nil }
     }
 
-    static func height(_ peak: Peak, _ units: AppSettings.Units) -> String {
-        Format.elevation(of: peak, units)
-    }
-
-    override func draw(_ rect: CGRect) {
+    /// Lays everything out for the frame on screen now.
+    func update() {
+        needsUpdate = false
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         labelHits = []
-        guard let model, let ctx = UIGraphicsGetCurrentContext(), let scene = model.scene else { return }
+        guard let model, let scene = model.scene, bounds.width > 0 else {
+            clear()
+            return
+        }
         let frozen = model.frozen
         let now = Date()
         let shown = frozen?.shown ?? screen?.shown ?? fallbackShown(model)
-        guard let pose = frozen?.pose ?? model.motion.pose(at: shown.time) ?? model.motion.pose else { return }
+        guard let pose = frozen?.pose ?? model.motion.pose(at: shown.time) ?? model.motion.pose else {
+            clear()
+            return
+        }
         let correction = frozen?.correction ?? smoothedCorrection(model.viewCorrection(for: pose), at: now)
         if frozen != nil { smoothed = correction }
         let orientation = screen?.interfaceOrientation ?? .portrait
@@ -87,10 +156,24 @@ final class OverlayCanvas: UIView {
         let axes = camera.attitude.axes
         upAngle = CGFloat(atan2(axes.right.z, -axes.down.z))
         lastFocal = camera.intrinsics.fx
-        drawRidges(scene, projector, heading: camera.attitude.heading, ridges: settings.showRidges, in: ctx)
-        if let runs = model.arTrail?.runs { drawTrail(runs, projector, in: ctx) }
-        let placed = drawLabels(scene, projector, heading: camera.attitude.heading, model: model, in: ctx)
+
+        // How far around the view direction anything can be on screen, in azimuth: the
+        // view's half-diagonal, widened toward the zenith where azimuths crowd together.
+        let half = atan(Double(hypot(bounds.width, bounds.height)) / 2 / camera.intrinsics.fx) * 180 / .pi
+        let top = abs(camera.attitude.pitch) + half
+        let reach = top >= 85 ? 180 : Int(min(180, half / cos(top * .pi / 180) + 3))
+
+        layoutRidges(scene, projector, heading: camera.attitude.heading, reach: reach, ridges: settings.showRidges)
+        layoutTrail(model.arTrail?.runs, projector)
+        let placed = layoutLabels(scene, projector, heading: camera.attitude.heading, reach: reach, model: model)
         if frozen == nil, settings.haptics { tickIfCrossing(placed, at: now) }
+    }
+
+    private func clear() {
+        for l in bandGlow + bandLine + [skyGlow, skyLine, trailGlow, trailLine, dotLayer] { l.path = nil }
+        labelLayers.values.forEach { $0.isHidden = true }
+        arrowLayer.isHidden = true
+        dots = []
     }
 
     /// Before the first frame: the latest lens, or a typical one.
@@ -102,8 +185,8 @@ final class OverlayCanvas: UIView {
 
     /// Eases corrections in instead of jumping.
     private func smoothedCorrection(_ target: ViewCorrection, at now: Date) -> ViewCorrection {
-        let dt = max(0, min(0.2, now.timeIntervalSince(lastDraw)))
-        lastDraw = now
+        let dt = max(0, min(0.2, now.timeIntervalSince(lastUpdate)))
+        lastUpdate = now
         guard let value = smoothed, abs(azimuthDifference(target.heading, value.heading)) < 30 else {
             smoothed = target
             return target
@@ -120,35 +203,56 @@ final class OverlayCanvas: UIView {
         projector.pixel(azimuth: azimuth, elevation: elevation).map { CGPoint(x: $0.x, y: $0.y) }
     }
 
-    private func drawRidges(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, ridges: Bool, in ctx: CGContext) {
-        let paths = Self.bands.map { _ in CGMutablePath() }
-        let skyline = CGMutablePath()
-        let center = Int(heading.rounded())
-        // ±70° covers the view's diagonal in either orientation.
-        for offset in -70...70 {
-            for s in scene.segments[(center + offset + 720) % 360] where ridges || s.isSkyline {
-                guard let a = point(projector, Double(s.azimuth0), Double(s.elevation0)),
-                      let b = point(projector, Double(s.azimuth1), Double(s.elevation1)) else { continue }
-                let path = s.isSkyline ? skyline : paths[Self.bands.firstIndex { s.distance < $0.0 } ?? Self.bands.count - 1]
+    /// A path that joins segments end to end when they meet, so a ridge is one line
+    /// rather than hundreds of pieces.
+    private struct Polyline {
+        let path = CGMutablePath()
+        var last: CGPoint?
+
+        mutating func add(_ a: CGPoint, _ b: CGPoint) {
+            if let last, abs(last.x - a.x) < 0.5, abs(last.y - a.y) < 0.5 {
+                path.addLine(to: b)
+            } else {
                 path.move(to: a)
                 path.addLine(to: b)
             }
+            last = b
         }
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-        // A wide faint stroke under each line for the glow (cheaper than a blurred shadow),
-        // ridges first and the skyline on top.
-        for (i, path) in paths.enumerated() {
-            let alpha = Self.bands[i].1
-            stroke(path, in: ctx, color: Self.tint.withAlphaComponent(alpha * 0.18), width: 4)
-            stroke(path, in: ctx, color: Self.tint.withAlphaComponent(alpha), width: 1)
+    }
+
+    private func layoutRidges(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, reach: Int, ridges: Bool) {
+        var bands = Self.bands.map { _ in Polyline() }
+        var skyline = Polyline()
+        let center = Int(heading.rounded())
+        let span = reach >= 180 ? -180...179 : -reach...reach
+        let bounds = self.bounds.insetBy(dx: -40, dy: -40)
+        for offset in span {
+            for s in scene.segments[(center + offset + 720) % 360] where ridges || s.isSkyline {
+                guard let a = point(projector, Double(s.azimuth0), Double(s.elevation0)),
+                      let b = point(projector, Double(s.azimuth1), Double(s.elevation1)),
+                      bounds.contains(a) || bounds.contains(b) else { continue }
+                if s.isSkyline {
+                    skyline.add(a, b)
+                } else {
+                    bands[Self.bands.firstIndex { s.distance < $0.0 } ?? Self.bands.count - 1].add(a, b)
+                }
+            }
         }
-        stroke(skyline, in: ctx, color: Self.tint.withAlphaComponent(0.3), width: 5)
-        stroke(skyline, in: ctx, color: UIColor.white.withAlphaComponent(0.95), width: 1.4)
+        for i in bands.indices {
+            bandGlow[i].path = bands[i].path
+            bandLine[i].path = bands[i].path
+        }
+        skyGlow.path = skyline.path
+        skyLine.path = skyline.path
     }
 
     /// The trail's visible stretches, laid on the slope.
-    private func drawTrail(_ runs: [[DrapedPoint]], _ projector: Camera.Projector, in ctx: CGContext) {
+    private func layoutTrail(_ runs: [[DrapedPoint]]?, _ projector: Camera.Projector) {
+        guard let runs else {
+            trailGlow.path = nil
+            trailLine.path = nil
+            return
+        }
         let path = CGMutablePath()
         for run in runs {
             var pen = false
@@ -161,17 +265,8 @@ final class OverlayCanvas: UIView {
                 pen = true
             }
         }
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-        stroke(path, in: ctx, color: Self.trailColor.withAlphaComponent(0.3), width: 8)
-        stroke(path, in: ctx, color: Self.trailColor, width: 2.5)
-    }
-
-    private func stroke(_ path: CGPath, in ctx: CGContext, color: UIColor, width: CGFloat) {
-        ctx.setStrokeColor(color.cgColor)
-        ctx.setLineWidth(width)
-        ctx.addPath(path)
-        ctx.strokePath()
+        trailGlow.path = path
+        trailLine.path = path
     }
 
     private static func attributes(size: CGFloat, weight: UIFont.Weight, color: UIColor) -> [NSAttributedString.Key: Any] {
@@ -196,119 +291,181 @@ final class OverlayCanvas: UIView {
     }
 
     /// Labels the selected peak, then the biggest visible peaks, skipping any that would
-    /// crowd a placed label; a selected peak out of view gets an arrow at the edge.
-    private func drawLabels(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double,
-                            model: AppModel, in ctx: CGContext) -> [(Int64, CGFloat)] {
+    /// crowd a placed label; a selected peak out of view gets an arrow at the edge. Every
+    /// other peak in sight gets a small dot, so it can be tapped too.
+    private func layoutLabels(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, reach: Int,
+                              model: AppModel) -> [(Int64, CGFloat)] {
         let units = model.settings.units
         // Zoomed in, peaks spread apart and there's room for more labels.
         let maxLabels = model.settings.labels.maxLabels + (model.zoom > 1.5 ? 6 : 0)
         var placed: [(id: Int64, point: CGPoint)] = []
-        dots = []
+        var shownLabels: [(id: Int64, image: LabelImage, point: CGPoint)] = []
         // The label rises about 70 points above its peak, toward the world's up.
         func fits(_ p: CGPoint, margin: CGFloat) -> Bool {
             let top = CGPoint(x: p.x - 70 * worldDown.x, y: p.y - 70 * worldDown.y)
             let area = bounds.insetBy(dx: margin, dy: margin)
             return area.contains(p) && area.contains(top)
         }
+        let limit = Double(min(reach, 90))
 
+        arrowLayer.isHidden = true
         if let id = model.selectedPeakID, let v = scene.allPeaks[id] {
-            if abs(azimuthDifference(v.azimuth, heading)) < 80, let p = point(projector, v.azimuth, v.elevation), fits(p, margin: 8) {
-                drawLabel(name: v.peak.name, detail: Self.height(v.peak, units) + (v.isVisible ? "" : " · hidden"),
-                          at: p, selected: true, hidden: !v.isVisible, id: id, in: ctx)
+            if abs(azimuthDifference(v.azimuth, heading)) < limit + 10, let p = point(projector, v.azimuth, v.elevation),
+               fits(p, margin: 8) {
+                let image = labelImage(name: v.peak.name, detail: Format.elevation(of: v.peak, units) + (v.isVisible ? "" : " · hidden"),
+                                       selected: true, hidden: !v.isVisible)
+                shownLabels.append((id, image, p))
                 placed.append((id, p))
             } else {
-                drawEdgeArrow(name: v.peak.name, distance: Format.distance(v.distance, units),
-                              toRight: azimuthDifference(v.azimuth, heading) > 0, id: id, in: ctx)
+                layoutEdgeArrow(name: v.peak.name, distance: Format.distance(v.distance, units),
+                                toRight: azimuthDifference(v.azimuth, heading) > 0, id: id)
             }
         }
 
-        for v in scene.peaks where placed.count < maxLabels && v.id != model.selectedPeakID {
-            guard abs(azimuthDifference(v.azimuth, heading)) < 70,
-                  let p = point(projector, v.azimuth, v.elevation), fits(p, margin: 16),
-                  placed.allSatisfy({
-                      let d = upright(CGPoint(x: $0.point.x - p.x, y: $0.point.y - p.y))
-                      return abs(d.x) > 84 || abs(d.y) > 70
-                  }) else { continue }
-            placed.append((v.peak.id, p))
-            drawLabel(name: v.peak.name, detail: Self.height(v.peak, units), at: p,
-                      selected: false, hidden: false, id: v.id, in: ctx)
+        var candidates: [(id: Int64, point: CGPoint)] = []
+        for v in scene.peaks where v.id != model.selectedPeakID {
+            guard abs(azimuthDifference(v.azimuth, heading)) < limit,
+                  let p = point(projector, v.azimuth, v.elevation), bounds.insetBy(dx: 4, dy: 4).contains(p) else { continue }
+            if placed.count < maxLabels, fits(p, margin: 16),
+               placed.allSatisfy({
+                   let d = upright(CGPoint(x: $0.point.x - p.x, y: $0.point.y - p.y))
+                   return abs(d.x) > 84 || abs(d.y) > 70
+               }) {
+                placed.append((v.id, p))
+                shownLabels.append((v.id, labelImage(name: v.peak.name, detail: Format.elevation(of: v.peak, units),
+                                                     selected: false, hidden: false), p))
+            } else if candidates.count < 150 {
+                candidates.append((v.id, p))
+            }
         }
-        // Every other peak in sight gets a small dot, so it can be tapped too.
-        for v in scene.peaks where dots.count < 150 && !placed.contains(where: { $0.id == v.id }) {
-            guard abs(azimuthDifference(v.azimuth, heading)) < 70, let p = point(projector, v.azimuth, v.elevation),
-                  bounds.insetBy(dx: 4, dy: 4).contains(p),
-                  placed.allSatisfy({ abs($0.point.x - p.x) > 10 || abs($0.point.y - p.y) > 10 }) else { continue }
-            dots.append((p, v.id))
+
+        // Label layers: reuse each peak's, hide the rest.
+        var used = Set<Int64>()
+        for (id, image, p) in shownLabels {
+            used.insert(id)
+            let l: CALayer
+            if let existing = labelLayers[id] {
+                l = existing
+            } else {
+                l = CALayer()
+                l.contentsScale = traitCollection.displayScale
+                labelContainer.addSublayer(l)
+                labelLayers[id] = l
+            }
+            if labelShows[id] != ObjectIdentifier(image.image) {
+                l.contents = image.image
+                labelShows[id] = ObjectIdentifier(image.image)
+            }
+            l.bounds = CGRect(origin: .zero, size: image.size)
+            l.anchorPoint = CGPoint(x: image.anchor.x / image.size.width, y: image.anchor.y / image.size.height)
+            l.position = p
+            l.setAffineTransform(CGAffineTransform(rotationAngle: upAngle))
+            l.isHidden = false
+            let turn = CGAffineTransform(translationX: p.x, y: p.y).rotated(by: upAngle)
+            labelHits.append((image.box.applying(turn), id))
         }
-        if !dots.isEmpty {
-            let path = CGMutablePath()
-            for (p, _) in dots { path.addEllipse(in: CGRect(x: p.x - 2, y: p.y - 2, width: 4, height: 4)) }
-            ctx.addPath(path)
-            ctx.setFillColor(UIColor.white.withAlphaComponent(0.55).cgColor)
-            ctx.fillPath()
+        for (id, l) in labelLayers where !used.contains(id) {
+            l.removeFromSuperlayer()
+            labelLayers[id] = nil
+            labelShows[id] = nil
         }
+
+        dots = candidates
+            .filter { c in placed.allSatisfy { abs($0.point.x - c.point.x) > 10 || abs($0.point.y - c.point.y) > 10 } }
+            .map { (point: $0.point, id: $0.id) }
+        let dotPath = CGMutablePath()
+        for (p, _) in dots { dotPath.addEllipse(in: CGRect(x: p.x - 2, y: p.y - 2, width: 4, height: 4)) }
+        dotLayer.path = dotPath
+
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         return placed.map { ($0.id, upright(CGPoint(x: $0.point.x - center.x, y: $0.point.y - center.y)).x) }
     }
 
-    /// A peak's label: a dot, a leader line up from it and the name and height above, all
-    /// turned so they stand upright in the world.
-    private func drawLabel(name: String, detail: String, at p: CGPoint, selected: Bool, hidden: Bool, id: Int64, in ctx: CGContext) {
-        let turn = CGAffineTransform(translationX: p.x, y: p.y).rotated(by: upAngle)
-        ctx.saveGState()
-        ctx.concatenate(turn)
-        defer { ctx.restoreGState() }
-
-        let leader = UIBezierPath()
-        leader.move(to: CGPoint(x: 0, y: -5))
-        leader.addLine(to: CGPoint(x: 0, y: -34))
-        leader.lineWidth = selected ? 1.5 : 1
-        if hidden { leader.setLineDash([3, 3], count: 2, phase: 0) }
-        (selected ? Self.accent : UIColor.white.withAlphaComponent(0.7)).setStroke()
-        leader.stroke()
-        (selected ? Self.accent : UIColor.white).setFill()
-        let r: CGFloat = selected ? 3.5 : 2.5
-        UIBezierPath(ovalIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r)).fill()
-        if selected {
-            Self.accent.withAlphaComponent(0.6).setStroke()
-            let ring = UIBezierPath(ovalIn: CGRect(x: -9, y: -9, width: 18, height: 18))
-            ring.lineWidth = 1
-            ring.stroke()
-        }
+    /// A peak's label, drawn once: a dot, a leader line up from it and the name and height
+    /// above.
+    private func labelImage(name: String, detail: String, selected: Bool, hidden: Bool) -> LabelImage {
+        let key = "\(name)|\(detail)|\(selected)|\(hidden)"
+        if let cached = images[key] { return cached }
+        if images.count > 200 { images.removeAll() }
 
         let title = NSAttributedString(string: name, attributes: selected ? Self.selectedAttributes : hidden ? Self.hiddenAttributes : Self.nameAttributes)
         let height = NSAttributedString(string: detail, attributes: Self.heightAttributes)
         let titleSize = title.size(), heightSize = height.size()
+        // Laid out around the dot at (0, 0).
         let heightOrigin = CGPoint(x: -heightSize.width / 2, y: -36 - heightSize.height)
         let titleOrigin = CGPoint(x: -titleSize.width / 2, y: heightOrigin.y - titleSize.height + 2)
-        height.draw(at: heightOrigin)
-        title.draw(at: titleOrigin)
         let box = CGRect(origin: titleOrigin, size: titleSize).union(CGRect(origin: heightOrigin, size: heightSize))
-            .union(CGRect(x: -6, y: -36, width: 12, height: 42))
-        labelHits.append((box.applying(turn), id))
+            .union(CGRect(x: -10, y: -36, width: 20, height: 46))
+        let canvas = box.insetBy(dx: -5, dy: -5).integral
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = traitCollection.displayScale
+        format.opaque = false
+        let rendered = UIGraphicsImageRenderer(size: canvas.size, format: format).image { context in
+            context.cgContext.translateBy(x: -canvas.minX, y: -canvas.minY)
+            let leader = UIBezierPath()
+            leader.move(to: CGPoint(x: 0, y: -5))
+            leader.addLine(to: CGPoint(x: 0, y: -34))
+            leader.lineWidth = selected ? 1.5 : 1
+            if hidden { leader.setLineDash([3, 3], count: 2, phase: 0) }
+            (selected ? Self.accent : UIColor.white.withAlphaComponent(0.7)).setStroke()
+            leader.stroke()
+            (selected ? Self.accent : UIColor.white).setFill()
+            let r: CGFloat = selected ? 3.5 : 2.5
+            UIBezierPath(ovalIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r)).fill()
+            if selected {
+                Self.accent.withAlphaComponent(0.6).setStroke()
+                let ring = UIBezierPath(ovalIn: CGRect(x: -9, y: -9, width: 18, height: 18))
+                ring.lineWidth = 1
+                ring.stroke()
+            }
+            height.draw(at: heightOrigin)
+            title.draw(at: titleOrigin)
+        }
+        let image = LabelImage(image: rendered.cgImage!, size: canvas.size,
+                               anchor: CGPoint(x: -canvas.minX, y: -canvas.minY), box: box)
+        images[key] = image
+        return image
     }
 
     /// A small tag at the edge of the view, along the horizon, pointing toward a selected
     /// peak out of view.
-    private func drawEdgeArrow(name: String, distance: String, toRight: Bool, id: Int64, in ctx: CGContext) {
-        let text = NSAttributedString(string: toRight ? "\(name) · \(distance)  ›" : "‹  \(name) · \(distance)",
-                                      attributes: Self.selectedAttributes)
-        let size = text.size()
+    private func layoutEdgeArrow(name: String, distance: String, toRight: Bool, id: Int64) {
+        let key = "arrow|\(name)|\(distance)|\(toRight)"
+        let image: LabelImage
+        if let cached = images[key] {
+            image = cached
+        } else {
+            let text = NSAttributedString(string: toRight ? "\(name) · \(distance)  ›" : "‹  \(name) · \(distance)",
+                                          attributes: Self.selectedAttributes)
+            let size = text.size()
+            let box = CGRect(x: -size.width / 2 - 10, y: -size.height / 2 - 6, width: size.width + 20, height: size.height + 12)
+            let canvas = box.integral
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = traitCollection.displayScale
+            format.opaque = false
+            let rendered = UIGraphicsImageRenderer(size: canvas.size, format: format).image { context in
+                context.cgContext.translateBy(x: -canvas.minX, y: -canvas.minY)
+                UIColor.black.withAlphaComponent(0.45).setFill()
+                UIBezierPath(roundedRect: box, cornerRadius: box.height / 2).fill()
+                text.draw(at: CGPoint(x: -size.width / 2, y: -size.height / 2))
+            }
+            image = LabelImage(image: rendered.cgImage!, size: canvas.size, anchor: CGPoint(x: -canvas.minX, y: -canvas.minY), box: box)
+            images[key] = image
+        }
         // From the middle toward the world's right (or left), stopping short of the edge.
         let dir = toRight ? worldRight : CGPoint(x: -worldRight.x, y: -worldRight.y)
         let halfW = bounds.width / 2 - 24, halfH = bounds.height / 2 - 60
         let reach = min(abs(dir.x) > 0.01 ? halfW / abs(dir.x) : .infinity, abs(dir.y) > 0.01 ? halfH / abs(dir.y) : .infinity)
-        let along = max(0, reach - size.width / 2 - 10)
+        let along = max(0, reach - image.size.width / 2 - 10)
         let center = CGPoint(x: bounds.midX + dir.x * along, y: bounds.midY + dir.y * along)
-        let turn = CGAffineTransform(translationX: center.x, y: center.y).rotated(by: upAngle)
-        ctx.saveGState()
-        ctx.concatenate(turn)
-        let box = CGRect(x: -size.width / 2 - 10, y: -size.height / 2 - 6, width: size.width + 20, height: size.height + 12)
-        UIColor.black.withAlphaComponent(0.45).setFill()
-        UIBezierPath(roundedRect: box, cornerRadius: box.height / 2).fill()
-        text.draw(at: CGPoint(x: -size.width / 2, y: -size.height / 2))
-        ctx.restoreGState()
-        labelHits.append((box.applying(turn), id))
+        arrowLayer.contentsScale = traitCollection.displayScale
+        arrowLayer.contents = image.image
+        arrowLayer.bounds = CGRect(origin: .zero, size: image.size)
+        arrowLayer.anchorPoint = CGPoint(x: image.anchor.x / image.size.width, y: image.anchor.y / image.size.height)
+        arrowLayer.position = center
+        arrowLayer.setAffineTransform(CGAffineTransform(rotationAngle: upAngle))
+        arrowLayer.isHidden = false
+        labelHits.append((image.box.applying(CGAffineTransform(translationX: center.x, y: center.y).rotated(by: upAngle)), id))
     }
 
     /// A light tick when a labeled peak crosses the middle of the screen. Positions are

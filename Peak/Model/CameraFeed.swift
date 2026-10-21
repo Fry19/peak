@@ -80,9 +80,10 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else { return }
         session.addInput(input)
-        // 4K where the phone can, so zooming in on the picture stays sharp.
-        session.sessionPreset = session.canSetSessionPreset(.hd4K3840x2160) ? .hd4K3840x2160 : .high
         self.device = device
+        // 1080p normally; 4K only while zoomed in (see `setHighResolution`), since every
+        // frame of it costs memory bandwidth and power.
+        session.sessionPreset = session.canSetSessionPreset(.hd1920x1080) ? .hd1920x1080 : .high
 
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
@@ -90,34 +91,60 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
         output.setSampleBufferDelegate(self, queue: queue)
         guard session.canAddOutput(output) else { return }
         session.addOutput(output)
-        if let connection = output.connection(with: .video) {
-            // Stabilization crops and shifts the picture, which would throw off the geometry.
-            if connection.isVideoStabilizationSupported { connection.preferredVideoStabilizationMode = .off }
-            // Portrait frames if the lens can still be measured with them; the lens matters more.
-            if connection.isVideoRotationAngleSupported(90) {
+        self.output = output
+        configureConnection()
+        configureFocus()
+    }
+
+    private var output: AVCaptureVideoDataOutput?
+    private var highResolution = false
+
+    /// Records in 4K (when the phone can) so a zoomed-in picture stays sharp, or back in
+    /// 1080p. Switching takes a moment, so it's only done when the zoom crosses a threshold.
+    func setHighResolution(_ on: Bool) {
+        queue.async { [self] in
+            guard on != highResolution, !session.inputs.isEmpty else { return }
+            let preset: AVCaptureSession.Preset = on ? .hd4K3840x2160 : .hd1920x1080
+            guard session.canSetSessionPreset(preset) else { return }
+            highResolution = on
+            session.beginConfiguration()
+            session.sessionPreset = preset
+            session.commitConfiguration()
+            // A new format can reset these.
+            configureConnection()
+            configureFocus()
+        }
+    }
+
+    private func configureConnection() {
+        guard let connection = output?.connection(with: .video) else { return }
+        // Stabilization crops and shifts the picture, which would throw off the geometry.
+        if connection.isVideoStabilizationSupported { connection.preferredVideoStabilizationMode = .off }
+        // Portrait frames if the lens can still be measured with them; the lens matters more.
+        if connection.isVideoRotationAngleSupported(90) {
+            connection.videoRotationAngle = 90
+            portraitFrames = true
+        }
+        if !connection.isCameraIntrinsicMatrixDeliverySupported, portraitFrames {
+            connection.videoRotationAngle = 0
+            portraitFrames = false
+            if !connection.isCameraIntrinsicMatrixDeliverySupported {
                 connection.videoRotationAngle = 90
                 portraitFrames = true
             }
-            if !connection.isCameraIntrinsicMatrixDeliverySupported, portraitFrames {
-                connection.videoRotationAngle = 0
-                portraitFrames = false
-                if !connection.isCameraIntrinsicMatrixDeliverySupported {
-                    connection.videoRotationAngle = 90
-                    portraitFrames = true
-                }
-            }
-            if connection.isCameraIntrinsicMatrixDeliverySupported {
-                connection.isCameraIntrinsicMatrixDeliveryEnabled = true
-                measuresLens = true
-            }
         }
+        if connection.isCameraIntrinsicMatrixDeliverySupported {
+            connection.isCameraIntrinsicMatrixDeliveryEnabled = true
+            measuresLens = true
+        }
+    }
 
-        // Mountains are far away: keep the focus there, which also keeps the lens still.
-        if (try? device.lockForConfiguration()) != nil {
-            if device.isAutoFocusRangeRestrictionSupported { device.autoFocusRangeRestriction = .far }
-            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
-            device.unlockForConfiguration()
-        }
+    /// Mountains are far away: keep the focus there, which also keeps the lens still.
+    private func configureFocus() {
+        guard let device, (try? device.lockForConfiguration()) != nil else { return }
+        if device.isAutoFocusRangeRestrictionSupported { device.autoFocusRangeRestriction = .far }
+        if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+        device.unlockForConfiguration()
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
