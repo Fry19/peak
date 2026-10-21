@@ -3,9 +3,10 @@ import SceneKit
 import SwiftUI
 import UIKit
 
-/// The trail in 3D: the terrain around it lit from the north-west, ridge crests glowing
-/// faintly, far ridges fading into haze, and the trail in orange. It opens looking straight
-/// down, as the map does, then tilts down behind the start and walks the trail to its end.
+/// The trail in 3D: the terrain around it lit from the north-west, far ridges fading into
+/// haze, and the trail in orange. It opens looking straight down, as the map does, with the
+/// ridge crests glowing faintly, then tilts down behind the start, the crests fading as it
+/// nears the horizon, and walks the trail to its end.
 /// Pause to look around (drag to orbit, pinch to zoom); the slider moves along the trail.
 /// Drawn from the terrain already on the phone, so it works offline.
 struct TrailWalkView: View {
@@ -75,6 +76,8 @@ final class WalkWorld: @unchecked Sendable {
     let camera: SCNNode
     let walker: SCNNode
     let label: SCNNode?
+    /// The ridge crest lines, faded by how steeply the camera looks down.
+    let crests: SCNNode
     let walk: TrailWalk
     let relief: ReliefMap
     /// Elevation along the walk from the terrain model, by distance, for the readout.
@@ -84,12 +87,13 @@ final class WalkWorld: @unchecked Sendable {
     /// How far from the walker the camera follows, meters.
     let range: Double
 
-    private init(scene: SCNScene, camera: SCNNode, walker: SCNNode, label: SCNNode?, walk: TrailWalk, relief: ReliefMap,
-                 profile: TrailProfile?, overhead: (eye: SIMD3<Double>, target: SIMD3<Double>), range: Double) {
+    private init(scene: SCNScene, camera: SCNNode, walker: SCNNode, label: SCNNode?, crests: SCNNode, walk: TrailWalk,
+                 relief: ReliefMap, profile: TrailProfile?, overhead: (eye: SIMD3<Double>, target: SIMD3<Double>), range: Double) {
         self.scene = scene
         self.camera = camera
         self.walker = walker
         self.label = label
+        self.crests = crests
         self.walk = walk
         self.relief = relief
         self.profile = profile
@@ -165,8 +169,9 @@ final class WalkWorld: @unchecked Sendable {
         let hole = (low: SIMD2(-edge, -edge), high: SIMD2(edge, edge))
         scene.rootNode.addChildNode(terrainNode(relief, low: low, high: high))
         scene.rootNode.addChildNode(terrainNode(wide, low: low, high: high, hole: hole, sink: 15))
-        for node in crestNodes(relief) { scene.rootNode.addChildNode(node) }
-        for node in crestNodes(wide, outside: hole) { scene.rootNode.addChildNode(node) }
+        let crests = SCNNode()
+        for node in crestNodes(relief) + crestNodes(wide, outside: hole) { crests.addChildNode(node) }
+        scene.rootNode.addChildNode(crests)
         for node in trailNodes(trail, relief, width: max(2, range / 180)) { scene.rootNode.addChildNode(node) }
 
         // Light from the north-west, low enough to model the slopes, and a cool fill.
@@ -235,8 +240,8 @@ final class WalkWorld: @unchecked Sendable {
         let floor = relief.height(at: center)
         let overhead = (eye: SIMD3(center.x, center.y, (floor.isFinite ? floor : Double(high)) + altitude),
                         target: SIMD3(center.x, center.y, floor.isFinite ? floor : Double(low)))
-        return WalkWorld(scene: scene, camera: camera, walker: walker, label: label, walk: walk, relief: relief, profile: profile,
-                         overhead: overhead, range: range)
+        return WalkWorld(scene: scene, camera: camera, walker: walker, label: label, crests: crests, walk: walk, relief: relief,
+                         profile: profile, overhead: overhead, range: range)
     }
 
     /// Faint contour lines on the ground, every 50 m with a stronger one every 250 m, drawn
@@ -589,11 +594,21 @@ final class WalkPlayer {
             break
         }
         moveWalker()
-        // Keep the summit's card the same size on screen.
-        if let label = world.label, let pov = view?.pointOfView {
-            let d = Double(simd_distance(label.simdWorldPosition, pov.presentation.simdWorldPosition))
-            let s = Float(d * 0.05)
-            label.scale = SCNVector3(s, s, s)
+        if let pov = view?.pointOfView?.presentation {
+            // Keep the summit's card the same size on screen.
+            if let label = world.label {
+                let d = Double(simd_distance(label.simdWorldPosition, pov.simdWorldPosition))
+                let s = Float(d * 0.05)
+                label.scale = SCNVector3(s, s, s)
+            }
+            // The crest lines show the ridges on ground seen from above. Looking along it,
+            // toward the horizon, the light and the skyline show them already, and the lines
+            // only crowd the trail; they fade out between 55° and 30° down.
+            let down = Double(asin(max(-1, min(1, -pov.simdWorldFront.y)))) * 180 / .pi
+            let t = min(1, max(0, (down - 30) / 25))
+            let opacity = CGFloat(t * t * (3 - 2 * t))
+            world.crests.opacity = opacity
+            world.crests.isHidden = opacity < 0.01
         }
         if now - lastShown > 0.08 || !playing {
             lastShown = now
