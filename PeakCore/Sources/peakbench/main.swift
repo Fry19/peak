@@ -24,8 +24,18 @@ peakbench: desk test harness for skyline matching.
   peakbench detect IMAGE [--width W] [--debug FILE]
       Run only the skyline detector and draw what it found.
 
-  peakbench geotiff FILE.tif [--level N] [--ranged] [--out FILE.pkdem] [--compare FILE.pkdem]
-      Decode a Copernicus GeoTIFF with PeakCore's own reader (what the app does).
+  peakbench geotiff FILE.tif [--level N] [--ranged] [--blocks] [--out FILE.pkdem] [--compare FILE.pkdem]
+      Decode a Copernicus GeoTIFF with PeakCore's own reader (what the app does). --blocks
+      also decodes each block of the level on its own and checks it against the whole.
+
+  peakbench trails OVERPASS.json --lat L --lon L [--dem DIR] [--from-lat L --from-lon L]
+  peakbench trails --query --lat L --lon L
+      Read hiking routes and paths from an Overpass response (Overpass.trailsQuery) near a
+      peak at --lat/--lon. With --dem, climb from the terrain; with --from-*, how much of
+      each trail is in sight from there, as the app draws it on the mountain.
+
+  peakbench facts ENTITY.json --id Q [--labels LABELS.json] [--summary SUMMARY.json]
+      Read a peak's facts from Wikidata and Wikipedia responses.
 
   peakbench case PHOTO.jpg [--out CASE.json]          (macOS only)
       Make a case file from an iPhone photo's location, compass heading and lens data.
@@ -344,6 +354,30 @@ func geotiffCommand(_ args: Arguments) throws {
     let heights = tile.heightValues
     print("Tile \(tile.south), \(tile.west): \(tile.rows)×\(tile.cols), first pixel at \(tile.originLatitude), " +
           "\(tile.originLongitude), \(heights.min()!)–\(heights.max()!) m")
+    if args.options["blocks"] != nil {
+        // As the app fetches full detail near the viewer: one block at a time.
+        let bytes = [UInt8](data)
+        let layout = try GeoTIFF.layout(Array(bytes.prefix(16_384)))
+        let image = layout.images[level]
+        var mismatched = 0
+        let parts = try timed("Decode \(image.blockCount) blocks one by one") {
+            try (0..<image.blockCount).map { block in
+                try GeoTIFF.decode(layout, level: level, blocks: [block]) { _ in bytes[image.byteRange(ofBlock: block)] }
+            }
+        }
+        for part in parts {
+            let r0 = Int(((tile.originLatitude - part.originLatitude) / tile.stepLatitude).rounded())
+            let c0 = Int(((part.originLongitude - tile.originLongitude) / tile.stepLongitude).rounded())
+            let values = part.heightValues
+            for r in 0..<part.rows {
+                for c in 0..<part.cols where values[r * part.cols + c] != heights[(r0 + r) * tile.cols + c0 + c] { mismatched += 1 }
+            }
+        }
+        let merged = ElevationTile(merging: parts)
+        print("Blocks: \(parts.count), \(mismatched) heights differ from the whole image; merged " +
+              "\(merged.map { "\($0.rows)×\($0.cols)" } ?? "failed")" + (merged?.heightValues == heights ? ", identical" : ", DIFFERENT"))
+        if mismatched > 0 || merged?.heightValues != heights { throw HarnessError("block decoding differs") }
+    }
     if let other = args.string("compare") {
         let reference = try ElevationTile(contentsOf: URL(fileURLWithPath: other)).heightValues
         guard reference.count == heights.count else { throw HarnessError("sizes differ") }
@@ -355,6 +389,78 @@ func geotiffCommand(_ args: Arguments) throws {
         try tile.write(to: URL(fileURLWithPath: out))
         print("Wrote \(out)")
     }
+}
+
+// MARK: - trails and facts
+
+func trailsCommand(_ args: Arguments) throws {
+    if args.options["query"] != nil {
+        // The app's own query, to fetch a response with: hikes for one peak, or with
+        // --area METERS, everything saved for an offline area of that radius.
+        let lat = try args.required("lat"), lon = try args.required("lon")
+        if let r = args.double("area") {
+            let dlat = r / 111_000, dlon = r / (111_000 * max(cos(lat * .pi / 180), 0.05))
+            print(Overpass.trailsQuery(south: lat - dlat, west: lon - dlon, north: lat + dlat, east: lon + dlon, timeout: 180))
+        } else {
+            print(Overpass.trailsQuery(latitude: lat, longitude: lon, radius: 8_000))
+        }
+        return
+    }
+    guard let path = args.positional.first else { throw HarnessError("which Overpass response?") }
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    let peak = LatLon(try args.required("lat"), try args.required("lon"))
+    let trails = try Overpass.trails(fromJSON: data)
+        .map { ($0, $0.distance(to: peak)) }
+        .sorted { ($0.1 < 250 ? 0 : 1, $0.1) < ($1.1 < 250 ? 0 : 1, $1.1) }
+    let terrain = try args.string("dem").map { try loadTerrain($0) }
+    var drape: ((Trail) -> [[DrapedPoint]])?
+    if let terrain, let lat = args.double("from-lat"), let lon = args.double("from-lon") {
+        let renderer = HorizonRenderer(terrain: terrain)
+        let observer = renderer.observer(latitude: lat, longitude: lon)
+        var settings = HorizonSettings()
+        settings.maxDistance = 80_000
+        let horizon = timed("Horizon") { renderer.render(from: observer, settings: settings) }
+        drape = { renderer.drape($0.lines, from: observer, horizon: horizon) }
+    }
+    print("\(trails.count) trails (\(data.count / 1000) KB of JSON)")
+    for (t, d) in trails {
+        var line = "\(t.kind == .route ? "route" : "path ") \(t.name) [\(t.id)]: \(t.lines.count) line(s), " +
+            "\(f(t.mappedLength / 1000, 1)) km mapped"
+        if let tagged = t.taggedLength { line += ", \(f(tagged / 1000, 1)) km tagged" }
+        if t.isPartial { line += ", partial" }
+        line += ", \(t.difficulty?.grade ?? "no grade"), \(d < 250 ? "reaches the summit" : "\(f(d / 1000, 1)) km from it")"
+        if let terrain, let p = t.profile(on: terrain) {
+            line += ", climb \(f(p.gain, 0)) m, descent \(f(p.loss, 0)) m, \(f(p.lowest, 0))–\(f(p.highest, 0)) m"
+        }
+        if let drape {
+            let runs = drape(t)
+            line += ", in sight: \(runs.count) stretch(es), \(runs.reduce(0) { $0 + $1.count }) points"
+        }
+        print(line)
+    }
+}
+
+func factsCommand(_ args: Arguments) throws {
+    guard let path = args.positional.first, let id = args.string("id") else { throw HarnessError("facts ENTITY.json --id Q…") }
+    var facts = try Wikidata.facts(fromJSON: try Data(contentsOf: URL(fileURLWithPath: path)), id: id)
+    if let labelsPath = args.string("labels") {
+        let labels = try Wikidata.labels(fromJSON: try Data(contentsOf: URL(fileURLWithPath: labelsPath)))
+        facts.range = facts.rangeID.flatMap { labels[$0] }
+        facts.parent = facts.parentID.flatMap { labels[$0] }
+        facts.countries = facts.countryIDs.compactMap { labels[$0] }
+    }
+    if let summaryPath = args.string("summary") {
+        try Wikipedia.addSummary(fromJSON: try Data(contentsOf: URL(fileURLWithPath: summaryPath)), to: &facts)
+    }
+    print("description: \(facts.description ?? "-")")
+    print("prominence: \(facts.prominence.map { f($0, 0) + " m" } ?? "-"), isolation: \(facts.isolation.map { f($0 / 1000, 1) + " km" } ?? "-")")
+    print("range: \(facts.range ?? facts.rangeID ?? "-"), parent: \(facts.parent ?? facts.parentID ?? "-"), " +
+          "countries: \(facts.countries.isEmpty ? facts.countryIDs.joined(separator: ", ") : facts.countries.joined(separator: ", "))")
+    print("first ascent: \(facts.firstAscentYear.map(String.init) ?? "-"), image: \(facts.image ?? "-")")
+    print("articles: \(facts.articles.count) languages; English: \(facts.articles["en"] ?? "-")")
+    print("linked ids: \(facts.linkedIDs.joined(separator: "|"))")
+    if let summary = facts.summary { print("summary: \(summary.prefix(160))…") }
+    print("picture: \(facts.pictureURL?.absoluteString ?? "-")")
 }
 
 // MARK: - scene
@@ -392,6 +498,9 @@ struct BenchRun {
     var after: Double
     var accepted: Bool
     var seconds: Double
+    /// Pitch and roll errors before (the sensors) and after matching, degrees.
+    var pitch: (before: Double, after: Double) = (0, 0)
+    var roll: (before: Double, after: Double) = (0, 0)
 }
 
 func benchCommand(_ args: Arguments) throws {
@@ -457,7 +566,9 @@ func benchCommand(_ args: Arguments) throws {
             abs(azimuthDifference(horizon.azimuth(ofRay: $0), truth.heading)) <= half
         }.map { Double(horizon.distances[$0]) }.sorted()
         let skylineKm = inView.isEmpty ? 0 : inView[inView.count / 2] / 1000
-        let r = BenchRun(before: compassError, after: after, accepted: m.alignment.accepted, seconds: m.seconds)
+        var r = BenchRun(before: compassError, after: after, accepted: m.alignment.accepted, seconds: m.seconds)
+        r.pitch = (prior.pitch - truth.pitch, m.alignment.attitude.pitch - truth.pitch)
+        r.roll = (prior.roll - truth.roll, m.alignment.attitude.roll - truth.roll)
         results.append(r)
         print(String(format: "%4d  %6.1f°  %3.0f°  %4.2f  %4.2f  %5.1f km  %+6.2f°  %+7.3f°  %@  %4.0f ms",
                      run + 1, truth.heading, fov, scene.clouds, scene.trees, skylineKm, r.before, r.after,
@@ -485,9 +596,16 @@ func benchSummary(_ results: [BenchRun], mode: String, aim: String) -> String {
     let before = stats(results.map(\.before))
     let after = stats(accepted.map(\.after))
     let bad = accepted.filter { abs($0.after) > 0.5 }.count
-    var md = "| Heading error (\(mode) mode, aim \(aim)) | median | 90th percentile | worst |\n|---|---|---|---|\n"
+    var md = "| Error (\(mode) mode, aim \(aim)) | median | 90th percentile | worst |\n|---|---|---|---|\n"
     md += "| Compass (before) | \(f(before.median))° | \(f(before.p90))° | \(f(before.max))° |\n"
-    md += "| Skyline matched (after) | \(f(after.median, 3))° | \(f(after.p90, 3))° | \(f(after.max, 3))° |\n\n"
+    md += "| Skyline matched (after) | \(f(after.median, 3))° | \(f(after.p90, 3))° | \(f(after.max, 3))° |\n"
+    // The level as the motion sensors give it, and after matching (accepted frames).
+    let pitchBefore = stats(accepted.map(\.pitch.before)), pitchAfter = stats(accepted.map(\.pitch.after))
+    let rollBefore = stats(accepted.map(\.roll.before)), rollAfter = stats(accepted.map(\.roll.after))
+    md += "| Pitch, sensors (before) | \(f(pitchBefore.median, 3))° | \(f(pitchBefore.p90, 3))° | \(f(pitchBefore.max, 3))° |\n"
+    md += "| Pitch, matched (after) | \(f(pitchAfter.median, 3))° | \(f(pitchAfter.p90, 3))° | \(f(pitchAfter.max, 3))° |\n"
+    md += "| Roll, sensors (before) | \(f(rollBefore.median, 3))° | \(f(rollBefore.p90, 3))° | \(f(rollBefore.max, 3))° |\n"
+    md += "| Roll, matched (after) | \(f(rollAfter.median, 3))° | \(f(rollAfter.p90, 3))° | \(f(rollAfter.max, 3))° |\n\n"
     md += "Accepted \(accepted.count) of \(results.count) frames; \(bad) accepted with an error over 0.5°. "
     md += String(format: "Median matching time %.0f ms.\n", stats(results.map(\.seconds)).median * 1000)
     return md
@@ -510,6 +628,8 @@ do {
     case "detect": try detectCommand(args)
     case "geotiff": try geotiffCommand(args)
     case "scene": try sceneCommand(args)
+    case "trails": try trailsCommand(args)
+    case "facts": try factsCommand(args)
     case "case": try caseCommand(args)
     case "help", "-h", "--help": print(usage)
     default:

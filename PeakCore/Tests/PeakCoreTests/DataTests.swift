@@ -81,6 +81,53 @@ final class GeoTIFFTests: XCTestCase {
         }
     }
 
+    /// The app fetches just the blocks around the viewer at full resolution. Decoded on
+    /// their own or a few at a time, they must match the whole image pixel for pixel.
+    func testBlocksDecodeOnTheirOwn() throws {
+        let bytes = [UInt8](Fixtures.floatTIFF)
+        let layout = try GeoTIFF.layout(bytes)
+        let full = try GeoTIFF.decode(layout, level: 0, bytes: bytes, base: 0)
+        XCTAssertEqual(layout.images[0].blockCount, 4)   // 24×20 in 16×16 tiles
+        func data(_ index: Int) -> ArraySlice<UInt8> { bytes[layout.images[0].byteRange(ofBlock: index)] }
+
+        // The bottom-right block alone: 8 columns by 4 rows, starting at pixel (16, 16).
+        let corner = try GeoTIFF.decode(layout, level: 0, blocks: [3], data: data)
+        XCTAssertEqual(corner.rows, 4)
+        XCTAssertEqual(corner.cols, 8)
+        XCTAssertEqual(corner.originLatitude, full.originLatitude - 16 * full.stepLatitude, accuracy: 1e-12)
+        XCTAssertEqual(corner.originLongitude, full.originLongitude + 16 * full.stepLongitude, accuracy: 1e-12)
+        let f = full.heightValues, h = corner.heightValues
+        for r in 0..<4 {
+            for c in 0..<8 { XCTAssertEqual(h[r * 8 + c], f[(16 + r) * 24 + 16 + c]) }
+        }
+
+        // Two diagonal blocks: the rectangle around them, with no data in the other two.
+        let diagonal = try GeoTIFF.decode(layout, level: 0, blocks: [0, 3], data: data).heightValues
+        XCTAssertEqual(diagonal[0], f[0])
+        XCTAssertEqual(diagonal[19 * 24 + 23], f[19 * 24 + 23])
+        XCTAssertEqual(diagonal[0 * 24 + 20], ElevationTile.noData)
+        XCTAssertEqual(diagonal[18 * 24 + 2], ElevationTile.noData)
+
+        // Blocks decoded one at a time and merged give back the whole image.
+        let parts = try (0..<4).map { try GeoTIFF.decode(layout, level: 0, blocks: [$0], data: data) }
+        let merged = try XCTUnwrap(ElevationTile(merging: parts.reversed()))
+        XCTAssertEqual(merged.rows, 20)
+        XCTAssertEqual(merged.cols, 24)
+        XCTAssertEqual(merged.originLatitude, full.originLatitude, accuracy: 1e-12)
+        XCTAssertEqual(merged.originLongitude, full.originLongitude, accuracy: 1e-12)
+        XCTAssertEqual(merged.heightValues, f)
+    }
+
+    func testBlocksCoveringAnArea() throws {
+        let layout = try GeoTIFF.layout([UInt8](Fixtures.floatTIFF))
+        let step = 1.0 / 3600
+        // Pixel centers start at 47°N 8°E; blocks are 16 pixels square, two across.
+        XCTAssertEqual(layout.blocks(level: 0, south: 47 - 5 * step, north: 47, west: 8, east: 8 + 5 * step), [0])
+        XCTAssertEqual(layout.blocks(level: 0, south: 47 - 5 * step, north: 47, west: 8 + 15.5 * step, east: 8 + 17 * step), [0, 1])
+        XCTAssertEqual(layout.blocks(level: 0, south: 47 - 18 * step, north: 47 - 17 * step, west: 8 + 18 * step, east: 8 + 19 * step), [3])
+        XCTAssertEqual(layout.blocks(level: 0, south: 40, north: 41, west: 8, east: 9), [])
+    }
+
     func testRejectsNonTIFF() {
         XCTAssertThrowsError(try GeoTIFF.elevationTile(Data("hello".utf8)))
     }
@@ -108,7 +155,11 @@ final class PeakDataTests: XCTestCase {
         ]}
         """
         let peaks = try Overpass.peaks(fromJSON: Data(json.utf8))
-        XCTAssertEqual(peaks, [Peak(id: 1, name: "Matterhorn", latitude: 45.9763, longitude: 7.6586, elevation: 4478)])
+        XCTAssertEqual(peaks.map(\.id), [1, 2], "unnamed peaks are left out")
+        XCTAssertEqual(peaks[0], Peak(id: 1, name: "Matterhorn", latitude: 45.9763, longitude: 7.6586, elevation: 4478))
+        // No elevation in OpenStreetMap: kept, for the terrain to fill in.
+        XCTAssertTrue(peaks[1].estimatedElevation)
+        XCTAssertFalse(peaks[0].estimatedElevation)
         XCTAssertTrue(Overpass.peaksQuery(south: 45, west: 7, north: 46, east: 8).contains("(45.0000,7.0000,46.0000,8.0000)"))
     }
 }

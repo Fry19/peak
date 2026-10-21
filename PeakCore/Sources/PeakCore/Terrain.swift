@@ -4,8 +4,13 @@ import Foundation
 ///
 /// Pixel centers sit at `originLatitude − row·stepLatitude`, `originLongitude + col·stepLongitude`.
 /// Copernicus GLO-30 tiles are 1° with the first pixel centered on the tile's north-west
-/// corner (3600 rows; 3600 columns below 50° latitude, fewer further north).
+/// corner (3600 rows; 3600 columns below 50° latitude, fewer further north). A tile can
+/// also cover just part of its 1° cell, as a sharper patch over a coarser tile; pixels it
+/// has no data for hold `noData`.
 public final class ElevationTile: @unchecked Sendable {
+    /// Marks a pixel without data. Decoded heights never take this value.
+    public static let noData = Int16.min
+
     public let south: Int
     public let west: Int
     public let rows: Int
@@ -107,8 +112,69 @@ public final class ElevationTile: @unchecked Sendable {
         try data.write(to: url)
     }
 
+    /// Joins patches of one cell with the same pixel grid (such as neighboring blocks of a
+    /// GeoTIFF) into one patch covering all of them; pixels none of them cover are `noData`.
+    public convenience init?(merging parts: [ElevationTile]) {
+        guard let first = parts.first,
+              parts.allSatisfy({ $0.south == first.south && $0.west == first.west &&
+                                 abs($0.stepLatitude - first.stepLatitude) < 1e-12 &&
+                                 abs($0.stepLongitude - first.stepLongitude) < 1e-12 }) else { return nil }
+        // Pixel offsets of each part from the first one's origin.
+        let offsets = parts.map { t in
+            (row: Int(((first.originLatitude - t.originLatitude) / first.stepLatitude).rounded()),
+             col: Int(((t.originLongitude - first.originLongitude) / first.stepLongitude).rounded()))
+        }
+        let row0 = offsets.map(\.row).min()!, col0 = offsets.map(\.col).min()!
+        let rows = zip(parts, offsets).map { $1.row + $0.rows }.max()! - row0
+        let cols = zip(parts, offsets).map { $1.col + $0.cols }.max()! - col0
+        let buffer = UnsafeMutableBufferPointer<Int16>.allocate(capacity: rows * cols)
+        buffer.initialize(repeating: Self.noData)
+        for (t, o) in zip(parts, offsets) {
+            for r in 0..<t.rows {
+                let dst = (o.row - row0 + r) * cols + (o.col - col0)
+                for c in 0..<t.cols where t.heights[r * t.cols + c] != Self.noData {
+                    buffer[dst + c] = t.heights[r * t.cols + c]
+                }
+            }
+        }
+        self.init(south: first.south, west: first.west, rows: rows, cols: cols,
+                  originLatitude: first.originLatitude - Double(row0) * first.stepLatitude,
+                  originLongitude: first.originLongitude + Double(col0) * first.stepLongitude,
+                  stepLatitude: first.stepLatitude, stepLongitude: first.stepLongitude, taking: buffer)
+    }
+
     @inline(__always)
     func value(row: Int, col: Int) -> Int16 { heights[row * cols + col] }
+
+    /// Bilinear height inside the patch and how far in from its nearest edge, in pixels;
+    /// nil past its last pixels or where it has no data.
+    @inline(__always)
+    func interiorSample(_ latitude: Double, _ longitude: Double) -> (height: Double, edge: Double)? {
+        let y = (originLatitude - latitude) / stepLatitude
+        let x = (longitude - originLongitude) / stepLongitude
+        guard y >= 0, x >= 0 else { return nil }
+        let r0 = Int(y), c0 = Int(x)
+        guard r0 + 1 < rows, c0 + 1 < cols else { return nil }
+        let i = r0 * cols + c0
+        let a = heights[i], b = heights[i + 1], c = heights[i + cols], d = heights[i + cols + 1]
+        if a == Self.noData || b == Self.noData || c == Self.noData || d == Self.noData { return nil }
+        let fy = y - Double(r0), fx = x - Double(c0)
+        let h = (Double(a) * (1 - fx) + Double(b) * fx) * (1 - fy) + (Double(c) * (1 - fx) + Double(d) * fx) * fy
+        return (h, min(min(y, x), min(Double(rows - 1) - y, Double(cols - 1) - x)))
+    }
+
+    /// Bilinear height inside the patch, or nil past its last pixels or where it has no data.
+    @inline(__always)
+    func interiorHeight(_ latitude: Double, _ longitude: Double) -> Double? {
+        interiorSample(latitude, longitude)?.height
+    }
+
+    /// The share of the 1° cell this tile covers with data, 0 to 1.
+    public var coverage: Double {
+        let area = Double(rows) * stepLatitude * Double(cols) * stepLongitude
+        let filled = Double(heights.reduce(0) { $1 == Self.noData ? $0 : $0 + 1 }) / Double(max(1, rows * cols))
+        return min(1, area * filled)
+    }
 
     /// All heights, row by row from the north.
     public var heightValues: [Int16] { Array(heights) }
@@ -126,7 +192,8 @@ public enum TerrainError: Error, CustomStringConvertible {
     }
 }
 
-/// A set of 1° tiles with bilinear height lookups that work across tile edges.
+/// A set of 1° tiles with bilinear height lookups that work across tile edges, plus
+/// optional sharper patches over parts of them.
 ///
 /// By default, a missing tile inside the bounding box of the loaded tiles reads as sea
 /// level, since the Copernicus bucket has no tiles over open ocean. Outside the box, or
@@ -134,23 +201,41 @@ public enum TerrainError: Error, CustomStringConvertible {
 /// data stops instead of seeing a flat sea.
 public final class Terrain: @unchecked Sendable {
     public let tiles: [ElevationTile]
+    public let detail: [ElevationTile]
     let minSouth: Int
     let minWest: Int
     let latCount: Int
     let lonCount: Int
     let grid: [ElevationTile?]
     let missing: Double
+    /// Patches of each cell, finest first: `patches[patchStart[cell]..<patchStart[cell + 1]]`.
+    let patches: [ElevationTile]
+    let patchStart: [Int]
 
-    public init(tiles: [ElevationTile], missingIsSea: Bool = true) {
+    /// `detail` patches are used wherever they have data, finest first; elsewhere, and
+    /// within a pixel of their edges, the 1° `tiles` are.
+    public init(tiles: [ElevationTile], detail: [ElevationTile] = [], missingIsSea: Bool = true) {
         self.tiles = tiles
+        self.detail = detail
         missing = missingIsSea ? 0 : .nan
-        minSouth = tiles.map(\.south).min() ?? 0
-        minWest = tiles.map(\.west).min() ?? 0
-        latCount = tiles.isEmpty ? 0 : (tiles.map(\.south).max()! - minSouth + 1)
-        lonCount = tiles.isEmpty ? 0 : (tiles.map(\.west).max()! - minWest + 1)
+        let all = tiles + detail
+        minSouth = all.map(\.south).min() ?? 0
+        minWest = all.map(\.west).min() ?? 0
+        latCount = all.isEmpty ? 0 : (all.map(\.south).max()! - minSouth + 1)
+        lonCount = all.isEmpty ? 0 : (all.map(\.west).max()! - minWest + 1)
         var grid = [ElevationTile?](repeating: nil, count: latCount * lonCount)
         for t in tiles { grid[(t.south - minSouth) * lonCount + (t.west - minWest)] = t }
         self.grid = grid
+        var byCell = [[ElevationTile]](repeating: [], count: latCount * lonCount)
+        for t in detail { byCell[(t.south - minSouth) * lonCount + (t.west - minWest)].append(t) }
+        var start = [0]
+        var patches: [ElevationTile] = []
+        for cell in byCell {
+            patches += cell.sorted { $0.stepLatitude < $1.stepLatitude }
+            start.append(patches.count)
+        }
+        self.patches = patches
+        patchStart = start
     }
 
     /// Loads every .pkdem file in a directory.
@@ -170,7 +255,39 @@ public final class Terrain: @unchecked Sendable {
         let west = Int(longitude.rounded(.down))
         let li = south - minSouth, wi = west - minWest
         guard li >= 0, li < latCount, wi >= 0, wi < lonCount else { return .nan }
-        guard let tile = grid[li * lonCount + wi] else { return missing }
+        let cell = li * lonCount + wi
+        if !patches.isEmpty, patchStart[cell] < patchStart[cell + 1] {
+            return patchHeight(latitude, longitude, cell: cell, from: patchStart[cell])
+        }
+        return baseHeight(latitude, longitude, cell: cell)
+    }
+
+    /// Patches blend into what lies under them over this many of their pixels from their
+    /// edges. A hard switch from sharp to coarse terrain leaves a step along the patch's
+    /// edge, which the horizon renderer sees as a ridge: a straight line drawn across the view.
+    static let patchBlend = 8.0
+
+    /// The height from patch `k` of the cell onward (finest first), blended near each
+    /// patch's edges into the ones under it and finally the 1° tile.
+    func patchHeight(_ latitude: Double, _ longitude: Double, cell: Int, from k: Int) -> Double {
+        var k = k
+        let end = patchStart[cell + 1]
+        while k < end {
+            if let (h, edge) = patches[k].interiorSample(latitude, longitude) {
+                let w = edge / Self.patchBlend
+                if w >= 1 { return h }
+                let below = patchHeight(latitude, longitude, cell: cell, from: k + 1)
+                return below.isFinite ? h * w + below * (1 - w) : h
+            }
+            k += 1
+        }
+        return baseHeight(latitude, longitude, cell: cell)
+    }
+
+    /// The height from the cell's 1° tile.
+    @inline(__always)
+    func baseHeight(_ latitude: Double, _ longitude: Double, cell: Int) -> Double {
+        guard let tile = grid[cell] else { return missing }
         let y = (tile.originLatitude - latitude) / tile.stepLatitude
         let x = (longitude - tile.originLongitude) / tile.stepLongitude
         let r0 = Int(y.rounded(.down)), c0 = Int(x.rounded(.down))
@@ -201,5 +318,94 @@ public final class Terrain: @unchecked Sendable {
         let r = Int(((other.originLatitude - lat) / other.stepLatitude).rounded())
         let c = Int(((lon - other.originLongitude) / other.stepLongitude).rounded())
         return Double(other.value(row: max(0, min(other.rows - 1, r)), col: max(0, min(other.cols - 1, c))))
+    }
+}
+
+extension Terrain {
+    /// The finest tile or patch with data at a point.
+    func finestTile(latitude: Double, longitude: Double) -> ElevationTile? {
+        let south = Int(latitude.rounded(.up)) - 1, west = Int(longitude.rounded(.down))
+        let li = south - minSouth, wi = west - minWest
+        guard li >= 0, li < latCount, wi >= 0, wi < lonCount else { return nil }
+        let cell = li * lonCount + wi
+        for k in patchStart[cell]..<patchStart[cell + 1] where patches[k].interiorHeight(latitude, longitude) != nil {
+            return patches[k]
+        }
+        return grid[cell]
+    }
+
+    /// Peaks with `estimatedElevation` get the terrain's highest point within `radius`
+    /// meters of them; those outside the terrain are left out. Others pass through.
+    public func fillElevations(_ peaks: [Peak], radius: Double = 60) -> [Peak] {
+        peaks.compactMap { peak in
+            guard peak.estimatedElevation else { return peak }
+            let dlat = radius / 111_320, dlon = radius / (111_320 * max(cos(peak.latitude * .pi / 180), 0.05))
+            var top = -Double.infinity
+            for i in -2...2 {
+                for j in -2...2 {
+                    let h = height(latitude: peak.latitude + dlat * Double(i) / 2, longitude: peak.longitude + dlon * Double(j) / 2)
+                    if h.isFinite { top = max(top, h) }
+                }
+            }
+            guard top.isFinite else { return nil }
+            var p = peak
+            p.elevation = top
+            return p
+        }
+    }
+
+    /// A 30 m terrain model blunts sharp summits: the Matterhorn's top is 148 m short. Raises
+    /// the terrain around each peak to a cone reaching the peak's surveyed elevation, so
+    /// skylines and ridgelines have their real tips. The cone is about as steep as a sharp
+    /// summit (45°) and only ever raises the terrain, so doing this twice changes nothing.
+    /// Peaks where the terrain already comes within `minDeficit` meters of the elevation,
+    /// or falls short by more than `maxDeficit` (likely a wrong elevation), are left alone.
+    /// Returns how many summits were raised.
+    @discardableResult
+    public func raiseSummits(_ peaks: [Peak], radius: Double = 250, minDeficit: Double = 8, maxDeficit: Double = 300) -> Int {
+        var raised = 0
+        for peak in peaks where !peak.estimatedElevation {
+            guard let tile = finestTile(latitude: peak.latitude, longitude: peak.longitude) else { continue }
+            let metersPerLat = 111_320.0, metersPerLon = 111_320 * cos(peak.latitude * .pi / 180)
+            let pixel = max(tile.stepLatitude * metersPerLat, tile.stepLongitude * metersPerLon)
+            let y = (tile.originLatitude - peak.latitude) / tile.stepLatitude
+            let x = (peak.longitude - tile.originLongitude) / tile.stepLongitude
+            let reachRows = Int(radius / (tile.stepLatitude * metersPerLat)) + 1
+            let reachCols = Int(radius / (tile.stepLongitude * metersPerLon)) + 1
+            let rowLow: Int = max(0, Int(y) - reachRows), rowHigh: Int = min(tile.rows - 1, Int(y) + reachRows)
+            let colLow: Int = max(0, Int(x) - reachCols), colHigh: Int = min(tile.cols - 1, Int(x) + reachCols)
+            guard rowLow <= rowHigh, colLow <= colHigh else { continue }
+            let rows = rowLow...rowHigh, cols = colLow...colHigh
+            let rowMeters: Double = tile.stepLatitude * metersPerLat, colMeters: Double = tile.stepLongitude * metersPerLon
+            func distance(_ r: Int, _ c: Int) -> Double {
+                let dy: Double = (Double(r) - y) * rowMeters
+                let dx: Double = (Double(c) - x) * colMeters
+                return (dx * dx + dy * dy).squareRoot()
+            }
+            // The model's top near the summit.
+            var top = -Double.infinity
+            for r in rows {
+                for c in cols where distance(r, c) <= radius {
+                    let v = tile.heights[r * tile.cols + c]
+                    if v != ElevationTile.noData { top = max(top, Double(v)) }
+                }
+            }
+            let deficit = peak.elevation - top
+            guard top.isFinite, deficit >= minDeficit, deficit <= maxDeficit else { continue }
+            // At least a pixel and a half wide, so the nearest grid point gets most of the tip.
+            let coneRadius = min(radius, max(deficit, 1.5 * pixel))
+            for r in rows {
+                for c in cols {
+                    let d = distance(r, c)
+                    guard d < coneRadius else { continue }
+                    let i = r * tile.cols + c
+                    guard tile.heights[i] != ElevationTile.noData else { continue }
+                    let cone = Int16(max(-32767, min(32767, (peak.elevation - deficit * d / coneRadius).rounded())))
+                    if cone > tile.heights[i] { tile.heights[i] = cone }
+                }
+            }
+            raised += 1
+        }
+        return raised
     }
 }

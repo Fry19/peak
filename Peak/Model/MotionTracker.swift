@@ -16,6 +16,16 @@ final class MotionTracker: @unchecked Sendable {
         var right: SIMD3<Double>
         var up: SIMD3<Double>
         var out: SIMD3<Double>
+
+        /// Between two poses a short time apart, re-squared so the axes stay perpendicular.
+        static func blend(_ a: Pose, _ b: Pose, _ f: Double) -> Pose {
+            func unit(_ v: SIMD3<Double>) -> SIMD3<Double> { v / max(1e-9, (v * v).sum().squareRoot()) }
+            let out = unit(a.out + (b.out - a.out) * f)
+            var up = a.up + (b.up - a.up) * f
+            up = unit(up - out * (up * out).sum())
+            let right = SIMD3(up.y * out.z - up.z * out.y, up.z * out.x - up.x * out.z, up.x * out.y - up.y * out.x)
+            return Pose(right: right, up: up, out: out)
+        }
     }
 
     struct Status {
@@ -32,6 +42,9 @@ final class MotionTracker: @unchecked Sendable {
     }()
     private let lock = NSLock()
     private var latest: Pose?
+    /// Recent poses with their sensor timestamps (seconds since boot, the same clock as
+    /// camera frames), oldest first.
+    private var history: [(time: TimeInterval, pose: Pose)] = []
     private var rotationRate = 0.0
     private var lastUpdate = Date.distantPast
     private var recentUpdates: [Date] = []
@@ -53,9 +66,11 @@ final class MotionTracker: @unchecked Sendable {
         lock.lock()
         useTrueNorth = wantTrue
         lastUpdate = Date()
+        // Readings in the old reference frame would mix two norths.
+        history.removeAll()
         lock.unlock()
         running = true
-        manager.deviceMotionUpdateInterval = 1.0 / 60
+        manager.deviceMotionUpdateInterval = 1.0 / 100
         let frame: CMAttitudeReferenceFrame = wantTrue ? .xTrueNorthZVertical : .xMagneticNorthZVertical
         manager.startDeviceMotionUpdates(using: frame, to: queue) { [weak self] motion, error in
             if let motion {
@@ -105,6 +120,35 @@ final class MotionTracker: @unchecked Sendable {
         return latest
     }
 
+    /// The pose at `time` (seconds since boot), between the sensor readings around it. A
+    /// camera frame reaches the screen a few hundredths of a second after it was taken, so
+    /// drawing it with the pose of that moment keeps the lines on the mountains while the
+    /// phone turns. Falls back to the latest pose for times far outside the readings.
+    func pose(at time: TimeInterval) -> Pose? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let first = history.first, let last = history.last,
+              time > first.time - 0.5, time < last.time + 0.5 else { return latest }
+        if time <= first.time { return first.pose }
+        if time >= last.time { return last.pose }
+        // Readings are evenly spaced, so a binary search is plenty fast.
+        var lo = 0, hi = history.count - 1
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2
+            if history[mid].time <= time { lo = mid } else { hi = mid }
+        }
+        let a = history[lo], b = history[hi]
+        let f = b.time > a.time ? (time - a.time) / (b.time - a.time) : 0
+        return Pose.blend(a.pose, b.pose, max(0, min(1, f)))
+    }
+
+    /// Timestamp of the latest reading (seconds since boot).
+    var latestTime: TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        return history.last?.time
+    }
+
     /// Held still enough for a sharp camera frame and a matching attitude.
     var isSteady: Bool {
         lock.lock()
@@ -138,10 +182,12 @@ final class MotionTracker: @unchecked Sendable {
         let now = Date()
         lock.lock()
         latest = pose
+        history.append((motion.timestamp, pose))
+        if history.count > 150 { history.removeFirst(history.count - 150) }
         rotationRate = (r.x * r.x + r.y * r.y + r.z * r.z).squareRoot()
         lastUpdate = now
         recentUpdates.append(now)
-        if recentUpdates.count > 90 { recentUpdates.removeFirst(recentUpdates.count - 90) }
+        if recentUpdates.count > 150 { recentUpdates.removeFirst(recentUpdates.count - 150) }
         lock.unlock()
     }
 }

@@ -1,21 +1,35 @@
 import Foundation
 
 /// A named summit from OpenStreetMap (`natural=peak`).
-public struct Peak: Codable, Sendable, Hashable {
+public struct Peak: Codable, Sendable, Hashable, Identifiable {
     public var id: Int64
     public var name: String
     public var latitude: Double
     public var longitude: Double
-    /// Elevation from the peak database, meters. Never from GPS.
+    /// Elevation from the peak database, meters. Never from GPS. For peaks the database
+    /// has no elevation for, the terrain's (see `estimatedElevation`).
     public var elevation: Double
+    /// The elevation is the terrain model's, since OpenStreetMap has none for this peak.
+    public var estimatedElevation = false
+    /// Topographic prominence when OpenStreetMap has it, meters.
+    public var prominence: Double?
+    /// Wikidata item ("Q1374") and Wikipedia article ("en:Matterhorn"), for facts.
+    public var wikidata: String?
+    public var wikipedia: String?
 
-    public init(id: Int64, name: String, latitude: Double, longitude: Double, elevation: Double) {
+    public init(id: Int64, name: String, latitude: Double, longitude: Double, elevation: Double,
+                prominence: Double? = nil, wikidata: String? = nil, wikipedia: String? = nil) {
         self.id = id
         self.name = name
         self.latitude = latitude
         self.longitude = longitude
         self.elevation = elevation
+        self.prominence = prominence
+        self.wikidata = wikidata
+        self.wikipedia = wikipedia
     }
+
+    public var position: LatLon { LatLon(latitude, longitude) }
 
     public var point: GeoPoint { GeoPoint(latitude: latitude, longitude: longitude, height: elevation) }
 }
@@ -30,8 +44,8 @@ public enum Overpass {
         return "[out:json][timeout:90];node[\"natural\"=\"peak\"][\"name\"](\(box));out body;"
     }
 
-    /// Peaks in an Overpass JSON response. Peaks without a usable elevation are left out,
-    /// since labels show it and the line-of-sight test needs it.
+    /// Peaks in an Overpass JSON response. Peaks without a usable elevation are kept with
+    /// `estimatedElevation` set (and elevation 0) for the terrain to fill in.
     public static func peaks(fromJSON data: Data) throws -> [Peak] {
         struct Response: Decodable {
             struct Element: Decodable {
@@ -43,9 +57,14 @@ public enum Overpass {
             var elements: [Element]
         }
         return try JSONDecoder().decode(Response.self, from: data).elements.compactMap { e in
-            guard let lat = e.lat, let lon = e.lon, let tags = e.tags, let name = tags["name"], !name.isEmpty,
-                  let ele = tags["ele"].flatMap(parseElevation) else { return nil }
-            return Peak(id: e.id, name: name, latitude: lat, longitude: lon, elevation: ele)
+            guard let lat = e.lat, let lon = e.lon, let tags = e.tags, let name = tags["name"], !name.isEmpty else { return nil }
+            let ele = tags["ele"].flatMap(parseElevation)
+            let wikidata = tags["wikidata"].flatMap { $0.hasPrefix("Q") ? $0 : nil }
+            var peak = Peak(id: e.id, name: name, latitude: lat, longitude: lon, elevation: ele ?? 0,
+                            prominence: tags["prominence"].flatMap(parseElevation), wikidata: wikidata,
+                            wikipedia: tags["wikipedia"])
+            peak.estimatedElevation = ele == nil
+            return peak
         }
     }
 

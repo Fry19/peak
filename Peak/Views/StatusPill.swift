@@ -1,9 +1,9 @@
 import PeakCore
 import SwiftUI
 
-/// The one floating control: what the app is doing, which way you're facing, and whether
-/// the labels are locked to the skyline or following the compass. Tap it to freeze the
-/// view; long-press it for the debug panel.
+/// The floating status: what the app is doing, which way you're facing, and whether the
+/// labels are locked to the skyline or following the compass. Tap it to pause the view;
+/// long-press it for diagnostics.
 struct StatusPill: View {
     let model: AppModel
 
@@ -14,29 +14,33 @@ struct StatusPill: View {
             }
             .font(.system(size: 13, weight: .medium))
             .monospacedDigit()
+            .lineLimit(2)
             .foregroundStyle(.white)
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
+            .frame(minHeight: 44)
             .background(.ultraThinMaterial, in: Capsule())
             .environment(\.colorScheme, .dark)
             .contentShape(Capsule())
-            .onTapGesture { model.toggleFreeze() }
-            .onLongPressGesture { model.showDebug.toggle() }
+            .onTapGesture { if !model.aligning { model.toggleFreeze() } }
+            .onLongPressGesture { model.settings.showDiagnostics.toggle() }
         }
     }
 
     /// Compass heading of the middle of the view, like "236° SW".
     private var heading: String? {
-        guard let pose = model.frozen?.pose ?? model.motion.pose else { return nil }
-        let h = CameraGeometry.attitude(pose, correction: model.frozen?.heading ?? model.headingCorrection).heading
-        let names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-        return String(format: "%.0f° %@", h, names[Int((h / 45).rounded()) % 8])
+        let pose = model.frozen?.pose ?? model.motion.pose
+        guard let pose else { return nil }
+        return Format.bearing(CameraGeometry.heading(pose, correction: model.frozen?.correction ?? model.viewCorrection(for: pose)))
     }
 
     @ViewBuilder private var content: some View {
-        if model.frozen != nil {
+        if model.aligning {
+            Image(systemName: "hand.draw.fill").font(.system(size: 11))
+            Text("Lining up" + (heading.map { " · \($0)" } ?? ""))
+        } else if model.frozen != nil {
             Image(systemName: "pause.fill").font(.system(size: 10))
-            Text("Paused" + (heading.map { " · \($0)" } ?? "") + " · tap to go live")
+            Text("Paused" + (heading.map { " · \($0)" } ?? ""))
         } else {
             switch model.phase {
             case .locating:
@@ -47,13 +51,13 @@ struct StatusPill: View {
                 Text(text)
             case let .needsPermission(text), let .failed(text):
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-                Text(text).multilineTextAlignment(.leading).frame(maxWidth: 280)
+                Text(text).multilineTextAlignment(.leading).frame(maxWidth: 260)
             case .ready:
+                let state = model.correction.state
                 Circle()
-                    .fill(model.correction.isAligned ? Color.green : Color.orange)
+                    .fill(state == .locked ? Color.green : state == .byHand ? Color.cyan : Color.orange)
                     .frame(width: 7, height: 7)
-                Text((heading.map { "\($0) · " } ?? "") +
-                     (model.correction.isAligned ? "Locked to the skyline" : "Compass · hold still on the mountains"))
+                Text((heading.map { "\($0) · " } ?? "") + (state == .locked ? "Locked" : state == .byHand ? "Lined up" : "Compass"))
             }
         }
     }
