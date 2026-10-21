@@ -399,8 +399,10 @@ final class AppModel {
     // MARK: Terrain and peaks
 
     private func locationChanged(_ new: CLLocation) {
-        guard new.horizontalAccuracy >= 0 else { return }
-        if let old = location, old.horizontalAccuracy < new.horizontalAccuracy,
+        // Starting updates first hands over the fix the phone kept from earlier, which may be
+        // from somewhere you've since left.
+        guard new.horizontalAccuracy >= 0, new.timestamp.timeIntervalSinceNow > -60 else { return }
+        if let old = location, new.timestamp.timeIntervalSince(old.timestamp) < 60, old.horizontalAccuracy < new.horizontalAccuracy,
            new.distance(from: old) < old.horizontalAccuracy { return }
         location = new
         // Tiles are 1° wide, so a rough first fix is enough to start downloading.
@@ -472,6 +474,18 @@ final class AppModel {
                     if let location = self.location, location.horizontalAccuracy < 2_000,
                        location.distance(from: start) > Self.reloadDistance { self.load(location) }
                 }
+            }
+            // The view is drawn from where it was last built. With the terrain here already in
+            // from a load nearby, build it from where you are now rather than after everything
+            // else has downloaded; without it, show none rather than the view from elsewhere.
+            if tiles[here] != nil {
+                center = location ?? start
+                await rebuild()
+                guard !superseded else { return }
+            } else if scene != nil {
+                center = nil
+                scene = nil
+                updateCorrector()
             }
             if scene == nil { phase = .loading("Getting terrain…") }
             var done = 0
@@ -733,7 +747,7 @@ final class AppModel {
     /// Builds the scene from the tiles and peaks so far, off the main thread. Calls that
     /// arrive while a build runs are folded into one more build afterwards.
     @MainActor private func rebuild() async {
-        guard let center else { return }
+        guard center != nil else { return }
         if rebuilding {
             rebuildAgain = true
             return
@@ -741,6 +755,7 @@ final class AppModel {
         rebuilding = true
         repeat {
             rebuildAgain = false
+            guard let center else { break }
             let terrain = Terrain(tiles: Array(tiles.values), detail: detail.values.flatMap { $0.values }, missingIsSea: false)
             let peaks = self.peaks
             let lat = center.coordinate.latitude, lon = center.coordinate.longitude
@@ -750,6 +765,8 @@ final class AppModel {
                 TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, peaks: peaks)
             }.value
             lastBuildSeconds = Date().timeIntervalSince(started)
+            // Moved far on while building, or somewhere the terrain isn't in yet: not from the old spot.
+            guard let now = self.center, now.distance(from: center) < Self.reloadDistance else { continue }
             scene = built
             updateCorrector()
             if arTrail != nil { drapeTrail() }
