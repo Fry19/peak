@@ -57,9 +57,7 @@ public struct UprightFrame: Sendable {
         }
         for _ in 0..<turns {
             image = image.rotatedClockwise()
-            // New pixel (x′, y′) is old (y′, H − x′).
-            k = CameraIntrinsics(width: k.height, height: k.width, fx: k.fy, fy: k.fx,
-                                 cx: Double(k.height) - k.cy, cy: k.cx)
+            k = k.rotatedClockwise()
             (right, down) = (-down, right)
         }
         self.image = image

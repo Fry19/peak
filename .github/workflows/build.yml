@@ -123,8 +123,52 @@ jobs:
           $B synth --dem DEM --lat "$LAT" --lon "$LON" --heading 262 --pitch 3 --roll 1 --compass-error 8 --out out/matterhorn
           $B align out/matterhorn.json --dem DEM --debug out/matterhorn-aligned.png
 
+      - name: Live data (hikes, facts, terrain blocks)
+        run: |
+          B=PeakCore/.build/release/peakbench
+          mkdir -p live
+          UA="Peak/0.4 CI (github.com/Fry19/peak)"
+          {
+            echo "## Live data checks"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Terrain: full-detail blocks decoded one at a time must match the whole image.
+          S=Copernicus_DSM_COG_10_N45_00_E007_00_DEM
+          curl -sSf -o live/N45E007.tif "https://copernicus-dem-30m.s3.amazonaws.com/$S/$S.tif"
+          $B geotiff live/N45E007.tif --level 0 --blocks | tee live/blocks.txt
+          $B geotiff live/N45E007.tif --level 1 --blocks | tee -a live/blocks.txt
+          rm live/N45E007.tif
+          # Hikes near the Matterhorn, with the app's own query; in sight from Gornergrat.
+          $B trails --query --lat 45.9763 --lon 7.6586 > live/trails-query.txt
+          if curl -sSf -A "$UA" --data-urlencode data@live/trails-query.txt https://overpass-api.de/api/interpreter -o live/matterhorn-trails.json; then
+            $B trails live/matterhorn-trails.json --lat 45.9763 --lon 7.6586 --dem DEM --from-lat "$LAT" --from-lon "$LON" | tee live/trails.txt
+          else
+            echo "Overpass unavailable; skipped" | tee live/trails.txt
+          fi
+          # Facts about the Matterhorn from Wikidata and Wikipedia.
+          W="https://www.wikidata.org/w/api.php?action=wbgetentities&format=json"
+          if curl -sSf -A "$UA" -o live/q1374.json "$W&ids=Q1374&props=claims%7Cdescriptions%7Csitelinks&languages=en"; then
+            IDS=$($B facts live/q1374.json --id Q1374 | sed -n 's/^linked ids: //p' | sed 's/|/%7C/g')
+            curl -sSf -A "$UA" -o live/labels.json "$W&ids=$IDS&props=labels&languages=en" || echo '{"entities":{}}' > live/labels.json
+            curl -sSf -A "$UA" -o live/summary.json "https://en.wikipedia.org/api/rest_v1/page/summary/Matterhorn" || echo '{}' > live/summary.json
+            $B facts live/q1374.json --id Q1374 --labels live/labels.json --summary live/summary.json | tee live/facts.txt
+          else
+            echo "Wikidata unavailable; skipped" | tee live/facts.txt
+          fi
+          {
+            echo '```'
+            cat live/blocks.txt
+            echo
+            head -40 live/trails.txt
+            echo
+            cat live/facts.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload images
         uses: actions/upload-artifact@v4
         with:
           name: skyline-matching
-          path: out
+          path: |
+            out
+            live

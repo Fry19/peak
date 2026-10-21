@@ -4,8 +4,13 @@ import Foundation
 ///
 /// Pixel centers sit at `originLatitude − row·stepLatitude`, `originLongitude + col·stepLongitude`.
 /// Copernicus GLO-30 tiles are 1° with the first pixel centered on the tile's north-west
-/// corner (3600 rows; 3600 columns below 50° latitude, fewer further north).
+/// corner (3600 rows; 3600 columns below 50° latitude, fewer further north). A tile can
+/// also cover just part of its 1° cell, as a sharper patch over a coarser tile; pixels it
+/// has no data for hold `noData`.
 public final class ElevationTile: @unchecked Sendable {
+    /// Marks a pixel without data. Decoded heights never take this value.
+    public static let noData = Int16.min
+
     public let south: Int
     public let west: Int
     public let rows: Int
@@ -107,8 +112,61 @@ public final class ElevationTile: @unchecked Sendable {
         try data.write(to: url)
     }
 
+    /// Joins patches of one cell with the same pixel grid (such as neighboring blocks of a
+    /// GeoTIFF) into one patch covering all of them; pixels none of them cover are `noData`.
+    public convenience init?(merging parts: [ElevationTile]) {
+        guard let first = parts.first,
+              parts.allSatisfy({ $0.south == first.south && $0.west == first.west &&
+                                 abs($0.stepLatitude - first.stepLatitude) < 1e-12 &&
+                                 abs($0.stepLongitude - first.stepLongitude) < 1e-12 }) else { return nil }
+        // Pixel offsets of each part from the first one's origin.
+        let offsets = parts.map { t in
+            (row: Int(((first.originLatitude - t.originLatitude) / first.stepLatitude).rounded()),
+             col: Int(((t.originLongitude - first.originLongitude) / first.stepLongitude).rounded()))
+        }
+        let row0 = offsets.map(\.row).min()!, col0 = offsets.map(\.col).min()!
+        let rows = zip(parts, offsets).map { $1.row + $0.rows }.max()! - row0
+        let cols = zip(parts, offsets).map { $1.col + $0.cols }.max()! - col0
+        let buffer = UnsafeMutableBufferPointer<Int16>.allocate(capacity: rows * cols)
+        buffer.initialize(repeating: Self.noData)
+        for (t, o) in zip(parts, offsets) {
+            for r in 0..<t.rows {
+                let dst = (o.row - row0 + r) * cols + (o.col - col0)
+                for c in 0..<t.cols where t.heights[r * t.cols + c] != Self.noData {
+                    buffer[dst + c] = t.heights[r * t.cols + c]
+                }
+            }
+        }
+        self.init(south: first.south, west: first.west, rows: rows, cols: cols,
+                  originLatitude: first.originLatitude - Double(row0) * first.stepLatitude,
+                  originLongitude: first.originLongitude + Double(col0) * first.stepLongitude,
+                  stepLatitude: first.stepLatitude, stepLongitude: first.stepLongitude, taking: buffer)
+    }
+
     @inline(__always)
     func value(row: Int, col: Int) -> Int16 { heights[row * cols + col] }
+
+    /// Bilinear height inside the patch, or nil near its edges or where it has no data.
+    @inline(__always)
+    func interiorHeight(_ latitude: Double, _ longitude: Double) -> Double? {
+        let y = (originLatitude - latitude) / stepLatitude
+        let x = (longitude - originLongitude) / stepLongitude
+        guard y >= 0, x >= 0 else { return nil }
+        let r0 = Int(y), c0 = Int(x)
+        guard r0 + 1 < rows, c0 + 1 < cols else { return nil }
+        let i = r0 * cols + c0
+        let a = heights[i], b = heights[i + 1], c = heights[i + cols], d = heights[i + cols + 1]
+        if a == Self.noData || b == Self.noData || c == Self.noData || d == Self.noData { return nil }
+        let fy = y - Double(r0), fx = x - Double(c0)
+        return (Double(a) * (1 - fx) + Double(b) * fx) * (1 - fy) + (Double(c) * (1 - fx) + Double(d) * fx) * fy
+    }
+
+    /// The share of the 1° cell this tile covers with data, 0 to 1.
+    public var coverage: Double {
+        let area = Double(rows) * stepLatitude * Double(cols) * stepLongitude
+        let filled = Double(heights.reduce(0) { $1 == Self.noData ? $0 : $0 + 1 }) / Double(max(1, rows * cols))
+        return min(1, area * filled)
+    }
 
     /// All heights, row by row from the north.
     public var heightValues: [Int16] { Array(heights) }
@@ -126,7 +184,8 @@ public enum TerrainError: Error, CustomStringConvertible {
     }
 }
 
-/// A set of 1° tiles with bilinear height lookups that work across tile edges.
+/// A set of 1° tiles with bilinear height lookups that work across tile edges, plus
+/// optional sharper patches over parts of them.
 ///
 /// By default, a missing tile inside the bounding box of the loaded tiles reads as sea
 /// level, since the Copernicus bucket has no tiles over open ocean. Outside the box, or
@@ -134,23 +193,41 @@ public enum TerrainError: Error, CustomStringConvertible {
 /// data stops instead of seeing a flat sea.
 public final class Terrain: @unchecked Sendable {
     public let tiles: [ElevationTile]
+    public let detail: [ElevationTile]
     let minSouth: Int
     let minWest: Int
     let latCount: Int
     let lonCount: Int
     let grid: [ElevationTile?]
     let missing: Double
+    /// Patches of each cell, finest first: `patches[patchStart[cell]..<patchStart[cell + 1]]`.
+    let patches: [ElevationTile]
+    let patchStart: [Int]
 
-    public init(tiles: [ElevationTile], missingIsSea: Bool = true) {
+    /// `detail` patches are used wherever they have data, finest first; elsewhere, and
+    /// within a pixel of their edges, the 1° `tiles` are.
+    public init(tiles: [ElevationTile], detail: [ElevationTile] = [], missingIsSea: Bool = true) {
         self.tiles = tiles
+        self.detail = detail
         missing = missingIsSea ? 0 : .nan
-        minSouth = tiles.map(\.south).min() ?? 0
-        minWest = tiles.map(\.west).min() ?? 0
-        latCount = tiles.isEmpty ? 0 : (tiles.map(\.south).max()! - minSouth + 1)
-        lonCount = tiles.isEmpty ? 0 : (tiles.map(\.west).max()! - minWest + 1)
+        let all = tiles + detail
+        minSouth = all.map(\.south).min() ?? 0
+        minWest = all.map(\.west).min() ?? 0
+        latCount = all.isEmpty ? 0 : (all.map(\.south).max()! - minSouth + 1)
+        lonCount = all.isEmpty ? 0 : (all.map(\.west).max()! - minWest + 1)
         var grid = [ElevationTile?](repeating: nil, count: latCount * lonCount)
         for t in tiles { grid[(t.south - minSouth) * lonCount + (t.west - minWest)] = t }
         self.grid = grid
+        var byCell = [[ElevationTile]](repeating: [], count: latCount * lonCount)
+        for t in detail { byCell[(t.south - minSouth) * lonCount + (t.west - minWest)].append(t) }
+        var start = [0]
+        var patches: [ElevationTile] = []
+        for cell in byCell {
+            patches += cell.sorted { $0.stepLatitude < $1.stepLatitude }
+            start.append(patches.count)
+        }
+        self.patches = patches
+        patchStart = start
     }
 
     /// Loads every .pkdem file in a directory.
@@ -170,7 +247,16 @@ public final class Terrain: @unchecked Sendable {
         let west = Int(longitude.rounded(.down))
         let li = south - minSouth, wi = west - minWest
         guard li >= 0, li < latCount, wi >= 0, wi < lonCount else { return .nan }
-        guard let tile = grid[li * lonCount + wi] else { return missing }
+        let cell = li * lonCount + wi
+        if !patches.isEmpty {
+            var k = patchStart[cell]
+            let end = patchStart[cell + 1]
+            while k < end {
+                if let h = patches[k].interiorHeight(latitude, longitude) { return h }
+                k += 1
+            }
+        }
+        guard let tile = grid[cell] else { return missing }
         let y = (tile.originLatitude - latitude) / tile.stepLatitude
         let x = (longitude - tile.originLongitude) / tile.stepLongitude
         let r0 = Int(y.rounded(.down)), c0 = Int(x.rounded(.down))

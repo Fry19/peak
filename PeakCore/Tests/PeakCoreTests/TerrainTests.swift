@@ -34,6 +34,27 @@ final class TerrainTests: XCTestCase {
         XCTAssertEqual(partial.height(latitude: 45.5, longitude: 7.5), 800)
     }
 
+    /// A sharp patch takes over wherever it has data; elsewhere, and at its edges, the
+    /// coarse tile answers.
+    func testDetailPatchesOverrideTheCoarseTile() {
+        let coarse = ElevationTile(south: 45, west: 7, size: 60) { _, _ in 1_000 }
+        // A 20×20 patch at 1/600° spacing near the middle of the cell, with a hole.
+        var values = [Int16](repeating: 1_500, count: 400)
+        for r in 8..<12 { for c in 8..<12 { values[r * 20 + c] = ElevationTile.noData } }
+        let patch = ElevationTile(south: 45, west: 7, rows: 20, cols: 20, originLatitude: 45.5, originLongitude: 7.5,
+                                  stepLatitude: 1.0 / 600, stepLongitude: 1.0 / 600, heights: values)
+        let terrain = Terrain(tiles: [coarse], detail: [patch])
+        XCTAssertEqual(terrain.height(latitude: 45.5 - 3.5 / 600, longitude: 7.5 + 2.5 / 600), 1_500)
+        XCTAssertEqual(terrain.height(latitude: 45.5 - 10 / 600, longitude: 7.5 + 10 / 600), 1_000, "hole in the patch")
+        XCTAssertEqual(terrain.height(latitude: 45.5 - 19.5 / 600, longitude: 7.5 + 5 / 600), 1_000, "last row: no neighbor below")
+        XCTAssertEqual(terrain.height(latitude: 45.2, longitude: 7.2), 1_000)
+        XCTAssertEqual(terrain.height(latitude: 45.51, longitude: 7.51), 1_000, "north of the patch")
+        // A patch alone (its coarse tile failed to download) still answers where it can.
+        let alone = Terrain(tiles: [], detail: [patch], missingIsSea: false)
+        XCTAssertEqual(alone.height(latitude: 45.5 - 3.5 / 600, longitude: 7.5 + 2.5 / 600), 1_500)
+        XCTAssertTrue(alone.height(latitude: 45.2, longitude: 7.2).isNaN)
+    }
+
     func testPkdemRoundTrip() throws {
         let tile = ElevationTile(south: 46, west: 7, size: 90) { lat, lon in 100 * lat + 10 * lon }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("test-\(UUID()).pkdem")

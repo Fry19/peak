@@ -45,4 +45,29 @@ final class CameraTests: XCTestCase {
         let p = Camera(intrinsics: k, attitude: Attitude(heading: 90)).projector
         XCTAssertNil(p.pixel(azimuth: 270, elevation: 0))
     }
+
+    /// The app turns camera frames to match the screen and fills the screen with them.
+    /// Each step must keep every direction on the same pixel.
+    func testTurnedAndFilledIntrinsicsAgree() throws {
+        let k = CameraIntrinsics(width: 1080, height: 1920, fx: 1500, fy: 1502, cx: 545, cy: 950)
+        let a = Attitude(heading: 30, pitch: 5, roll: 2)
+        let axes = a.axes
+        let original = Camera(intrinsics: k, attitude: a)
+        // Turned clockwise, the image's x runs along the old −y and its y along the old x.
+        let turned = Camera(intrinsics: k.rotatedClockwise(),
+                            attitude: Attitude(right: -axes.down, down: axes.right, forward: axes.forward))
+        for (az, el) in [(30.0, 5.0), (40, 10), (20, -3)] {
+            let p = try XCTUnwrap(original.projector.pixel(azimuth: az, elevation: el))
+            let q = try XCTUnwrap(turned.projector.pixel(azimuth: az, elevation: el))
+            XCTAssertEqual(q.x, Double(k.height) - p.y, accuracy: 1e-6)
+            XCTAssertEqual(q.y, p.x, accuracy: 1e-6)
+        }
+        // Filling a 390×844 view scales by the larger ratio about the center.
+        let filled = Camera(intrinsics: k.aspectFilled(width: 390, height: 844), attitude: a)
+        let s = max(390.0 / 1080, 844.0 / 1920)
+        let p = try XCTUnwrap(original.projector.pixel(azimuth: 35, elevation: 4))
+        let q = try XCTUnwrap(filled.projector.pixel(azimuth: 35, elevation: 4))
+        XCTAssertEqual(q.x, 195 + (p.x - 540) * s, accuracy: 1e-6)
+        XCTAssertEqual(q.y, 422 + (p.y - 960) * s, accuracy: 1e-6)
+    }
 }

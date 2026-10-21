@@ -31,6 +31,14 @@ public enum GeoTIFF {
         public var byteRange: Range<Int> {
             (offsets.min() ?? 0)..<(zip(offsets, counts).map { $0 + $1 }.max() ?? 0)
         }
+
+        /// The bytes of the file holding one block (a tile or a strip).
+        public func byteRange(ofBlock index: Int) -> Range<Int> {
+            offsets[index]..<(offsets[index] + counts[index])
+        }
+
+        public var blockCount: Int { offsets.count }
+        var blocksAcross: Int { (width + blockWidth - 1) / blockWidth }
     }
 
     public struct Layout: Sendable {
@@ -41,6 +49,40 @@ public enum GeoTIFF {
         var originLongitude: Double
         var stepLatitude: Double
         var stepLongitude: Double
+
+        /// The 1° cell the file covers.
+        public var south: Int { Int(originLatitude.rounded(.up)) - 1 }
+        public var west: Int { Int(originLongitude.rounded(.down)) }
+
+        /// First pixel center and pixel size of image `level`, degrees. An overview covers
+        /// the same area with bigger pixels, so its first pixel center sits half of the
+        /// difference in pixel size further in.
+        public func grid(level: Int) -> (originLatitude: Double, originLongitude: Double,
+                                         stepLatitude: Double, stepLongitude: Double) {
+            let full = images[0], img = images[level]
+            let stepLat = stepLatitude * Double(full.height) / Double(img.height)
+            let stepLon = stepLongitude * Double(full.width) / Double(img.width)
+            return (originLatitude - (stepLat - stepLatitude) / 2, originLongitude + (stepLon - stepLongitude) / 2,
+                    stepLat, stepLon)
+        }
+
+        /// The blocks of image `level` holding any part of the given area (degrees), with
+        /// the pixels needed to interpolate at its edges.
+        public func blocks(level: Int, south: Double, north: Double, west: Double, east: Double) -> [Int] {
+            guard north > Double(self.south), south < Double(self.south + 1),
+                  east > Double(self.west), west < Double(self.west + 1) else { return [] }
+            let img = images[level]
+            let g = grid(level: level)
+            func clampRow(_ v: Double) -> Int { max(0, min(img.height - 1, Int(v.rounded(.down)))) }
+            func clampCol(_ v: Double) -> Int { max(0, min(img.width - 1, Int(v.rounded(.down)))) }
+            let r0 = clampRow((g.originLatitude - north) / g.stepLatitude), r1 = clampRow((g.originLatitude - south) / g.stepLatitude + 1)
+            let c0 = clampCol((west - g.originLongitude) / g.stepLongitude), c1 = clampCol((east - g.originLongitude) / g.stepLongitude + 1)
+            var out: [Int] = []
+            for by in (r0 / img.blockHeight)...(r1 / img.blockHeight) {
+                for bx in (c0 / img.blockWidth)...(c1 / img.blockWidth) { out.append(by * img.blocksAcross + bx) }
+            }
+            return out
+        }
     }
 
     /// Reads the image directories from the start of a file. Throws if `prefix` is too
@@ -72,24 +114,46 @@ public enum GeoTIFF {
     public static func decode(_ layout: Layout, level: Int, bytes: [UInt8], base: Int) throws -> ElevationTile {
         guard layout.images.indices.contains(level) else { throw Failure("no image at level \(level)") }
         let img = layout.images[level]
-        let full = layout.images[0]
+        return try decode(layout, level: level, blocks: Array(img.offsets.indices)) { index in
+            let start = img.offsets[index] - base, end = start + img.counts[index]
+            guard start >= 0, end <= bytes.count else { return nil }
+            return bytes[start..<end]
+        }
+    }
+
+    /// Decodes some blocks of image `level` into a tile covering the rectangle of blocks
+    /// around them. Pixels of blocks in that rectangle that weren't asked for hold
+    /// `ElevationTile.noData`. `data(block)` returns a block's bytes as stored in the file.
+    public static func decode(_ layout: Layout, level: Int, blocks: [Int],
+                              data: (Int) throws -> ArraySlice<UInt8>?) throws -> ElevationTile {
+        guard layout.images.indices.contains(level) else { throw Failure("no image at level \(level)") }
+        let img = layout.images[level]
+        guard !blocks.isEmpty, blocks.allSatisfy({ img.offsets.indices.contains($0) }) else { throw Failure("no such blocks") }
         let width = img.width, height = img.height
         let isFloat = img.sampleFormat == 3
         let bytesPerSample = img.bitsPerSample / 8
-        let across = (width + img.blockWidth - 1) / img.blockWidth
+        let across = img.blocksAcross
         let rowBytes = img.blockWidth * bytesPerSample
 
-        var heights = [Int16](repeating: 0, count: width * height)
-        for (index, (offset, count)) in zip(img.offsets, img.counts).enumerated() {
+        // The window: the rectangle of blocks holding all the requested ones.
+        let bxs = blocks.map { $0 % across }, bys = blocks.map { $0 / across }
+        let col0 = bxs.min()! * img.blockWidth, row0 = bys.min()! * img.blockHeight
+        let cols = min(width, (bxs.max()! + 1) * img.blockWidth) - col0
+        let rows = min(height, (bys.max()! + 1) * img.blockHeight) - row0
+        let complete = Set(blocks).count == (bxs.max()! - bxs.min()! + 1) * (bys.max()! - bys.min()! + 1)
+        var heights = [Int16](repeating: complete ? 0 : ElevationTile.noData, count: rows * cols)
+
+        for index in Set(blocks) {
             let bx = (index % across) * img.blockWidth, by = (index / across) * img.blockHeight
             // Tiles are always whole; the last strip only has the rows that are left.
-            let rows = img.tiled ? img.blockHeight : min(img.blockHeight, height - by)
-            let start = offset - base, end = start + count
-            guard start >= 0, end <= bytes.count else { throw Failure("block \(index) is outside the data given") }
-            var block = Array(bytes[start..<end])
-            if img.compression != 1 { block = try Inflate.zlib(block, expectedSize: rows * rowBytes) }
-            guard block.count >= rows * rowBytes else { throw Failure("block \(index) is short") }
-            for r in 0..<rows {
+            let blockRows = img.tiled ? img.blockHeight : min(img.blockHeight, height - by)
+            guard let stored = try data(index), stored.count == img.counts[index] else {
+                throw Failure("block \(index) is outside the data given")
+            }
+            var block = Array(stored)
+            if img.compression != 1 { block = try Inflate.zlib(block, expectedSize: blockRows * rowBytes) }
+            guard block.count >= blockRows * rowBytes else { throw Failure("block \(index) is short") }
+            for r in 0..<blockRows {
                 let row = r * rowBytes
                 switch img.predictor {
                 case 2 where !isFloat:
@@ -113,7 +177,7 @@ public enum GeoTIFF {
                 }
             }
             // Copy the part of the block inside the image.
-            for r in 0..<min(rows, height - by) {
+            for r in 0..<min(blockRows, height - by) {
                 for c in 0..<min(img.blockWidth, width - bx) {
                     let i = (r * img.blockWidth + c) * bytesPerSample
                     let value: Double
@@ -123,21 +187,17 @@ public enum GeoTIFF {
                     } else {
                         value = Double(Int16(bitPattern: UInt16(block[i]) | UInt16(block[i + 1]) << 8))
                     }
-                    heights[(by + r) * width + bx + c] = Int16(max(-32767, min(32767, value.isFinite ? value.rounded(.toNearestOrEven) : 0)))
+                    heights[(by + r - row0) * cols + bx + c - col0] =
+                        Int16(max(-32767, min(32767, value.isFinite ? value.rounded(.toNearestOrEven) : 0)))
                 }
             }
         }
 
-        // An overview covers the same area with bigger pixels, so its first pixel center
-        // sits half of the difference in pixel size further in.
-        let stepLat = layout.stepLatitude * Double(full.height) / Double(height)
-        let stepLon = layout.stepLongitude * Double(full.width) / Double(width)
-        let originLat = layout.originLatitude - (stepLat - layout.stepLatitude) / 2
-        let originLon = layout.originLongitude + (stepLon - layout.stepLongitude) / 2
-        return ElevationTile(south: Int(layout.originLatitude.rounded(.up)) - 1,
-                             west: Int(layout.originLongitude.rounded(.down)),
-                             rows: height, cols: width, originLatitude: originLat, originLongitude: originLon,
-                             stepLatitude: stepLat, stepLongitude: stepLon, heights: heights)
+        let grid = layout.grid(level: level)
+        return ElevationTile(south: layout.south, west: layout.west, rows: rows, cols: cols,
+                             originLatitude: grid.originLatitude - Double(row0) * grid.stepLatitude,
+                             originLongitude: grid.originLongitude + Double(col0) * grid.stepLongitude,
+                             stepLatitude: grid.stepLatitude, stepLongitude: grid.stepLongitude, heights: heights)
     }
 
     /// Decodes image `level` of a whole GeoTIFF file.

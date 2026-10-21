@@ -1,4 +1,5 @@
 import CoreVideo
+import UIKit
 import Foundation
 import PeakCore
 
@@ -6,8 +7,10 @@ import PeakCore
 /// the phone is held steady, to correct the compass.
 final class SkylineCorrector: @unchecked Sendable {
     struct Outcome {
-        /// Heading correction relative to the one the frame was matched with, degrees.
+        /// Corrections relative to the ones the frame was matched with, degrees.
         var delta: Double
+        var pitchDelta: Double
+        var rollDelta: Double
         var accepted: Bool
         var rms: Double
         /// Why a frame was turned away (nil when accepted).
@@ -23,24 +26,25 @@ final class SkylineCorrector: @unchecked Sendable {
     private var busy = false
     private var lastStart = Date.distantPast
     private var horizon: HorizonProfile?
-    private var correction = 0.0
+    private var correction = ViewCorrection()
     private let matcher: SkylineMatcher = {
         var m = SkylineMatcher()
         m.workingWidth = 640
         return m
     }()
 
-    /// What to match against, and the compass correction in use. Call on any thread.
-    func update(horizon: HorizonProfile?, correction: Double) {
+    /// What to match against, and the corrections in use. Call on any thread.
+    func update(horizon: HorizonProfile?, correction: ViewCorrection) {
         lock.lock()
         self.horizon = horizon
         self.correction = correction
         lock.unlock()
     }
 
-    /// Offers a camera frame (on the camera queue). Most are skipped: one is taken at a time,
-    /// at most about once a second, and only while the phone is steady.
-    func offer(_ buffer: CVPixelBuffer, pose: MotionTracker.Pose, steady: Bool, camera: CameraFeed) {
+    /// Offers a camera frame (on the camera queue) with the phone's pose when it was taken.
+    /// Most are skipped: one is taken at a time, at most about once a second, and only
+    /// while the phone is steady.
+    func offer(_ frame: CameraFeed.Frame, pose: MotionTracker.Pose, steady: Bool) {
         lock.lock()
         guard !busy, steady, let horizon, Date().timeIntervalSince(lastStart) > 0.8 else {
             lock.unlock()
@@ -53,24 +57,24 @@ final class SkylineCorrector: @unchecked Sendable {
         lock.unlock()
 
         // Convert now so the camera gets its buffer back straight away.
-        guard let image = Self.rgbImage(buffer, maxSide: 800) else {
+        guard let image = Self.rgbImage(frame.pixels, maxSide: 800) else {
             finish(nil)
             return
         }
-        let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
-        let f = Double(max(w, h)) / 2 / tan(camera.fieldOfView * .pi / 360)
-        let intrinsics = CameraIntrinsics(width: w, height: h, fx: f, fy: f, cx: Double(w) / 2, cy: Double(h) / 2)
-            .scaled(toWidth: image.width, height: image.height)
-        let axes = CameraGeometry.axes(pose, portrait: camera.portraitFrames)
+        let intrinsics = frame.lens.intrinsics.scaled(toWidth: image.width, height: image.height)
+        let axes = CameraGeometry.axes(pose, portrait: frame.portrait)
 
         work.async { [weak self] in
             guard let self else { return }
-            let frame = UprightFrame(image: image, intrinsics: intrinsics, right: axes.right, down: axes.down, forward: axes.forward)
-            var prior = frame.camera.attitude
-            prior.heading = normalizedAzimuth(prior.heading + correction)
-            let m = self.matcher.match(frame.image, intrinsics: frame.camera.intrinsics, prior: prior, horizon: horizon)
-            self.finish(Outcome(delta: m.alignment.headingCorrection, accepted: m.alignment.accepted, rms: m.alignment.rms,
-                                reason: m.alignment.rejectionReason, seconds: m.seconds))
+            let upright = UprightFrame(image: image, intrinsics: intrinsics, right: axes.right, down: axes.down, forward: axes.forward)
+            var prior = upright.camera.attitude
+            prior.heading = normalizedAzimuth(prior.heading + correction.heading)
+            prior.pitch += correction.pitch
+            prior.roll += correction.roll
+            let m = self.matcher.match(upright.image, intrinsics: upright.camera.intrinsics, prior: prior, horizon: horizon)
+            let a = m.alignment
+            self.finish(Outcome(delta: a.headingCorrection, pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
+                                accepted: a.accepted, rms: a.rms, reason: a.rejectionReason, seconds: m.seconds))
         }
     }
 

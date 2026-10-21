@@ -32,6 +32,21 @@ public struct CameraIntrinsics: Equatable, Codable, Sendable {
         let sx = Double(width) / Double(self.width), sy = Double(height) / Double(self.height)
         return CameraIntrinsics(width: width, height: height, fx: fx * sx, fy: fy * sy, cx: cx * sx, cy: cy * sy)
     }
+
+    /// The same camera for the image turned a quarter turn clockwise: new pixel (x′, y′)
+    /// is old pixel (y′, height − x′).
+    public func rotatedClockwise() -> CameraIntrinsics {
+        CameraIntrinsics(width: height, height: width, fx: fy, fy: fx, cx: Double(height) - cy, cy: cx)
+    }
+
+    /// The camera for the image shown in a `width` × `height` view, scaled to fill it and
+    /// centered (the parts that don't fit are cut off).
+    public func aspectFilled(width: Double, height: Double) -> CameraIntrinsics {
+        let s = max(width / Double(self.width), height / Double(self.height))
+        return CameraIntrinsics(width: Int(width.rounded()), height: Int(height.rounded()), fx: fx * s, fy: fy * s,
+                                cx: width / 2 + (cx - Double(self.width) / 2) * s,
+                                cy: height / 2 + (cy - Double(self.height) / 2) * s)
+    }
 }
 
 /// Which way the camera points, in degrees.

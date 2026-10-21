@@ -8,14 +8,25 @@ public struct Peak: Codable, Sendable, Hashable {
     public var longitude: Double
     /// Elevation from the peak database, meters. Never from GPS.
     public var elevation: Double
+    /// Topographic prominence when OpenStreetMap has it, meters.
+    public var prominence: Double?
+    /// Wikidata item ("Q1374") and Wikipedia article ("en:Matterhorn"), for facts.
+    public var wikidata: String?
+    public var wikipedia: String?
 
-    public init(id: Int64, name: String, latitude: Double, longitude: Double, elevation: Double) {
+    public init(id: Int64, name: String, latitude: Double, longitude: Double, elevation: Double,
+                prominence: Double? = nil, wikidata: String? = nil, wikipedia: String? = nil) {
         self.id = id
         self.name = name
         self.latitude = latitude
         self.longitude = longitude
         self.elevation = elevation
+        self.prominence = prominence
+        self.wikidata = wikidata
+        self.wikipedia = wikipedia
     }
+
+    public var position: LatLon { LatLon(latitude, longitude) }
 
     public var point: GeoPoint { GeoPoint(latitude: latitude, longitude: longitude, height: elevation) }
 }
@@ -45,7 +56,10 @@ public enum Overpass {
         return try JSONDecoder().decode(Response.self, from: data).elements.compactMap { e in
             guard let lat = e.lat, let lon = e.lon, let tags = e.tags, let name = tags["name"], !name.isEmpty,
                   let ele = tags["ele"].flatMap(parseElevation) else { return nil }
-            return Peak(id: e.id, name: name, latitude: lat, longitude: lon, elevation: ele)
+            let wikidata = tags["wikidata"].flatMap { $0.hasPrefix("Q") ? $0 : nil }
+            return Peak(id: e.id, name: name, latitude: lat, longitude: lon, elevation: ele,
+                        prominence: tags["prominence"].flatMap(parseElevation), wikidata: wikidata,
+                        wikipedia: tags["wikipedia"])
         }
     }
 

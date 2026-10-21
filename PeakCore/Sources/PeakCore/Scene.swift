@@ -69,3 +69,55 @@ extension HorizonRenderer {
         return results.compactMap { $0 }
     }
 }
+
+/// A point of a trail as seen from the observer.
+public struct DrapedPoint: Sendable {
+    public var azimuth: Float
+    public var elevation: Float
+    /// Horizontal distance from the observer, meters.
+    public var distance: Float
+}
+
+extension HorizonProfile {
+    /// Whether a point on the terrain, seen at (azimuth, elevation) from `distance` meters
+    /// away, is in sight rather than behind nearer terrain. The depth map gives the distance
+    /// to the first terrain in that direction; for a visible point that is the point itself.
+    public func isInSight(azimuth: Double, elevation: Double, distance: Double) -> Bool {
+        guard let hit = self.distance(atAzimuth: azimuth, elevation: elevation) else { return true }
+        return hit >= distance * 0.97 - 30
+    }
+}
+
+extension HorizonRenderer {
+    /// A trail laid on the terrain as seen from `observer`: the stretches in sight, as runs
+    /// of points about `spacing` meters apart and `lift` meters above the ground. Stretches
+    /// hidden behind nearer terrain, outside the terrain or within `minDistance` of the
+    /// observer are left out.
+    public func drape(_ lines: [[LatLon]], from observer: GeoPoint, horizon: HorizonProfile,
+                      spacing: Double = 15, lift: Double = 2, minDistance: Double = 30) -> [[DrapedPoint]] {
+        let frame = LocalFrame(origin: observer)
+        let here = LatLon(observer.latitude, observer.longitude)
+        var runs: [[DrapedPoint]] = []
+        for line in lines {
+            var run: [DrapedPoint] = []
+            func endRun() {
+                if run.count >= 2 { runs.append(run) }
+                run = []
+            }
+            for p in Trail.densify(line, spacing: spacing) {
+                let ground = terrain.height(latitude: p.latitude, longitude: p.longitude)
+                let horizontal = here.distance(to: p)
+                guard ground.isFinite, horizontal >= minDistance else { endRun(); continue }
+                let look = frame.look(at: GeoPoint(latitude: p.latitude, longitude: p.longitude, height: ground + lift),
+                                      refraction: horizon.settings.refraction)
+                guard horizon.isInSight(azimuth: look.azimuth, elevation: look.elevation, distance: horizontal) else {
+                    endRun()
+                    continue
+                }
+                run.append(DrapedPoint(azimuth: Float(look.azimuth), elevation: Float(look.elevation), distance: Float(horizontal)))
+            }
+            endRun()
+        }
+        return runs
+    }
+}
