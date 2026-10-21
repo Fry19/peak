@@ -114,8 +114,12 @@ final class AppModel {
     struct ARTrail {
         var trail: Trail
         var peakID: Int64
-        /// The stretches in sight, once worked out.
+        /// The trail laid on the terrain, stretches behind ridges marked, once worked out.
         var runs: [[DrapedPoint]]?
+
+        /// Some of it is in sight, and some of it is behind nearer ridges.
+        var someInSight: Bool { runs?.contains { $0.contains(where: \.isInSight) } ?? false }
+        var someHidden: Bool { runs?.contains { $0.contains { !$0.isInSight } } ?? false }
     }
 
     /// Getting the peaks around you: under way, waiting to try again, or done.

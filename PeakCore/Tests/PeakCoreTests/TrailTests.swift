@@ -123,7 +123,7 @@ final class TrailTests: XCTestCase {
 
     /// From the south, a trail on a cone's south face is in sight and one on its north
     /// face is hidden behind the summit.
-    func testDrapeHidesTheFarSide() {
+    func testDrapeHidesTheFarSide() throws {
         let cone = TestTerrain.Cone(latitude: 46.2, longitude: 8.0, height: 1_500, radius: 4_000)
         let terrain = TestTerrain.cones([cone])
         let renderer = HorizonRenderer(terrain: terrain)
@@ -147,6 +147,25 @@ final class TrailTests: XCTestCase {
             XCTAssertEqual(azimuthDifference(Double(p.azimuth), 0), 0, accuracy: 3)
             XCTAssertGreaterThan(p.elevation, 0)
         }
+
+        // Seeing through the cone: the north face comes back, marked hidden, and a trail over
+        // the top is one line, in sight up to the summit and hidden beyond it.
+        let throughNorth = renderer.drape([line(0.8, 3.5, azimuth: 5)], from: observer, horizon: horizon, includeHidden: true)
+        XCTAssertEqual(throughNorth.count, 1)
+        XCTAssertGreaterThan(throughNorth[0].count, 150)
+        XCTAssertTrue(throughNorth[0].allSatisfy { !$0.isInSight })
+        let throughSouth = renderer.drape([line(0.5, 3.5, azimuth: 175)], from: observer, horizon: horizon, includeHidden: true)
+        XCTAssertEqual(throughSouth.map(\.count), south.map(\.count))
+        XCTAssertTrue(throughSouth[0].allSatisfy(\.isInSight))
+        let over = renderer.drape([line(3, 0, azimuth: 180) + line(0, 3, azimuth: 0).dropFirst()], from: observer,
+                                  horizon: horizon, includeHidden: true)
+        XCTAssertEqual(over.count, 1)
+        let firstHidden = try XCTUnwrap(over[0].firstIndex { !$0.isInSight })
+        XCTAssertTrue(over[0][..<firstHidden].allSatisfy(\.isInSight))
+        XCTAssertTrue(over[0][firstHidden...].allSatisfy { !$0.isInSight })
+        // The switch is within a few hundred meters of the summit.
+        let summit = LatLon(46.05, 8.0).distance(to: LatLon(46.2, 8.0))
+        XCTAssertEqual(Double(over[0][firstHidden].distance), summit, accuracy: 400)
     }
 }
 

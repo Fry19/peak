@@ -27,6 +27,8 @@ struct AppSettings: Codable, Equatable {
     /// Ridges in front of the skyline, not just the skyline.
     var showRidges = true
     var haptics = true
+    /// A trail's stretches behind nearer ridges, drawn dashed as if seen through them.
+    var trailXRay = false
     /// Fetch the sharpest terrain on mobile data too, not just on Wi-Fi.
     var detailOnMobile = true
     var showDiagnostics = false
@@ -41,6 +43,22 @@ struct AppSettings: Codable, Equatable {
 
     func save() {
         if let data = try? JSONEncoder().encode(self) { UserDefaults.standard.set(data, forKey: Self.key) }
+    }
+}
+
+extension AppSettings {
+    /// Settings saved before a newer one was added keep their values; what's missing takes
+    /// its default.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init()
+        units = try c.decodeIfPresent(Units.self, forKey: .units) ?? units
+        labels = try c.decodeIfPresent(LabelDensity.self, forKey: .labels) ?? labels
+        showRidges = try c.decodeIfPresent(Bool.self, forKey: .showRidges) ?? showRidges
+        haptics = try c.decodeIfPresent(Bool.self, forKey: .haptics) ?? haptics
+        trailXRay = try c.decodeIfPresent(Bool.self, forKey: .trailXRay) ?? trailXRay
+        detailOnMobile = try c.decodeIfPresent(Bool.self, forKey: .detailOnMobile) ?? detailOnMobile
+        showDiagnostics = try c.decodeIfPresent(Bool.self, forKey: .showDiagnostics) ?? showDiagnostics
     }
 }
 

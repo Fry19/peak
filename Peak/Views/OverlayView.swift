@@ -39,6 +39,7 @@ final class OverlayCanvas: UIView {
     private let skyLine = OverlayCanvas.stroke(UIColor.white.withAlphaComponent(0.95), width: 1.4)
     private let trailGlow = OverlayCanvas.stroke(OverlayCanvas.trailColor.withAlphaComponent(0.3), width: 8)
     private let trailLine = OverlayCanvas.stroke(OverlayCanvas.trailColor, width: 2.5)
+    private let hiddenTrailLine = OverlayCanvas.stroke(OverlayCanvas.trailColor.withAlphaComponent(0.6), width: 1.8)
     private let dotLayer: CAShapeLayer = {
         let l = CAShapeLayer()
         l.fillColor = UIColor.white.withAlphaComponent(0.55).cgColor
@@ -92,7 +93,7 @@ final class OverlayCanvas: UIView {
         if let renderer {
             layer.addSublayer(renderer.layer)
         } else {
-            for l in bandGlow + bandLine + [skyGlow, skyLine, trailGlow, trailLine, dotLayer] { layer.addSublayer(l) }
+            for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, trailGlow, trailLine, dotLayer] { layer.addSublayer(l) }
         }
         layer.addSublayer(labelContainer)
         layer.addSublayer(arrowLayer)
@@ -184,14 +185,17 @@ final class OverlayCanvas: UIView {
 
         segments.removeAll(keepingCapacity: true)
         layoutRidges(scene, projector, heading: camera.attitude.heading, reach: reach, ridges: settings.showRidges)
-        layoutTrail(model.arTrail?.runs, projector)
+        // Dashes keep their size on the mountain while zooming, halving at each doubling,
+        // so they're 9 to 18 points apart on screen.
+        let dashScale = camera.intrinsics.fx / model.zoom * pow(2, floor(log2(max(1, model.zoom)))) * .pi / 180
+        layoutTrail(model.arTrail?.runs, projector, xRay: settings.trailXRay, pointsPerDegree: dashScale)
         let placed = layoutLabels(scene, projector, heading: camera.attitude.heading, reach: reach, model: model)
         renderer?.draw(segments, size: bounds.size, scale: displayScale)
         if frozen == nil, settings.haptics { tickIfCrossing(placed, at: now) }
     }
 
     private func clear() {
-        for l in bandGlow + bandLine + [skyGlow, skyLine, trailGlow, trailLine, dotLayer] { l.path = nil }
+        for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, trailGlow, trailLine, dotLayer] { l.path = nil }
         renderer?.draw([], size: bounds.size, scale: displayScale)
         labelLayers.values.forEach { $0.isHidden = true }
         arrowLayer.isHidden = true
@@ -243,6 +247,11 @@ final class OverlayCanvas: UIView {
     }
     private static let skylineStyle = Style(color: SIMD4(0.97, 0.99, 1.0, 0.95), width: 1.4, glow: 4.5, glowAlpha: 0.32)
     private static let trailStyle = Style(color: SIMD4(1.0, 0.72, 0.28, 1), width: 2.5, glow: 6, glowAlpha: 0.38)
+    private static let hiddenTrailStyle = Style(color: SIMD4(1.0, 0.72, 0.28, 0.6), width: 1.8, glow: 3, glowAlpha: 0.14)
+    /// A hidden stretch's dashes: `dashOn` points drawn of every `dashPeriod`, before the
+    /// round caps.
+    private static let dashPeriod: CGFloat = 9
+    private static let dashOn: CGFloat = 3.5
     private static let dotStyle = Style(color: SIMD4(1, 1, 1, 0.55), width: 4, glow: 0, glowAlpha: 0)
 
     /// Ridges this close are mostly the ground in front of you, houses and trees in
@@ -315,32 +324,71 @@ final class OverlayCanvas: UIView {
         skyLine.path = skyline.path
     }
 
-    /// The trail's visible stretches, laid on the slope.
-    private func layoutTrail(_ runs: [[DrapedPoint]]?, _ projector: Camera.Projector) {
+    /// The trail laid on the slope: solid where it's in sight and, seeing through ridges
+    /// (`xRay`), fainter and dashed where nearer terrain hides it. Dashes are spaced along
+    /// the trail by angle, `pointsPerDegree`, not along the screen, so they stay put on the
+    /// mountain as the phone turns.
+    private func layoutTrail(_ runs: [[DrapedPoint]]?, _ projector: Camera.Projector, xRay: Bool, pointsPerDegree: CGFloat) {
         guard let runs else {
             trailGlow.path = nil
             trailLine.path = nil
+            hiddenTrailLine.path = nil
             return
         }
-        let path = CGMutablePath()
+        let gpu = renderer != nil
+        var solid = Polyline()
+        let dashes = CGMutablePath()
+        let area = bounds.insetBy(dx: -20, dy: -20)
+        // The dashes along a→b, which spans s0 to s1 of the pattern.
+        func dash(_ a: CGPoint, _ b: CGPoint, _ s0: CGFloat, _ s1: CGFloat) {
+            guard s1 > s0, CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
+                .intersects(area) else { return }
+            func at(_ s: CGFloat) -> CGPoint {
+                let t = (s - s0) / (s1 - s0)
+                return CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
+            }
+            var start = (s0 / Self.dashPeriod).rounded(.down) * Self.dashPeriod
+            while start < s1 {
+                let lo = max(start, s0), hi = min(start + Self.dashOn, s1)
+                if hi > lo {
+                    if gpu {
+                        segments.append(Self.hiddenTrailStyle.segment(at(lo), at(hi)))
+                    } else {
+                        dashes.move(to: at(lo))
+                        dashes.addLine(to: at(hi))
+                    }
+                }
+                start += Self.dashPeriod
+            }
+        }
         for run in runs {
-            var last: CGPoint?
+            var last: (point: CGPoint, inSight: Bool, along: CGFloat)?
+            var previous: DrapedPoint?
+            var along: CGFloat = 0
             for p in run {
+                if let previous {
+                    let across = CGFloat(azimuthDifference(Double(p.azimuth), Double(previous.azimuth)) * cos(Double(p.elevation) * .pi / 180))
+                    along += hypot(across, CGFloat(p.elevation - previous.elevation)) * pointsPerDegree
+                }
+                previous = p
                 guard let q = point(projector, Double(p.azimuth), Double(p.elevation)) else {
                     last = nil
                     continue
                 }
                 if let last {
-                    if renderer != nil { segments.append(Self.trailStyle.segment(last, q)) } else { path.addLine(to: q) }
-                } else if renderer == nil {
-                    path.move(to: q)
+                    if last.inSight && p.isInSight {
+                        if gpu { segments.append(Self.trailStyle.segment(last.point, q)) } else { solid.add(last.point, q) }
+                    } else if xRay {
+                        dash(last.point, q, last.along, along)
+                    }
                 }
-                last = q
+                last = (q, p.isInSight, along)
             }
         }
-        guard renderer == nil else { return }
-        trailGlow.path = path
-        trailLine.path = path
+        guard !gpu else { return }
+        trailGlow.path = solid.path
+        trailLine.path = solid.path
+        hiddenTrailLine.path = xRay ? dashes : nil
     }
 
     private static func attributes(size: CGFloat, weight: UIFont.Weight, color: UIColor) -> [NSAttributedString.Key: Any] {

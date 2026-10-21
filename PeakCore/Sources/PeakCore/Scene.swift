@@ -76,6 +76,8 @@ public struct DrapedPoint: Sendable {
     public var elevation: Float
     /// Horizontal distance from the observer, meters.
     public var distance: Float
+    /// In sight, rather than behind nearer terrain.
+    public var isInSight = true
 }
 
 extension HorizonProfile {
@@ -91,10 +93,12 @@ extension HorizonProfile {
 extension HorizonRenderer {
     /// A trail laid on the terrain as seen from `observer`: the stretches in sight, as runs
     /// of points about `spacing` meters apart and `lift` meters above the ground. Stretches
-    /// hidden behind nearer terrain, outside the terrain or within `minDistance` of the
-    /// observer are left out.
+    /// hidden behind nearer terrain are left out, or with `includeHidden` kept and marked
+    /// not in sight, for seeing through the ridge. Stretches outside the terrain or within
+    /// `minDistance` of the observer are always left out.
     public func drape(_ lines: [[LatLon]], from observer: GeoPoint, horizon: HorizonProfile,
-                      spacing: Double = 15, lift: Double = 2, minDistance: Double = 30) -> [[DrapedPoint]] {
+                      spacing: Double = 15, lift: Double = 2, minDistance: Double = 30,
+                      includeHidden: Bool = false) -> [[DrapedPoint]] {
         let frame = LocalFrame(origin: observer)
         let here = LatLon(observer.latitude, observer.longitude)
         var runs: [[DrapedPoint]] = []
@@ -110,11 +114,13 @@ extension HorizonRenderer {
                 guard ground.isFinite, horizontal >= minDistance else { endRun(); continue }
                 let look = frame.look(at: GeoPoint(latitude: p.latitude, longitude: p.longitude, height: ground + lift),
                                       refraction: horizon.settings.refraction)
-                guard horizon.isInSight(azimuth: look.azimuth, elevation: look.elevation, distance: horizontal) else {
+                let inSight = horizon.isInSight(azimuth: look.azimuth, elevation: look.elevation, distance: horizontal)
+                guard inSight || includeHidden else {
                     endRun()
                     continue
                 }
-                run.append(DrapedPoint(azimuth: Float(look.azimuth), elevation: Float(look.elevation), distance: Float(horizontal)))
+                run.append(DrapedPoint(azimuth: Float(look.azimuth), elevation: Float(look.elevation),
+                                       distance: Float(horizontal), isInSight: inSight))
             }
             endRun()
         }

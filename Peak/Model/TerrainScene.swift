@@ -53,9 +53,10 @@ struct TerrainScene: @unchecked Sendable {
         return TerrainScene(observer: observer, terrain: terrain, horizon: horizon, segments: buckets, peaks: visible, allPeaks: all)
     }
 
-    /// The stretches of a trail in sight from here, laid on the terrain.
+    /// A trail laid on the terrain as seen from here, with the stretches behind nearer
+    /// ridges marked, so they can be hidden or seen through.
     func drape(_ trail: Trail) -> [[DrapedPoint]] {
-        HorizonRenderer(terrain: terrain).drape(trail.lines, from: observer, horizon: horizon)
+        HorizonRenderer(terrain: terrain).drape(trail.lines, from: observer, horizon: horizon, includeHidden: true)
     }
 
     var position: LatLon { LatLon(observer.latitude, observer.longitude) }

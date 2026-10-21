@@ -164,8 +164,8 @@ private struct AlignBanner: View {
     }
 }
 
-/// The trail drawn on the mountain: tap for its card, the map to see it from above, × to
-/// clear it.
+/// The trail drawn on the mountain: tap for its card, the cube to see it through the
+/// ridges in front of it, the map to see it from above, × to clear it.
 private struct TrailChip: View {
     let model: AppModel
     let trail: AppModel.ARTrail
@@ -178,11 +178,24 @@ private struct TrailChip: View {
                 Text(trail.trail.name)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
-                Text(trail.runs == nil ? "Laying it on the terrain…" : trail.runs!.isEmpty ? "Not in sight from here" : "Drawn where it's in sight")
+                Text(status)
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.7))
+                    .lineLimit(1)
             }
             Spacer(minLength: 4)
+            Button {
+                model.settings.trailXRay.toggle()
+            } label: {
+                Image(systemName: "cube.transparent")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(xRay ? .black : .white)
+                    .frame(width: 28, height: 28)
+                    .background(xRay ? AnyShapeStyle(Color(red: 1, green: 0.72, blue: 0.28)) : AnyShapeStyle(.white.opacity(0.15)),
+                                in: Circle())
+            }
+            .accessibilityLabel("See through the ridges")
+            .accessibilityValue(xRay ? "On" : "Off")
             Button {
                 model.showsFromAbove = true
             } label: {
@@ -211,5 +224,17 @@ private struct TrailChip: View {
         .environment(\.colorScheme, .dark)
         .contentShape(Capsule())
         .onTapGesture { model.select(trail.peakID) }
+    }
+
+    private var xRay: Bool { model.settings.trailXRay }
+
+    private var status: String {
+        guard trail.runs != nil else { return "Laying it on the terrain…" }
+        switch (trail.someInSight, trail.someHidden) {
+        case (true, true): return xRay ? "Dashed where ridges hide it" : "Drawn where it's in sight"
+        case (true, false): return "All of it in sight"
+        case (false, true): return xRay ? "Behind the ridges, seen through them" : "Hidden behind the ridges"
+        case (false, false): return "Not in sight from here"
+        }
     }
 }
