@@ -10,6 +10,9 @@ final class SkylineCorrector: @unchecked Sendable {
         var delta: Double
         var accepted: Bool
         var rms: Double
+        /// Why a frame was turned away (nil when accepted).
+        var reason: String?
+        var seconds: Double
     }
 
     /// Called on the main thread with each finished match.
@@ -45,6 +48,7 @@ final class SkylineCorrector: @unchecked Sendable {
         }
         busy = true
         lastStart = Date()
+        // The correction covers both the compass's north (magnetic or true) and its error.
         let correction = self.correction
         lock.unlock()
 
@@ -65,7 +69,8 @@ final class SkylineCorrector: @unchecked Sendable {
             var prior = frame.camera.attitude
             prior.heading = normalizedAzimuth(prior.heading + correction)
             let m = self.matcher.match(frame.image, intrinsics: frame.camera.intrinsics, prior: prior, horizon: horizon)
-            self.finish(Outcome(delta: m.alignment.headingCorrection, accepted: m.alignment.accepted, rms: m.alignment.rms))
+            self.finish(Outcome(delta: m.alignment.headingCorrection, accepted: m.alignment.accepted, rms: m.alignment.rms,
+                                reason: m.alignment.rejectionReason, seconds: m.seconds))
         }
     }
 

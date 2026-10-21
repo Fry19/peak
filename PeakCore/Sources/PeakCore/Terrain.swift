@@ -16,10 +16,20 @@ public final class ElevationTile: @unchecked Sendable {
     public let stepLongitude: Double
     let heights: UnsafeMutableBufferPointer<Int16>
 
-    public init(south: Int, west: Int, rows: Int, cols: Int,
-                originLatitude: Double, originLongitude: Double,
-                stepLatitude: Double, stepLongitude: Double, heights: [Int16]) {
+    public convenience init(south: Int, west: Int, rows: Int, cols: Int,
+                            originLatitude: Double, originLongitude: Double,
+                            stepLatitude: Double, stepLongitude: Double, heights: [Int16]) {
         precondition(heights.count == rows * cols, "expected \(rows * cols) heights, got \(heights.count)")
+        let buffer = UnsafeMutableBufferPointer<Int16>.allocate(capacity: heights.count)
+        _ = buffer.initialize(from: heights)
+        self.init(south: south, west: west, rows: rows, cols: cols, originLatitude: originLatitude,
+                  originLongitude: originLongitude, stepLatitude: stepLatitude, stepLongitude: stepLongitude,
+                  taking: buffer)
+    }
+
+    /// Takes ownership of `buffer`, which must hold rows × cols heights.
+    init(south: Int, west: Int, rows: Int, cols: Int, originLatitude: Double, originLongitude: Double,
+         stepLatitude: Double, stepLongitude: Double, taking buffer: UnsafeMutableBufferPointer<Int16>) {
         self.south = south
         self.west = west
         self.rows = rows
@@ -28,8 +38,7 @@ public final class ElevationTile: @unchecked Sendable {
         self.originLongitude = originLongitude
         self.stepLatitude = stepLatitude
         self.stepLongitude = stepLongitude
-        self.heights = .allocate(capacity: heights.count)
-        _ = self.heights.initialize(from: heights)
+        heights = buffer
     }
 
     /// A Copernicus-style 1° tile filled by `height(latitude, longitude)`, for tests.
@@ -71,18 +80,17 @@ public final class ElevationTile: @unchecked Sendable {
         guard data.count == Self.headerSize + rows * cols * 2 else {
             throw TerrainError.badFile(url.lastPathComponent, "size doesn't match \(rows)x\(cols)")
         }
-        var heights = [Int16](repeating: 0, count: rows * cols)
-        heights.withUnsafeMutableBytes { dst in
-            data.withUnsafeBytes { src in
-                dst.copyMemory(from: UnsafeRawBufferPointer(rebasing: src[Self.headerSize...]))
-            }
+        // Copy the heights straight from the mapped file into the tile's own memory.
+        let buffer = UnsafeMutableBufferPointer<Int16>.allocate(capacity: rows * cols)
+        data.withUnsafeBytes { src in
+            UnsafeMutableRawBufferPointer(buffer).copyMemory(from: UnsafeRawBufferPointer(rebasing: src[Self.headerSize...]))
         }
         #if _endian(big)
-        for i in heights.indices { heights[i] = Int16(littleEndian: heights[i]) }
+        for i in buffer.indices { buffer[i] = Int16(littleEndian: buffer[i]) }
         #endif
         self.init(south: Int(int32(8)), west: Int(int32(12)), rows: rows, cols: cols,
                   originLatitude: double(24), originLongitude: double(32),
-                  stepLatitude: double(40), stepLongitude: double(48), heights: heights)
+                  stepLatitude: double(40), stepLongitude: double(48), taking: buffer)
     }
 
     public func write(to url: URL) throws {

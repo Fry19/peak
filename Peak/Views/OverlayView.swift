@@ -1,102 +1,143 @@
 import PeakCore
 import SwiftUI
+import UIKit
 
-/// Thin glowing ridgelines, nearer ones brighter and farther ones fading like haze, and a
-/// few labels for the most prominent visible peaks. Redrawn every display frame from the
-/// phone's latest orientation, so the overlay moves with the picture.
-struct OverlayView: View {
+/// The ridgelines and labels over the camera picture.
+struct OverlayView: UIViewRepresentable {
     let model: AppModel
-    @State private var haptics = CenterHaptics()
-    @State private var smoothing = Smoothing()
 
-    var body: some View {
-        TimelineView(.animation) { timeline in
-            Canvas { context, size in
-                // Reading the frame time ties the drawing to every display frame.
-                let now = timeline.date
-                guard let scene = model.scene, let pose = model.frozen?.pose ?? model.motion.pose else { return }
-                let correction = model.frozen?.correction ?? smoothing.value(toward: model.correction.degrees, at: now)
-                let camera = Camera(intrinsics: model.camera.screenIntrinsics(for: size),
-                                    attitude: CameraGeometry.attitude(pose, correction: correction))
-                let projector = camera.projector
-                drawRidges(scene, projector, heading: camera.attitude.heading, in: &context)
-                let placed = drawLabels(scene, projector, heading: camera.attitude.heading, size: size, in: &context)
-                if model.frozen == nil { haptics.update(placed, centerX: size.width / 2, at: now) }
-            }
-        }
-        .allowsHitTesting(false)
+    func makeUIView(context: Context) -> OverlayCanvas {
+        let view = OverlayCanvas()
+        view.model = model
+        return view
     }
 
+    func updateUIView(_ view: OverlayCanvas, context: Context) {
+        view.model = model
+    }
+}
+
+/// Thin glowing ridgelines, nearer ones brighter and farther ones fading like haze, and a
+/// few labels for the most prominent visible peaks. A display link redraws it on every
+/// screen refresh from the phone's latest orientation, so the lines stay put on the
+/// mountains as the phone moves.
+final class OverlayCanvas: UIView {
+    weak var model: AppModel?
+    private var link: CADisplayLink?
+    private var smoothed: Double?
+    private var lastFrame = Date()
+    private var lastSide: [Int64: Bool] = [:]
+    private var lastTick = Date.distantPast
+    private let haptics = UISelectionFeedbackGenerator()
+
     /// Distance bands: (farthest distance in meters, opacity).
-    private static let bands: [(Float, Double)] = [(3_000, 0.95), (10_000, 0.75), (30_000, 0.55), (.infinity, 0.35)]
+    private static let bands: [(Float, CGFloat)] = [(3_000, 0.95), (10_000, 0.75), (30_000, 0.55), (.infinity, 0.35)]
+    private static let tint = UIColor(red: 0.86, green: 0.94, blue: 1.0, alpha: 1)
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isOpaque = false
+        backgroundColor = .clear
+        isUserInteractionEnabled = false
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        link?.invalidate()
+        link = nil
+        if window != nil {
+            // The display link holds its target strongly; it is invalidated when the view leaves.
+            let link = CADisplayLink(target: self, selector: #selector(frameTick))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+            link.add(to: .main, forMode: .common)
+            self.link = link
+        }
+    }
+
+    @objc private func frameTick() {
+        setNeedsDisplay()
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let model, let ctx = UIGraphicsGetCurrentContext(), let scene = model.scene else { return }
+        let frozen = model.frozen
+        guard let pose = frozen?.pose ?? model.motion.pose else { return }
+        let now = Date()
+        let correction = frozen?.heading ?? smoothedCorrection(model.headingCorrection, at: now)
+        let camera = Camera(intrinsics: model.camera.screenIntrinsics(for: bounds.size),
+                            attitude: CameraGeometry.attitude(pose, correction: correction))
+        let projector = camera.projector
+        drawRidges(scene, projector, heading: camera.attitude.heading, in: ctx)
+        let placed = drawLabels(scene, projector, heading: camera.attitude.heading)
+        if frozen == nil { tickIfCrossing(placed, at: now) }
+    }
+
+    /// Eases compass corrections in instead of jumping.
+    private func smoothedCorrection(_ target: Double, at now: Date) -> Double {
+        let dt = max(0, min(0.2, now.timeIntervalSince(lastFrame)))
+        lastFrame = now
+        guard let value = smoothed, abs(target - value) < 30 else {
+            smoothed = target
+            return target
+        }
+        let next = value + (target - value) * (1 - exp(-dt / 0.35))
+        smoothed = next
+        return next
+    }
 
     private func point(_ projector: Camera.Projector, _ azimuth: Double, _ elevation: Double) -> CGPoint? {
         projector.pixel(azimuth: azimuth, elevation: elevation).map { CGPoint(x: $0.x, y: $0.y) }
     }
 
-    private func drawRidges(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double,
-                            in context: inout GraphicsContext) {
-        var paths = [Path](repeating: Path(), count: Self.bands.count)
-        var skyline = Path()
+    private func drawRidges(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, in ctx: CGContext) {
+        let paths = Self.bands.map { _ in CGMutablePath() }
+        let skyline = CGMutablePath()
         let center = Int(heading.rounded())
         for offset in -70...70 {
             for s in scene.segments[(center + offset + 720) % 360] {
                 guard let a = point(projector, Double(s.azimuth0), Double(s.elevation0)),
                       let b = point(projector, Double(s.azimuth1), Double(s.elevation1)) else { continue }
-                if s.isSkyline {
-                    skyline.move(to: a)
-                    skyline.addLine(to: b)
-                } else {
-                    let band = Self.bands.firstIndex { s.distance < $0.0 } ?? Self.bands.count - 1
-                    paths[band].move(to: a)
-                    paths[band].addLine(to: b)
-                }
+                let path = s.isSkyline ? skyline : paths[Self.bands.firstIndex { s.distance < $0.0 } ?? Self.bands.count - 1]
+                path.move(to: a)
+                path.addLine(to: b)
             }
         }
-        let tint = Color(red: 0.86, green: 0.94, blue: 1.0)
-        // Glow underneath, then the thin line.
-        context.drawLayer { glow in
-            glow.addFilter(.blur(radius: 4))
-            glow.stroke(skyline, with: .color(tint.opacity(0.55)), lineWidth: 5)
-            for (i, path) in paths.enumerated() {
-                glow.stroke(path, with: .color(tint.opacity(Self.bands[i].1 * 0.35)), lineWidth: 4)
-            }
-        }
-        context.stroke(skyline, with: .color(.white.opacity(0.95)), style: StrokeStyle(lineWidth: 1.4, lineCap: .round))
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        // A wide faint stroke under each line for the glow (cheaper than a blurred shadow),
+        // ridges first and the skyline on top.
         for (i, path) in paths.enumerated() {
-            context.stroke(path, with: .color(tint.opacity(Self.bands[i].1)), style: StrokeStyle(lineWidth: 1, lineCap: .round))
+            let alpha = Self.bands[i].1
+            stroke(path, in: ctx, color: Self.tint.withAlphaComponent(alpha * 0.18), width: 4)
+            stroke(path, in: ctx, color: Self.tint.withAlphaComponent(alpha), width: 1)
         }
+        stroke(skyline, in: ctx, color: Self.tint.withAlphaComponent(0.3), width: 5)
+        stroke(skyline, in: ctx, color: UIColor.white.withAlphaComponent(0.95), width: 1.4)
     }
 
-    /// Labels the biggest visible peaks first, skipping any that would crowd a placed label.
-    private func drawLabels(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, size: CGSize,
-                            in context: inout GraphicsContext) -> [(Int64, CGFloat)] {
-        let maxLabels = 10
-        var placed: [(id: Int64, point: CGPoint)] = []
-        let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 12, dy: 60)
-        for v in scene.peaks where placed.count < maxLabels {
-            guard abs(azimuthDifference(v.azimuth, heading)) < 70,
-                  let p = point(projector, v.azimuth, v.elevation), bounds.contains(p),
-                  placed.allSatisfy({ abs($0.point.x - p.x) > 84 || abs($0.point.y - p.y) > 70 }) else { continue }
-            placed.append((v.peak.id, p))
-
-            let top = CGPoint(x: p.x, y: p.y - 34)
-            var leader = Path()
-            leader.move(to: CGPoint(x: p.x, y: p.y - 5))
-            leader.addLine(to: top)
-            context.stroke(leader, with: .color(.white.opacity(0.7)), lineWidth: 1)
-            context.fill(Path(ellipseIn: CGRect(x: p.x - 2.5, y: p.y - 2.5, width: 5, height: 5)), with: .color(.white))
-
-            var text = context
-            text.addFilter(.shadow(color: .black.opacity(0.6), radius: 3))
-            text.draw(Text(v.peak.name).font(.system(size: 15, weight: .semibold)).foregroundColor(.white),
-                      at: CGPoint(x: top.x, y: top.y - 16), anchor: .bottom)
-            text.draw(Text(Self.elevation(v.peak.elevation)).font(.system(size: 12, weight: .regular))
-                        .foregroundColor(.white.opacity(0.75)),
-                      at: CGPoint(x: top.x, y: top.y - 2), anchor: .bottom)
-        }
-        return placed.map { ($0.id, $0.point.x) }
+    private func stroke(_ path: CGPath, in ctx: CGContext, color: UIColor, width: CGFloat) {
+        ctx.setStrokeColor(color.cgColor)
+        ctx.setLineWidth(width)
+        ctx.addPath(path)
+        ctx.strokePath()
     }
+
+    private static let nameAttributes: [NSAttributedString.Key: Any] = {
+        let shadow = NSShadow()
+        shadow.shadowColor = UIColor.black.withAlphaComponent(0.6)
+        shadow.shadowBlurRadius = 3
+        return [.font: UIFont.systemFont(ofSize: 15, weight: .semibold), .foregroundColor: UIColor.white, .shadow: shadow]
+    }()
+
+    private static let heightAttributes: [NSAttributedString.Key: Any] = {
+        let shadow = NSShadow()
+        shadow.shadowColor = UIColor.black.withAlphaComponent(0.6)
+        shadow.shadowBlurRadius = 3
+        return [.font: UIFont.systemFont(ofSize: 12), .foregroundColor: UIColor.white.withAlphaComponent(0.75), .shadow: shadow]
+    }()
 
     private static let formatter: NumberFormatter = {
         let f = NumberFormatter()
@@ -105,37 +146,40 @@ struct OverlayView: View {
         return f
     }()
 
-    private static func elevation(_ meters: Double) -> String {
-        (formatter.string(from: NSNumber(value: meters.rounded())) ?? "\(Int(meters))") + " m"
-    }
-}
+    /// Labels the biggest visible peaks first, skipping any that would crowd a placed label.
+    private func drawLabels(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double) -> [(Int64, CGFloat)] {
+        let maxLabels = 10
+        var placed: [(id: Int64, point: CGPoint)] = []
+        let area = bounds.insetBy(dx: 12, dy: 60)
+        for v in scene.peaks where placed.count < maxLabels {
+            guard abs(azimuthDifference(v.azimuth, heading)) < 70,
+                  let p = point(projector, v.azimuth, v.elevation), area.contains(p),
+                  placed.allSatisfy({ abs($0.point.x - p.x) > 84 || abs($0.point.y - p.y) > 70 }) else { continue }
+            placed.append((v.peak.id, p))
 
-/// Eases the compass correction toward each new value instead of jumping.
-final class Smoothing {
-    private var current: Double?
-    private var last = Date()
+            let leader = UIBezierPath()
+            leader.move(to: CGPoint(x: p.x, y: p.y - 5))
+            leader.addLine(to: CGPoint(x: p.x, y: p.y - 34))
+            UIColor.white.withAlphaComponent(0.7).setStroke()
+            leader.lineWidth = 1
+            leader.stroke()
+            UIColor.white.setFill()
+            UIBezierPath(ovalIn: CGRect(x: p.x - 2.5, y: p.y - 2.5, width: 5, height: 5)).fill()
 
-    func value(toward target: Double, at now: Date) -> Double {
-        guard let value = current else {
-            current = target
-            last = now
-            return target
+            let name = NSAttributedString(string: v.peak.name, attributes: Self.nameAttributes)
+            let height = NSAttributedString(
+                string: (Self.formatter.string(from: NSNumber(value: v.peak.elevation.rounded())) ?? "\(Int(v.peak.elevation))") + " m",
+                attributes: Self.heightAttributes)
+            let nameSize = name.size(), heightSize = height.size()
+            height.draw(at: CGPoint(x: p.x - heightSize.width / 2, y: p.y - 36 - heightSize.height))
+            name.draw(at: CGPoint(x: p.x - nameSize.width / 2, y: p.y - 36 - heightSize.height - nameSize.height + 2))
         }
-        let dt = max(0, min(0.2, now.timeIntervalSince(last)))
-        last = now
-        let next = value + (target - value) * (1 - exp(-dt / 0.35))
-        current = next
-        return next
+        return placed.map { ($0.id, $0.point.x) }
     }
-}
 
-/// A light tick when a labeled peak crosses the middle of the screen.
-final class CenterHaptics {
-    private var lastSide: [Int64: Bool] = [:]
-    private var lastTick = Date.distantPast
-    private let generator = UISelectionFeedbackGenerator()
-
-    func update(_ labels: [(Int64, CGFloat)], centerX: CGFloat, at now: Date) {
+    /// A light tick when a labeled peak crosses the middle of the screen.
+    private func tickIfCrossing(_ labels: [(Int64, CGFloat)], at now: Date) {
+        let centerX = bounds.midX
         var sides: [Int64: Bool] = [:]
         var crossed = false
         for (id, x) in labels {
@@ -145,7 +189,7 @@ final class CenterHaptics {
         }
         lastSide = sides
         if crossed, now.timeIntervalSince(lastTick) > 0.15 {
-            generator.selectionChanged()
+            haptics.selectionChanged()
             lastTick = now
         }
     }
