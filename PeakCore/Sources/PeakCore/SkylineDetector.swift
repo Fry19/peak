@@ -39,14 +39,19 @@ public struct SkylineDetector: Sendable {
 
     public init() {}
 
-    public func detect(in image: RGBImage) -> Skyline {
+    /// Finds the skyline. `band`, when given, holds for each column the boundary rows the
+    /// skyline may be at (row r: the rows above r are sky): where the terrain's skyline can
+    /// appear. Sky seen past things above it (eaves, blinds, a porch roof) then can't pull
+    /// the skyline up to them, and the sky is learned from what's just above the band.
+    public func detect(in image: RGBImage, band: [ClosedRange<Int>]? = nil) -> Skyline {
         let w = image.width, h = image.height
         let f = Features(image)
+        let band = band.flatMap { $0.count == w ? $0.map { max(0, min(h, $0.lowerBound))...max(0, min(h, $0.upperBound)) } : nil }
 
         // First guess: the first strong edge down each column, smoothed across columns.
-        var boundary = firstStrongEdges(f)
+        var boundary = firstStrongEdges(f, band: band)
         var llr = [Float](repeating: 0, count: w * h)
-        var sky = SkyModel(f, boundary: boundary)
+        var sky = SkyModel(f, boundary: boundary, band: band)
         var ground = ColorModel.fit(f, components: 3) { x, y in y >= boundary[x] + max(2, h / 60) }
 
         for iteration in 0..<iterations {
@@ -57,10 +62,10 @@ public struct SkylineDetector: Sendable {
                     llr[i] = max(-4, min(4, v))
                 }
             }
-            boundary = bestPath(llr: llr, edges: f.edges, width: w, height: h)
+            boundary = bestPath(llr: llr, edges: f.edges, width: w, height: h, band: band)
             if iteration + 1 < iterations {
                 let b = boundary
-                sky = SkyModel(f, boundary: b)
+                sky = SkyModel(f, boundary: b, band: band)
                 ground = ColorModel.fit(f, components: 3) { x, y in y >= b[x] + max(2, h / 60) }
             }
         }
@@ -68,7 +73,7 @@ public struct SkylineDetector: Sendable {
         // Sub-pixel edge position and per-column trust.
         var rows = [Float](repeating: .nan, count: w)
         var strength = [Float](repeating: 0, count: w)
-        let band = max(3, h / 40)
+        let rim = max(3, h / 40)
         for x in 0..<w {
             let r = boundary[x]
             guard r > 1, r < h - 1 else { continue }
@@ -84,19 +89,22 @@ public struct SkylineDetector: Sendable {
             let offset = denom < 0 ? max(-0.5, min(0.5, 0.5 * (e0 - e2) / denom)) : 0
             // The evidence just above should look like sky and just below like terrain.
             // Sky is also smooth: real sky has little texture right above the skyline.
-            // And it is blue or neutral gray, never brown or green.
-            var above: Float = 0, below: Float = 0, texture: Float = 0, warmth: Float = 0
-            for k in 1...band {
+            // And it is blue or neutral gray, never brown or green, except low sun turns it
+            // orange near the horizon, where it stays bright and smooth.
+            var above: Float = 0, below: Float = 0, texture: Float = 0, warmth: Float = 0, light: Float = 0
+            for k in 1...rim {
                 let yAbove = max(0, r - k - 1)
                 above += llr[yAbove * w + x]
                 below += llr[min(h - 1, r + k - 1) * w + x]
                 let i = 4 * (yAbove * w + x)
                 texture += f.values[i + 3]
                 warmth += max(f.values[i], f.values[i + 1]) - f.values[i + 2]
+                light += (f.values[i] + f.values[i + 1] + f.values[i + 2]) / 3
             }
-            let n = Float(band)
+            let n = Float(rim)
+            let skyColored = warmth / n < 0.04 || light / n > 0.6
             strength[x] = f.edges[bestY * w + x]
-            if strength[x] >= minStrength, above > 0, below < 0, texture / n < maxSkyTexture, warmth / n < 0.04 {
+            if strength[x] >= minStrength, above > 0, below < 0, texture / n < maxSkyTexture, skyColored {
                 rows[x] = Float(bestY) + offset
             }
         }
@@ -105,11 +113,14 @@ public struct SkylineDetector: Sendable {
 
     /// For each column, the first row from the top with a clear color step, median-filtered
     /// across columns so that stray edges (birds, cloud wisps) don't matter.
-    func firstStrongEdges(_ f: Features) -> [Int] {
+    func firstStrongEdges(_ f: Features, band: [ClosedRange<Int>]? = nil) -> [Int] {
         let w = f.width, h = f.height
         var first = [Int](repeating: h * 2 / 3, count: w)
         for x in 0..<w {
-            for y in 3..<(h - 3) where f.edges[y * w + x] >= 0.25 {
+            let low = max(3, band?[x].lowerBound ?? 3), high = min(h - 4, band?[x].upperBound ?? h - 4)
+            if let band { first[x] = (band[x].lowerBound + band[x].upperBound) / 2 }
+            guard low <= high else { continue }
+            for y in low...high where f.edges[y * w + x] >= 0.25 {
                 first[x] = y
                 break
             }
@@ -123,7 +134,7 @@ public struct SkylineDetector: Sendable {
 
     /// Boundary row for every column maximizing sky-above/terrain-below evidence plus edge
     /// strength, minus a smoothness cost. Row r means rows 0..<r are sky.
-    func bestPath(llr: [Float], edges: [Float], width w: Int, height h: Int) -> [Int] {
+    func bestPath(llr: [Float], edges: [Float], width w: Int, height h: Int, band: [ClosedRange<Int>]? = nil) -> [Int] {
         let n = h + 1
         var score = [Float](repeating: 0, count: n)
         var prev = [Float](repeating: 0, count: n)
@@ -141,6 +152,9 @@ public struct SkylineDetector: Sendable {
                 let edge = r > 0 && r < h ? edges[r * w + x] : 0
                 score[r] = 2 * above - total + edgeWeight * edge
                 if r < h { above += llr[r * w + x] }
+            }
+            if let band {
+                for r in 0...h where !band[x].contains(r) { score[r] = -1e9 }
             }
             if x == 0 {
                 prev = score
@@ -285,16 +299,29 @@ struct SkyModel {
     var logNorm: Float = 0
     var clouds: ColorModel
 
-    init(_ f: Features, boundary: [Int]) {
+    /// Learned from the pixels above `boundary`; with a `band`, only from those within it
+    /// (when there are enough), the sky right above where the skyline can be.
+    init(_ f: Features, boundary: [Int], band: [ClosedRange<Int>]? = nil) {
         let w = f.width, h = f.height
         let margin = max(2, h / 60)
-        clouds = ColorModel.fit(f, components: 2) { x, y in y < boundary[x] - margin }
+        let stride = max(1, Int((Double(w * h) / 30_000).squareRoot()))
+        func isSky(_ x: Int, _ y: Int, inBand: Bool) -> Bool {
+            y < boundary[x] - margin && (!inBand || y >= band![x].lowerBound)
+        }
+        var inBand = false
+        if let band {
+            var n = 0
+            for y in Swift.stride(from: 0, to: h, by: stride) {
+                for x in Swift.stride(from: 0, to: w, by: stride) where y < boundary[x] - margin && y >= band[x].lowerBound { n += 1 }
+            }
+            inBand = n >= 200
+        }
+        clouds = ColorModel.fit(f, components: 2) { x, y in isSky(x, y, inBand: inBand) }
 
         var rows: [[Double]] = []
         var values: [SIMD4<Float>] = []
-        let stride = max(1, Int((Double(w * h) / 30_000).squareRoot()))
         for y in Swift.stride(from: 0, to: h, by: stride) {
-            for x in Swift.stride(from: 0, to: w, by: stride) where y < boundary[x] - margin {
+            for x in Swift.stride(from: 0, to: w, by: stride) where isSky(x, y, inBand: inBand) {
                 let i = 4 * (y * w + x)
                 rows.append(Self.basis(x, y, w, h))
                 values.append(SIMD4(f.values[i], f.values[i + 1], f.values[i + 2], f.values[i + 3]))

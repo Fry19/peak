@@ -7,6 +7,8 @@ public struct SkylineMatcher: Sendable {
     public var settings = AlignmentSettings()
     /// Width the image is scaled to before detection.
     public var workingWidth = 960
+    /// Look for the skyline only where the terrain's skyline can appear (see `searchBand`).
+    public var usesSearchBand = true
 
     public init() {}
 
@@ -27,8 +29,35 @@ public struct SkylineMatcher: Sendable {
         let small = image.width > workingWidth ? image.resized(toWidth: workingWidth) : image
         let k = intrinsics.scaled(toWidth: small.width, height: small.height)
         let camera = Camera(intrinsics: k, attitude: prior)
-        let skyline = detector.detect(in: small)
+        let band = usesSearchBand ? Self.searchBand(camera: camera, horizon: horizon, settings: settings) : nil
+        let skyline = detector.detect(in: small, band: band)
         let alignment = SkylineAligner.align(skyline, camera: camera, horizon: horizon, settings: settings)
         return Match(image: small, skyline: skyline, camera: camera, alignment: alignment, seconds: Date().timeIntervalSince(start))
+    }
+
+    /// For each column of the camera's image, the rows where the terrain's skyline can be:
+    /// wherever the rendered horizon lands with the heading anywhere in the aligner's search
+    /// and the pitch and roll off by as much as it allows, plus a little. Nothing above that
+    /// (eaves, blinds, a porch roof with sky past it) can be the skyline it matches against.
+    public static func searchBand(camera: Camera, horizon: HorizonProfile, settings: AlignmentSettings) -> [ClosedRange<Int>] {
+        let k = camera.intrinsics
+        let projector = camera.projector
+        let pitchPixels = tan(settings.pitchRange * .pi / 180) * k.fy
+        return (0..<k.width).map { x in
+            let px = Double(x) + 0.5
+            let center = projector.look(x: px, y: k.cy)
+            var low = Double.infinity, high = -Double.infinity
+            for step in -Int(settings.headingRange * 2)...Int(settings.headingRange * 2) {
+                let e = horizon.elevation(atAzimuth: center.azimuth + Double(step) / 2)
+                low = min(low, e)
+                high = max(high, e)
+            }
+            guard let top = projector.pixel(azimuth: center.azimuth, elevation: high),
+                  let bottom = projector.pixel(azimuth: center.azimuth, elevation: low) else { return 0...k.height }
+            let margin = pitchPixels + abs(px - k.cx) * tan(settings.rollRange * .pi / 180) + Double(k.height) / 60
+            let a = max(0, min(k.height, Int((min(top.y, bottom.y) - margin).rounded(.down))))
+            let b = max(a, min(k.height, Int((max(top.y, bottom.y) + margin).rounded(.up))))
+            return a...b
+        }
     }
 }

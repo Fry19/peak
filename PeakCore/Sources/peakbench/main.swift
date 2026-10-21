@@ -12,7 +12,7 @@ peakbench: desk test harness for skyline matching.
                   [--seed S] --out NAME
       Render a synthetic photo (NAME.ppm, or NAME.png on a Mac) and its case file NAME.json.
 
-  peakbench align CASE.json [--dem DIR] [--debug FILE]
+  peakbench align CASE.json [--dem DIR] [--debug FILE] [--curve] [--points FILE.csv]
       Find the skyline in a photo, align it to the terrain and report the heading error
       before and after correction.
 
@@ -258,6 +258,28 @@ func alignCommand(_ args: Arguments) throws {
     let prior = Attitude(heading: photo.heading, pitch: photo.pitch ?? 0, roll: photo.roll ?? 0)
     let match = matcher.match(image, intrinsics: intrinsics, prior: prior, horizon: horizon)
     report(match, truth: photo.truth)
+    if let path = args.string("points") {
+        // Each detected skyline point where the sensors put it, beside the rendered horizon.
+        let projector = match.camera.projector
+        var csv = "x,y,azimuth,elevation,horizon,distance\n"
+        for p in match.skyline.points {
+            let d = projector.look(x: p.x, y: p.y)
+            let ray = Int((normalizedAzimuth(d.azimuth) / horizon.azimuthStep).rounded()) % horizon.count
+            csv += String(format: "%.1f,%.1f,%.3f,%.3f,%.3f,%.0f\n", p.x, p.y, d.azimuth, d.elevation,
+                          horizon.elevation(atAzimuth: d.azimuth), Double(horizon.distances[ray]))
+        }
+        try csv.write(toFile: path, atomically: true, encoding: .utf8)
+        print("Wrote \(path)")
+    }
+    if args.string("curve") != nil {
+        // The coarse search's cost for each heading correction, at 1° steps, lowest marked.
+        let curve = match.alignment.headingCurve
+        let best = curve.min { $0.cost < $1.cost }?.correction ?? 0
+        for c in curve where Int((c.correction * 10).rounded()) % 10 == 0 {
+            print(String(format: "%+6.1f°  %.3f %@", c.correction, c.cost, String(repeating: "#", count: Int(c.cost * 40)))
+                  + (abs(c.correction - best) < 0.5 ? "  <" : ""))
+        }
+    }
 
     if let path = args.string("debug") {
         try saveImage(debugOverlay(match, horizon: horizon), to: path)
