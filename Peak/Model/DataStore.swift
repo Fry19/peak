@@ -5,10 +5,10 @@ import PeakCore
 /// visited once works offline afterwards.
 ///
 /// Copernicus tiles are cloud-optimized GeoTIFFs with built-in lower-resolution copies, so
-/// a tile can be fetched at 120 m (about 2 MB), 60 m (8 MB) or the full 30 m (31 MB) with
-/// one range request, instead of downloading the whole 40 MB file.
+/// a tile can be fetched at 240 m (about 0.6 MB), 120 m (2 MB), 60 m (8 MB) or the full
+/// 30 m (31 MB) with one range request, instead of downloading the whole 40 MB file.
 actor DataStore {
-    /// Pixel size: 0 is the full 30 m, 1 is 60 m, 2 is 120 m.
+    /// Pixel size: 0 is the full 30 m, 1 is 60 m, 2 is 120 m, 3 is 240 m.
     typealias Level = Int
 
     struct Key: Hashable, Sendable {
@@ -70,8 +70,11 @@ actor DataStore {
 
     /// The finest level of a tile already on the phone, or nil if none is.
     func cachedLevel(_ key: Key) -> Level? {
-        (0...2).first { FileManager.default.fileExists(atPath: tileURL(key, $0).path) }
+        (0...3).first { FileManager.default.fileExists(atPath: tileURL(key, $0).path) }
     }
+
+    /// Bytes downloaded so far, for showing progress.
+    private(set) var bytesDownloaded = 0
 
     func isSea(_ key: Key) -> Bool {
         FileManager.default.fileExists(atPath: seaURL(key).path)
@@ -142,6 +145,7 @@ actor DataStore {
         request.timeoutInterval = 60
         if let range { request.setValue("bytes=\(range.lowerBound)-\(range.upperBound - 1)", forHTTPHeaderField: "Range") }
         let (data, response) = try await URLSession.shared.data(for: request)
+        bytesDownloaded += data.count
         return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
     }
 
@@ -164,7 +168,7 @@ actor DataStore {
         var request = URLRequest(url: Overpass.endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = 60
-        request.setValue("Peak/0.2 (iPhone app; github.com/Fry19/peak)", forHTTPHeaderField: "User-Agent")
+        request.setValue("Peak/0.3 (iPhone app; github.com/Fry19/peak)", forHTTPHeaderField: "User-Agent")
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         let query = Overpass.peaksQuery(south: cellLat - dlat, west: cellLon - dlon, north: cellLat + dlat, east: cellLon + dlon)
         request.httpBody = Data(("data=" + (query.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")).utf8)

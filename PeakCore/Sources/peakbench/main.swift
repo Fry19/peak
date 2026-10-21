@@ -357,6 +357,34 @@ func geotiffCommand(_ args: Arguments) throws {
     }
 }
 
+// MARK: - scene
+
+/// Times what the app does to build its view from a point: the horizon, the ridgelines and
+/// line of sight to every peak (made-up peaks on the real terrain when none are given).
+func sceneCommand(_ args: Arguments) throws {
+    let terrain = try loadTerrain(args.string("dem"))
+    let renderer = HorizonRenderer(terrain: terrain)
+    let lat = try args.required("lat"), lon = try args.required("lon")
+    let count = args.int("peaks") ?? 3000
+    var rng = SplitMix64(seed: 9)
+    var peaks: [Peak] = []
+    for i in 0..<count {
+        let p = destination(from: GeoPoint(latitude: lat, longitude: lon), azimuth: 360 * rng.uniform(),
+                            distance: 80_000 * rng.uniform().squareRoot())
+        let h = terrain.height(latitude: p.latitude, longitude: p.longitude)
+        if h.isFinite { peaks.append(Peak(id: Int64(i), name: "P\(i)", latitude: p.latitude, longitude: p.longitude, elevation: h + 5)) }
+    }
+    var settings = HorizonSettings()
+    settings.maxDistance = args.double("radius-km").map { $0 * 1000 } ?? 80_000
+    let observer = renderer.observer(latitude: lat, longitude: lon)
+    let horizon = timed("Horizon") { renderer.render(from: observer, settings: settings) }
+    let segments = timed("Ridge segments") { horizon.ridgeSegments() }
+    let visible = timed("Line of sight for \(peaks.count) peaks") {
+        renderer.visiblePeaks(peaks, from: observer, maxDistance: settings.maxDistance, settings: settings)
+    }
+    print("\(segments.count) segments, \(visible.count) of \(peaks.count) peaks visible")
+}
+
 // MARK: - bench
 
 struct BenchRun {
@@ -481,6 +509,7 @@ do {
     case "bench": try benchCommand(args)
     case "detect": try detectCommand(args)
     case "geotiff": try geotiffCommand(args)
+    case "scene": try sceneCommand(args)
     case "case": try caseCommand(args)
     case "help", "-h", "--help": print(usage)
     default:
