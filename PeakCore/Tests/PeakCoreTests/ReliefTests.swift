@@ -16,7 +16,7 @@ final class ReliefTests: XCTestCase {
     private let center = LatLon(46, 8)
 
     private func length(_ line: CrestLine) -> Double {
-        zip(line.points, line.points.dropFirst()).reduce(0) { $0 + (($1.1 - $1.0) * ($1.1 - $1.0)).sum().squareRoot() }
+        line.length
     }
 
     func testProjectionRoundTrip() {

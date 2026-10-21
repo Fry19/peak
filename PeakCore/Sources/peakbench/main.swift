@@ -671,9 +671,7 @@ func reliefCommand(_ args: Arguments) throws {
           "\(crests.reduce(0) { $0 + $1.points.count }) points")
     for (k, band) in bands.enumerated() {
         let inBand = crests.filter { $0.relief >= band.0 && (k == 0 || $0.relief < bands[k - 1].0) }
-        let km = inBand.reduce(0.0) { sum, line in
-            sum + zip(line.points, line.points.dropFirst()).reduce(0) { $0 + (($1.1 - $1.0) * ($1.1 - $1.0)).sum().squareRoot() }
-        } / 1000
+        let km = inBand.reduce(0.0) { $0 + $1.length } / 1000
         print("  \(band.1) (relief over \(Int(band.0)) m): \(inBand.count) lines, \(f(km, 1)) km")
     }
     guard let path = args.string("image") else { return }

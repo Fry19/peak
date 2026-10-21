@@ -61,6 +61,16 @@ public struct CrestLine: Sendable {
     public var relief: Double
     /// Mean height of the crest, meters.
     public var height: Double
+
+    /// Length along the line, meters.
+    public var length: Double {
+        var total = 0.0
+        for i in points.indices.dropFirst() {
+            let d = points[i] - points[i - 1]
+            total += (d.x * d.x + d.y * d.y).squareRoot()
+        }
+        return total
+    }
 }
 
 /// Terrain seen from straight above, north up, sampled on a square grid in meters: its
