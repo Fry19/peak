@@ -26,6 +26,8 @@ struct TerrainScene: @unchecked Sendable {
     let allPeaks: [Int64: PeakView]
 
     static func build(terrain: Terrain, latitude: Double, longitude: Double, peaks: [Peak]) -> TerrainScene {
+        // Give blunted summits their real tips before drawing skylines from them.
+        terrain.raiseSummits(peaks)
         let renderer = HorizonRenderer(terrain: terrain)
         let observer = renderer.observer(latitude: latitude, longitude: longitude)
         var settings = HorizonSettings()

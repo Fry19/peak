@@ -55,6 +55,28 @@ final class TerrainTests: XCTestCase {
         XCTAssertTrue(alone.height(latitude: 45.2, longitude: 7.2).isNaN)
     }
 
+    /// A blunt top (a cone cut off 150 m below its tip) gets its tip back from the peak's
+    /// elevation, without changing the terrain further out.
+    func testRaiseSummitsRestoresBluntTips() {
+        let summit = (lat: 45.5, lon: 7.5)
+        func blunt(_ lat: Double, _ lon: Double) -> Double {
+            let dy = (lat - summit.lat) * 111_320, dx = (lon - summit.lon) * 111_320 * cos(summit.lat * .pi / 180)
+            return min(2_850, 3_000 - (dx * dx + dy * dy).squareRoot())   // 45° slopes, top cut at 2850 m
+        }
+        let terrain = Terrain(tiles: [ElevationTile(south: 45, west: 7, size: 3600, height: blunt)])
+        let far = terrain.height(latitude: summit.lat + 0.004, longitude: summit.lon)
+        XCTAssertEqual(terrain.height(latitude: summit.lat, longitude: summit.lon), 2_850, accuracy: 1)
+        let peaks = [Peak(id: 1, name: "Tip", latitude: summit.lat, longitude: summit.lon, elevation: 3_000),
+                     Peak(id: 2, name: "Already right", latitude: 45.2, longitude: 7.2, elevation: blunt(45.2, 7.2) + 3),
+                     Peak(id: 3, name: "Wrong height", latitude: 45.8, longitude: 7.8, elevation: 9_000)]
+        XCTAssertEqual(terrain.raiseSummits(peaks), 1)
+        XCTAssertEqual(terrain.height(latitude: summit.lat, longitude: summit.lon), 3_000, accuracy: 1)
+        // Halfway down the restored tip: 75 m below it, 75 m out.
+        XCTAssertEqual(terrain.height(latitude: summit.lat + 75 / 111_320, longitude: summit.lon), 2_925, accuracy: 6)
+        XCTAssertEqual(terrain.height(latitude: summit.lat + 0.004, longitude: summit.lon), far, "unchanged 450 m away")
+        XCTAssertEqual(terrain.raiseSummits(peaks), 0, "raising again changes nothing")
+    }
+
     func testPkdemRoundTrip() throws {
         let tile = ElevationTile(south: 46, west: 7, size: 90) { lat, lon in 100 * lat + 10 * lon }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("test-\(UUID()).pkdem")

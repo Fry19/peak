@@ -1,7 +1,7 @@
 import Foundation
 
 /// A named summit from OpenStreetMap (`natural=peak`).
-public struct Peak: Codable, Sendable, Hashable {
+public struct Peak: Codable, Sendable, Hashable, Identifiable {
     public var id: Int64
     public var name: String
     public var latitude: Double

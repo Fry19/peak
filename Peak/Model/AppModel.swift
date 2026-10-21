@@ -4,8 +4,6 @@ import Observation
 import PeakCore
 import SwiftUI
 
-extension Peak: Identifiable {}
-
 @Observable
 final class AppModel {
     enum Phase: Equatable {
@@ -95,6 +93,7 @@ final class AppModel {
     @ObservationIgnored weak var screen: CameraScreenView?
     let store = DataStore()
     private let corrector = SkylineCorrector()
+    private let mailbox = FrameMailbox()
     private let locationManager = CLLocationManager()
     private let locationDelegate = LocationDelegate()
     private let network = NWPathMonitor()
@@ -167,7 +166,7 @@ final class AppModel {
             if let pose = self.motion.pose(at: frame.time) {
                 self.corrector.offer(frame, pose: pose, steady: self.motion.isSteady)
             }
-            DispatchQueue.main.async { self.screen?.show(frame) }
+            self.mailbox.post(frame) { [weak self] in self?.screen?.show($0) }
         }
         corrector.onResult = { [weak self] outcome in
             guard let self else { return }
@@ -557,6 +556,31 @@ final class PeakDetails {
             } catch {
                 hikesState = .failed("Couldn't load hikes. Check your connection.")
             }
+        }
+    }
+}
+
+/// Hands camera frames to the main thread, keeping only the newest when it falls behind,
+/// so frames don't pile up (each holds one of the camera's few buffers).
+private final class FrameMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frame: CameraFeed.Frame?
+    private var scheduled = false
+
+    func post(_ frame: CameraFeed.Frame, deliver: @escaping (CameraFeed.Frame) -> Void) {
+        lock.lock()
+        self.frame = frame
+        let schedule = !scheduled
+        scheduled = true
+        lock.unlock()
+        guard schedule else { return }
+        DispatchQueue.main.async {
+            self.lock.lock()
+            let next = self.frame
+            self.frame = nil
+            self.scheduled = false
+            self.lock.unlock()
+            if let next { deliver(next) }
         }
     }
 }

@@ -39,6 +39,7 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
     private(set) var portraitFrames = false
     private(set) var measuresLens = false
     private var lastLens: Lens?
+    private var device: AVCaptureDevice?
     /// Called on the camera queue for every frame. Must return quickly.
     var onFrame: ((Frame) -> Void)?
 
@@ -80,6 +81,7 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else { return }
         session.addInput(input)
+        self.device = device
 
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
@@ -115,12 +117,13 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
             if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
             device.unlockForConfiguration()
         }
-        formatFieldOfView = Double(device.activeFormat.videoFieldOfView)
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let width = CVPixelBufferGetWidth(pixels), height = CVPixelBufferGetHeight(pixels)
+        // The format the preset picked, known once the session runs.
+        if let device { formatFieldOfView = Double(device.activeFormat.videoFieldOfView) }
         let lens = Self.lens(for: sampleBuffer, width: width, height: height, fallbackFOV: formatFieldOfView)
         lock.lock()
         lastLens = lens

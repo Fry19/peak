@@ -289,3 +289,69 @@ public final class Terrain: @unchecked Sendable {
         return Double(other.value(row: max(0, min(other.rows - 1, r)), col: max(0, min(other.cols - 1, c))))
     }
 }
+
+extension Terrain {
+    /// The finest tile or patch with data at a point.
+    func finestTile(latitude: Double, longitude: Double) -> ElevationTile? {
+        let south = Int(latitude.rounded(.up)) - 1, west = Int(longitude.rounded(.down))
+        let li = south - minSouth, wi = west - minWest
+        guard li >= 0, li < latCount, wi >= 0, wi < lonCount else { return nil }
+        let cell = li * lonCount + wi
+        for k in patchStart[cell]..<patchStart[cell + 1] where patches[k].interiorHeight(latitude, longitude) != nil {
+            return patches[k]
+        }
+        return grid[cell]
+    }
+
+    /// A 30 m terrain model blunts sharp summits: the Matterhorn's top is 148 m short. Raises
+    /// the terrain around each peak to a cone reaching the peak's surveyed elevation, so
+    /// skylines and ridgelines have their real tips. The cone is about as steep as a sharp
+    /// summit (45°) and only ever raises the terrain, so doing this twice changes nothing.
+    /// Peaks where the terrain already comes within `minDeficit` meters of the elevation,
+    /// or falls short by more than `maxDeficit` (likely a wrong elevation), are left alone.
+    /// Returns how many summits were raised.
+    @discardableResult
+    public func raiseSummits(_ peaks: [Peak], radius: Double = 250, minDeficit: Double = 8, maxDeficit: Double = 300) -> Int {
+        var raised = 0
+        for peak in peaks {
+            guard let tile = finestTile(latitude: peak.latitude, longitude: peak.longitude) else { continue }
+            let metersPerLat = 111_320.0, metersPerLon = 111_320 * cos(peak.latitude * .pi / 180)
+            let pixel = max(tile.stepLatitude * metersPerLat, tile.stepLongitude * metersPerLon)
+            let y = (tile.originLatitude - peak.latitude) / tile.stepLatitude
+            let x = (peak.longitude - tile.originLongitude) / tile.stepLongitude
+            let reachRows = Int(radius / (tile.stepLatitude * metersPerLat)) + 1
+            let reachCols = Int(radius / (tile.stepLongitude * metersPerLon)) + 1
+            let rows = max(0, Int(y) - reachRows)...min(tile.rows - 1, Int(y) + reachRows)
+            let cols = max(0, Int(x) - reachCols)...min(tile.cols - 1, Int(x) + reachCols)
+            guard !rows.isEmpty, !cols.isEmpty else { continue }
+            func distance(_ r: Int, _ c: Int) -> Double {
+                let dy = (Double(r) - y) * tile.stepLatitude * metersPerLat, dx = (Double(c) - x) * tile.stepLongitude * metersPerLon
+                return (dx * dx + dy * dy).squareRoot()
+            }
+            // The model's top near the summit.
+            var top = -Double.infinity
+            for r in rows {
+                for c in cols where distance(r, c) <= radius {
+                    let v = tile.heights[r * tile.cols + c]
+                    if v != ElevationTile.noData { top = max(top, Double(v)) }
+                }
+            }
+            let deficit = peak.elevation - top
+            guard top.isFinite, deficit >= minDeficit, deficit <= maxDeficit else { continue }
+            // At least a pixel and a half wide, so the nearest grid point gets most of the tip.
+            let coneRadius = min(radius, max(deficit, 1.5 * pixel))
+            for r in rows {
+                for c in cols {
+                    let d = distance(r, c)
+                    guard d < coneRadius else { continue }
+                    let i = r * tile.cols + c
+                    guard tile.heights[i] != ElevationTile.noData else { continue }
+                    let cone = Int16(max(-32767, min(32767, (peak.elevation - deficit * d / coneRadius).rounded())))
+                    if cone > tile.heights[i] { tile.heights[i] = cone }
+                }
+            }
+            raised += 1
+        }
+        return raised
+    }
+}

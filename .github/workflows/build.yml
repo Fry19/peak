@@ -140,11 +140,14 @@ jobs:
           rm live/N45E007.tif
           # Hikes near the Matterhorn, with the app's own query; in sight from Gornergrat.
           $B trails --query --lat 45.9763 --lon 7.6586 > live/trails-query.txt
-          if curl -sSf -A "$UA" --data-urlencode data@live/trails-query.txt https://overpass-api.de/api/interpreter -o live/matterhorn-trails.json; then
-            $B trails live/matterhorn-trails.json --lat 45.9763 --lon 7.6586 --dem DEM --from-lat "$LAT" --from-lon "$LON" | tee live/trails.txt
-          else
-            echo "Overpass unavailable; skipped" | tee live/trails.txt
-          fi
+          echo "Overpass unavailable; skipped" > live/trails.txt
+          for server in https://overpass-api.de https://overpass.kumi.systems https://maps.mail.ru/osm/tools/overpass; do
+            if curl -sSf -m 90 -A "$UA" --data-urlencode data@live/trails-query.txt "$server/api/interpreter" -o live/matterhorn-trails.json; then
+              echo "From $server" | tee live/trails.txt
+              $B trails live/matterhorn-trails.json --lat 45.9763 --lon 7.6586 --dem DEM --from-lat "$LAT" --from-lon "$LON" | tee -a live/trails.txt
+              break
+            fi
+          done
           # Facts about the Matterhorn from Wikidata and Wikipedia.
           W="https://www.wikidata.org/w/api.php?action=wbgetentities&format=json"
           if curl -sSf -A "$UA" -o live/q1374.json "$W&ids=Q1374&props=claims%7Cdescriptions%7Csitelinks&languages=en"; then
