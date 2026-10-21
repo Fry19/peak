@@ -31,6 +31,38 @@ jobs:
         working-directory: PeakCore
         run: swift test
 
+  app:
+    name: Build app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Show Xcode version
+        run: xcodebuild -version
+      - name: Archive for iPhone
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project Peak.xcodeproj \
+            -scheme Peak \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Peak.xcarchive \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | xcbeautify --renderer github-actions
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/Peak.xcarchive/Products/Applications/Peak.app Payload/
+          # An ad-hoc signature; sideloading tools replace it with one from your Apple ID.
+          codesign --force --sign - Payload/Peak.app
+          zip -qry Peak.ipa Payload
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Peak-ipa
+          path: Peak.ipa
+
   bench:
     name: Skyline matching benchmark
     runs-on: macos-15

@@ -101,6 +101,9 @@ public final class ElevationTile: @unchecked Sendable {
 
     @inline(__always)
     func value(row: Int, col: Int) -> Int16 { heights[row * cols + col] }
+
+    /// All heights, row by row from the north.
+    public var heightValues: [Int16] { Array(heights) }
 }
 
 public enum TerrainError: Error, CustomStringConvertible {

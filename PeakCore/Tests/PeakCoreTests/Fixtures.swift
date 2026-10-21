@@ -1,0 +1,99 @@
+import XCTest
+@testable import PeakCore
+
+/// Fixtures made with Python's zlib and tifffile (see the comments on each).
+enum Fixtures {
+    /// 24×20 float32 GeoTIFF in 16×16 tiles, DEFLATE with the floating-point predictor, like
+    /// Copernicus tiles: value(row, col) = 1000 + 13.25·row − 7.5·col + 0.5·sin(col), first
+    /// pixel centered on 47°N 8°E, 1 arc-second pixels.
+    static let floatTIFF = Data(base64Encoded: """
+        SUkqAAgAAAAUAAABBAABAAAAGAAAAAEBBAABAAAAFAAAAAIBAwABAAAAIAAAAAMBAwABAAAACAAAAAYBAwABAAAAAQAAAA4BAgAU
+        AAAA/gAAABUBAwABAAAAAQAAABoBBQABAAAAIgEAABsBBQABAAAAKgEAACgBAwABAAAAAQAAADEBAgAMAAAAMgEAAD0BAwABAAAA
+        AwAAAEIBBAABAAAAEAAAAEMBBAABAAAAEAAAAEQBBAAEAAAAPgEAAEUBAwAEAAAATgEAAFMBAwABAAAAAwAAAA6DDAADAAAAVgEA
+        AIKEDAAGAAAAbgEAAK+HAwAQAAAAngEAAAAAAAB7InNoYXBlIjogWzIwLCAyNF19AAAAAAAAAAAAAAAAAAAAAAABAAAAAQAAAAEA
+        AAABAAAAdGlmZmZpbGUucHkAwAEAAPUCAAASBAAAcAQAADUBHQFeAF0A37yaeFY0Mj/fvJp4VjQyPwAAAAAAAAAAAAAAAAAAAAAA
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAIEAAAAAAAIBHQAAAAAAAAAAAAQABAAAAAwAABAAAAQACAAEEAAABAAIAAAgAAAEA5hAAAHic
+        c2FABWb/IOA/lF5spczOLGVmp8XHKKRnbyTK81Yn26Vj//fF7emZV+Y5yrig6bdE0f3/33s0/XsI6LdBaAYz3nSh6s8hoN+W4T+K
+        CybKCuoh65cpF/2BT7/9fyCAa///z1RWkOUqkv4z5aLb2vDod/wPBnAP3ALqZ+TdD9dfA9S/6Eg6Tv1ODFADoEbUg/VLy0+F6tcB
+        63/wWw2HfheIdgaIE/7/U4bqF2U3AOu/A9UfeOQ/Vv1u/xEA5IYTcP2ML0H6e+D6t2zBpt+d4T+yCf9yEfo5xe8Zidog6c/iwNTv
+        CXc/BAgi65eXnPoGWb+/4ld0/d7I1gNN2Y6qn/scqv4+dP0+/1E88D8OTb8aAf1+aO5nQdNfR0B/AJr7V6Hpv0ZAfyCa+wPR9Ouh
+        6QcArYGa/Xicc2GAgD1QOvr/PzDYBOV/41aztZRlZbWB8k8W77mS3f/RVATKd0HTHw/SDDRjHZTvBtX/hkj9SWDd//6thvKnQfXP
+        IVJ/KkT7vxVQ/jOofh8i9WdCvP9/CZRvBtX/h0j9ORDv/1sI5bdB9a8hUn8+1P3zoPxrUP0xROov/gcBs6F8Nah+HiL1l0HdPx3G
+        h+qHyRPSXwmNvylQ/jGo/hwi9ddC3T8RyheD6pchUn8D1P29UL6xHUT/GSg/9Tp+/Y3//4Pd3wXl32ZlB+uvgem3jMKrv/k/xIB2
+        GJ9VWP4zUL8OXH9c1kU8+lv/g8G/ZihfG6hfhn8S6x0k/aYnQnDqb/v/nwFkQAOUfxmsn4n5GIr+ylkw/wEAhf74AXicc2FABcH/
+        IYABSn+XFWRh5JWWF2Vn5BSXl+RuKxfdtujIg9+BR7ZsyfJX7HNB0x/6Hxkw/J+Lpv8eAf1hCKvBwAVNvxkB/RFo7n+Fpr8PTT/D
+        KBgFIxgAAABwZKF4nHNhgIA9ULrjPwTUQ/nVrMLyMvxMzHJQfqplXJbpicpZXVC+C5r+Lqj+WihfGaq/jEj93f//M/z///9/NZR/
+        Gqr/HJH6e6H2V0H5xVD9ajj0j4JRMJIBAJDlOAE=
+""", options: .ignoreUnknownCharacters)!
+    /// 24×20 int16 GeoTIFF in strips of 7 rows, DEFLATE with horizontal differencing:
+    /// value(row, col) = 500 + 3·row + 2·col.
+    static let int16TIFF = Data(base64Encoded: """
+        SUkqAAgAAAATAAABBAABAAAAGAAAAAEBBAABAAAAFAAAAAIBAwABAAAAEAAAAAMBAwABAAAACAAAAAYBAwABAAAAAQAAAA4BAgAU
+        AAAA8gAAABEBBAADAAAAFgEAABUBAwABAAAAAQAAABYBBAABAAAABwAAABcBAwADAAAAIgEAABoBBQABAAAAKAEAABsBBQABAAAA
+        MAEAACgBAwABAAAAAQAAADEBAgAMAAAAOAEAAD0BAwABAAAAAgAAAFMBAwABAAAAAgAAAA6DDAADAAAARAEAAIKEDAAGAAAAXAEA
+        AK+HAwAQAAAAjAEAAAAAAAB7InNoYXBlIjogWzIwLCAyNF19AAAAAAAAAAAAAAAAAAAAAACwAQAA0wEAAPUBAAAjACIAHgABAAAA
+        AQAAAAEAAAABAAAAdGlmZmZpbGUucHkA37yaeFY0Mj/fvJp4VjQyPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        AAAAIEAAAAAAAIBHQAAAAAAAAAAAAQABAAAAAwAABAAAAQACAAEEAAABAAIAAAgAAAEA5hAAAAAAeJz7wsjEQAr8TqL6XySq/0ui
+        egYm0tQzk6iejUT1ANuyBTh4nONkYmIgBfKQqJ6fRPVCJKoXJVG9BInqpUlUDwAt4QHPeJyTY2JiIAUqkqhehUT16iSq1yJRvS6J
+        6gEuEwIC
+""", options: .ignoreUnknownCharacters)!
+    /// zlib level 0 (stored blocks) of "the quick brown fox jumps over the lazy dog " × 40
+    /// followed by 300 random bytes, 2060 bytes in all.
+    static let stored = Data(base64Encoded: """
+        eAEBDAjz93RoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3duIGZveCBqdW1w
+        cyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRoZSBxdWljayBi
+        cm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRv
+        ZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRoZSBxdWljayBicm93biBmb3gganVtcHMgb3Zl
+        ciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sgYnJvd24g
+        Zm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgdGhl
+        IHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIgdGhl
+        IGxhenkgZG9nIHRoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3duIGZveCBq
+        dW1wcyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRoZSBxdWlj
+        ayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5
+        IGRvZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRoZSBxdWljayBicm93biBmb3gganVtcHMg
+        b3ZlciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sgYnJv
+        d24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cg
+        dGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIg
+        dGhlIGxhenkgZG9nIHRoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3duIGZv
+        eCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRoZSBx
+        dWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBs
+        YXp5IGRvZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRoZSBxdWljayBicm93biBmb3gganVt
+        cHMgb3ZlciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sg
+        YnJvd24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBk
+        b2cgdGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92
+        ZXIgdGhlIGxhenkgZG9nIHRoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgdGhlIHF1aWNrIGJyb3du
+        IGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZyB0aGUgcXVpY2sgYnJvd24gZm94IGp1bXBzIG92ZXIgdGhlIGxhenkgZG9nIHRo
+        ZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgIpHYzcMQQR5+wnN4pmHJNRh8B+TVY26bw8QAsnJEuM06
+        l/Ea5lEHBQamigLw4WGvN/hsuQeHOMNw8H6NO1g7rTjCdfNK7QVq1uqO7KQZL6H+udxLHr5V5bj5toDv92yB1OmrME1Ilvnhf9jw
+        gWSW2gh6Pr7MZ2qqLF2M4bPGrLxfFnCpghvHKYXXZF59uwd4C0602fudl5RkpSsrgDr7A8UziuvcjDtng1jz2JNadehEqIyb9boB
+        Ysjb0vTi8L2DzyGEx480bfMOe95dkY0z8IFpfNBbalgAiYqfyZxUdZkHzTqiLYyVLtwXzI3M2dHuQQjX8awSFd4EcwPBwUc/RBzM
+        ny9YShEqKEGH8yuoRaW2S3SzUn95HQZPYldryzBCG0DmuoL6NfebbtH5znIfiQ==
+""", options: .ignoreUnknownCharacters)!
+    /// zlib with one fixed-Huffman block: "abcabcabcabcabc hello hello".
+    static let fixed = Data(base64Encoded: """
+        eNpLTEpOREIKGak5OfkQEgCN7won
+""", options: .ignoreUnknownCharacters)!
+    /// zlib with dynamic Huffman blocks: 1500 words from `dynamicWords`, joined by spaces.
+    static let dynamic = Data(base64Encoded: """
+        eNqVmmluWkEQhK/iqyGMLJTnOMJxpNw+Fm+ZWr4B5UdswLyZnl6qq3pyu76+XV4+v97fr7+PX6fX1+Xy8ue0LJe/L+ePZfv3tXxc
+        by9vy+l8vdyO97f7Cvu77aFfl9OP9cfn+Xa57Euub86n6+3n/vp75XWF9ef2xe0r65tcbNvD3uxW7b/X1fZv2oHscTDP1l0N6ZPs
+        592fVLPVB3rWw3P3z+4+lb/68utX1AvHjuLD9ee+bsZt/f7YZ4+k7Sc/xxPr7/UA3w+44ewHS53V+4dd6988UfZ3nVj7UhYGscJD
+        fDcSMsid4c9Euqt5lIvfe3vqWAaJGX62fc/t27iyOe8eG42/+MhKJj1om1vipk8331hANGd9h8pgd6r4R+MoEbEYDnutOMOnmyvc
+        enF0ZsFmnnhwf8lwFYUr7ltsHzN6IJCbuXllfZO+VidHGsYT6iwt7GHTfe88euKiF5iniXwtEsU8bvVrpwO/yUvdxI6vhav5plUD
+        UFbRcghZukLDpZj+cQbZ3TNazyFr58l6sYeIZzU94gudQwtLC3/0ovG87Wu1rw1AsijMTwAnCmBlDEG2HC+j8IRH89+WsM9tC23N
+        DggNzB71dRmHWveQoayglx1Va8vdPl5o8TilCGywCuxCJhIksfeSlRqa1Q1lpZxqPLbUo8lWzH/gs4Ss/+hH6lwEHSdCuZFEkWvT
+        CNlIGk9bKq7qXLBjI6a148S1xUOZXBiogL9UKqpNyHLJuaIT3rGBN1RiqsnRvey1vqLYPfuJ1EMhTpyjvgtceoj5xFUcLmzlETrH
+        jSWZNzWRyvo4uQOFICXxfUdE2cbSkZHa/F5MLIJl9TtiTb0onwRLE+9H/aRD3fSkNSwwQ2jZ35BCcim7EJ0EC7BzwldSBqKOSlBS
+        yZWoM9HPhHGEy6SdzB9HeAXTMBqEkdCXm9Qk5+q279pcvKESibg/iPUwF6wi9EMbg6ZSj6YMgaGB7RXVoa4EZCv68aSEDNNB5Y/P
+        7CBkqJ/b3YvSA4uQNSsq4igeHBoQA63jTpJgBspJt4RQzJpjub8bPbRhIqc92Wq2PtWupJQIh4BYe+Y+VlswdCmGgrVqXMghMVpd
+        g3QPhMKciHIkEWqbCiw4EMZls06UTmwYQJ3u6nyZ7SyYr9aOj7VZgJU0TWAJX2A79nDBkEFHhWM44x2v+JtuCiDNTIL9WKnqkAgQ
+        3BxKIcIbox/RWFX2fP40JfxUGMFcsKWgdcE+Z6cQjQUi3ywWKJgyYlkPjo40YoyE4MrAqYmtOUIUO0OuB4/3s+tHMPFKNlUczYAF
+        py2oN0a2gTkwqAeYEhhQWFbroSkfD8CI0RpODvlhosG9Y3pnkqRmrladoDp0950H0Xsg4Q8FX9/QwM2N6u64EJG/PR3/m9WW4ixp
+        gAiGmoZo2P6T0TioqSRrTyDJ3e3kybeedM4maFEBzXMK2SdL8wAiGwqO35hmBdWFe6q+3OhhYE0aaAxJPJq7+sMGmwNYAvqE54Ub
+        gF57+tRb88SBdCwJsy1A8gXQm0aV3L1G0kYvmCrAKZurywO+NCzPYcfjO5aeQ/bsCcJEqn42tazpKIgAQx/SB3bnTzPEmLhlSZgr
+        6LhNbZ5dMrZEncljmmZ79iGAssrI2dDUNL6Q1FPhfIWSSjXp9Go4CgVunx5cr4LrZIdSYzBH1EBAUEkwZwEv0/9T4vBA1wsugSoF
+        TD5KTrlSN55A7bE7k0WyBnh1H8UFgVMUTCaxusMEIzUcBpNuqiutmP0+GlNNq37IxCLqcItSorlFYZDLvGeeXyTgPIJF2EJUiGTT
+        ZDrb8DoXLk8E3z8JBeZw
+""", options: .ignoreUnknownCharacters)!
+    static let dynamicWords = Set("ridge summit valley glacier col saddle peak cairn scree couloir".split(separator: " ").map(String.init))
+}

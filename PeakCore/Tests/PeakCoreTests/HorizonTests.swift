@@ -73,6 +73,11 @@ final class HorizonTests: XCTestCase {
 
         let ridges = profile.ridges(ofRay: 0)
         XCTAssertEqual(ridges.count, 2, "\(ridges)")
+        // The hill's crest is drawn as a ridge in front of the skyline (rays 1° apart, so that
+        // the crest continues from ray to ray).
+        settings.azimuthStep = 1
+        let fine = renderer.render(from: observer, settings: settings)
+        XCTAssertTrue(fine.ridgeSegments().contains { !$0.isSkyline && $0.azimuth0 < 3 && abs($0.distance - 4_000) < 300 })
         XCTAssertEqual(Double(ridges[0].distance), 4_000, accuracy: 200)
         XCTAssertEqual(Double(ridges[1].distance), 30_000, accuracy: 300)
         XCTAssertGreaterThan(ridges[1].elevation, ridges[0].elevation)
@@ -103,6 +108,35 @@ final class HorizonTests: XCTestCase {
                                             from: observer)
         XCTAssertTrue(inTheOpen.isVisible)
         XCTAssertEqual(inTheOpen.azimuth, 60, accuracy: 0.01)
+    }
+
+    func testVisiblePeaksAndRidgeSegments() {
+        let wall = destination(from: TestTerrain.center, azimuth: 180, distance: 5_000)
+        let hidden = destination(from: TestTerrain.center, azimuth: 180, distance: 20_000)
+        let open = destination(from: TestTerrain.center, azimuth: 60, distance: 20_000)
+        let terrain = TestTerrain.cones([
+            .init(latitude: wall.latitude, longitude: wall.longitude, height: 1_500, radius: 3_000),
+            .init(latitude: hidden.latitude, longitude: hidden.longitude, height: 2_000, radius: 4_000),
+            .init(latitude: open.latitude, longitude: open.longitude, height: 2_000, radius: 4_000),
+        ])
+        let renderer = HorizonRenderer(terrain: terrain)
+        let observer = renderer.observer(latitude: 46, longitude: 8)
+        let peaks = [
+            Peak(id: 1, name: "Hidden", latitude: hidden.latitude, longitude: hidden.longitude, elevation: 2_500),
+            Peak(id: 2, name: "Open", latitude: open.latitude, longitude: open.longitude, elevation: 2_500),
+            Peak(id: 3, name: "Too far", latitude: 47.5, longitude: 8, elevation: 4_000),
+        ]
+        let visible = renderer.visiblePeaks(peaks, from: observer, maxDistance: 80_000)
+        XCTAssertEqual(visible.map(\.peak.name), ["Open"])
+        XCTAssertEqual(visible[0].distance, 20_000, accuracy: 300)
+
+        var settings = HorizonSettings()
+        settings.azimuthStep = 1
+        settings.maxDistance = 40_000
+        let segments = renderer.render(from: observer, settings: settings).ridgeSegments()
+        XCTAssertEqual(segments.filter(\.isSkyline).count, 360)
+        // Looking south, the near cone hides the far one, so it is the skyline.
+        XCTAssertTrue(segments.contains { $0.isSkyline && abs($0.azimuth0 - 180) < 1 && abs($0.distance - 5_000) < 300 })
     }
 
     func testEnvelopeIsSortedAndEndsAtTheSkyline() {

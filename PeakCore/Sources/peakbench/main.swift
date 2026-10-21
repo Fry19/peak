@@ -24,6 +24,9 @@ peakbench: desk test harness for skyline matching.
   peakbench detect IMAGE [--width W] [--debug FILE]
       Run only the skyline detector and draw what it found.
 
+  peakbench geotiff FILE.tif [--out FILE.pkdem] [--compare FILE.pkdem]
+      Decode a Copernicus GeoTIFF with PeakCore's own reader (what the app does).
+
   peakbench case PHOTO.jpg [--out CASE.json]          (macOS only)
       Make a case file from an iPhone photo's location, compass heading and lens data.
 """
@@ -314,6 +317,28 @@ func detectCommand(_ args: Arguments) throws {
     }
 }
 
+// MARK: - geotiff
+
+func geotiffCommand(_ args: Arguments) throws {
+    guard let path = args.positional.first else { throw HarnessError("which GeoTIFF?") }
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    let tile = try timed("Decode") { try GeoTIFF.elevationTile(data) }
+    let heights = tile.heightValues
+    print("Tile \(tile.south), \(tile.west): \(tile.rows)×\(tile.cols), first pixel at \(tile.originLatitude), " +
+          "\(tile.originLongitude), \(heights.min()!)–\(heights.max()!) m")
+    if let other = args.string("compare") {
+        let reference = try ElevationTile(contentsOf: URL(fileURLWithPath: other)).heightValues
+        guard reference.count == heights.count else { throw HarnessError("sizes differ") }
+        let diffs = zip(heights, reference).map { abs(Int($0) - Int($1)) }
+        print("Compared with \(other): \(diffs.filter { $0 > 0 }.count) of \(diffs.count) heights differ, " +
+              "by at most \(diffs.max()!) m")
+    }
+    if let out = args.string("out") {
+        try tile.write(to: URL(fileURLWithPath: out))
+        print("Wrote \(out)")
+    }
+}
+
 // MARK: - bench
 
 struct BenchRun {
@@ -437,6 +462,7 @@ do {
     case "align": try alignCommand(args)
     case "bench": try benchCommand(args)
     case "detect": try detectCommand(args)
+    case "geotiff": try geotiffCommand(args)
     case "case": try caseCommand(args)
     case "help", "-h", "--help": print(usage)
     default:
