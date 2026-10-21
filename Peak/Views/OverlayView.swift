@@ -49,6 +49,12 @@ final class OverlayCanvas: UIView {
     private let renderer = LineRenderer()
     private var segments: [LineSegment] = []
     var drawsWithMetal: Bool { renderer != nil }
+
+    /// Pixels per point; before the view is on screen the trait collection doesn't know yet.
+    private var displayScale: CGFloat {
+        let s = traitCollection.displayScale
+        return s > 0 ? s : (window?.windowScene?.screen.scale ?? 3)
+    }
     /// Line segments sent to the GPU for the last frame, for diagnostics.
     var segmentCount: Int { segments.count }
     private let labelContainer = CALayer()
@@ -99,7 +105,7 @@ final class OverlayCanvas: UIView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for l in layer.sublayers ?? [] { l.frame = bounds }
-        renderer?.resize(to: bounds.size, scale: traitCollection.displayScale)
+        renderer?.resize(to: bounds.size, scale: displayScale)
         CATransaction.commit()
         needsUpdate = true
     }
@@ -178,13 +184,13 @@ final class OverlayCanvas: UIView {
         layoutRidges(scene, projector, heading: camera.attitude.heading, reach: reach, ridges: settings.showRidges)
         layoutTrail(model.arTrail?.runs, projector)
         let placed = layoutLabels(scene, projector, heading: camera.attitude.heading, reach: reach, model: model)
-        renderer?.draw(segments, size: bounds.size, scale: traitCollection.displayScale)
+        renderer?.draw(segments, size: bounds.size, scale: displayScale)
         if frozen == nil, settings.haptics { tickIfCrossing(placed, at: now) }
     }
 
     private func clear() {
         for l in bandGlow + bandLine + [skyGlow, skyLine, trailGlow, trailLine, dotLayer] { l.path = nil }
-        renderer?.draw([], size: bounds.size, scale: traitCollection.displayScale)
+        renderer?.draw([], size: bounds.size, scale: displayScale)
         labelLayers.values.forEach { $0.isHidden = true }
         arrowLayer.isHidden = true
         dots = []
@@ -414,7 +420,7 @@ final class OverlayCanvas: UIView {
                 l = existing
             } else {
                 l = CALayer()
-                l.contentsScale = traitCollection.displayScale
+                l.contentsScale = displayScale
                 labelContainer.addSublayer(l)
                 labelLayers[id] = l
             }
@@ -468,7 +474,7 @@ final class OverlayCanvas: UIView {
             .union(CGRect(x: -10, y: -36, width: 20, height: 46))
         let canvas = box.insetBy(dx: -5, dy: -5).integral
         let format = UIGraphicsImageRendererFormat()
-        format.scale = traitCollection.displayScale
+        format.scale = displayScale
         format.opaque = false
         let rendered = UIGraphicsImageRenderer(size: canvas.size, format: format).image { context in
             context.cgContext.translateBy(x: -canvas.minX, y: -canvas.minY)
@@ -511,7 +517,7 @@ final class OverlayCanvas: UIView {
             let box = CGRect(x: -size.width / 2 - 10, y: -size.height / 2 - 6, width: size.width + 20, height: size.height + 12)
             let canvas = box.integral
             let format = UIGraphicsImageRendererFormat()
-            format.scale = traitCollection.displayScale
+            format.scale = displayScale
             format.opaque = false
             let rendered = UIGraphicsImageRenderer(size: canvas.size, format: format).image { context in
                 context.cgContext.translateBy(x: -canvas.minX, y: -canvas.minY)
@@ -528,7 +534,7 @@ final class OverlayCanvas: UIView {
         let reach = min(abs(dir.x) > 0.01 ? halfW / abs(dir.x) : .infinity, abs(dir.y) > 0.01 ? halfH / abs(dir.y) : .infinity)
         let along = max(0, reach - image.size.width / 2 - 10)
         let center = CGPoint(x: bounds.midX + dir.x * along, y: bounds.midY + dir.y * along)
-        arrowLayer.contentsScale = traitCollection.displayScale
+        arrowLayer.contentsScale = displayScale
         arrowLayer.contents = image.image
         arrowLayer.bounds = CGRect(origin: .zero, size: image.size)
         arrowLayer.anchorPoint = CGPoint(x: image.anchor.x / image.size.width, y: image.anchor.y / image.size.height)

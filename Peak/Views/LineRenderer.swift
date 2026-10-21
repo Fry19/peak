@@ -67,6 +67,8 @@ final class LineRenderer {
 
     /// Draws the segments (in points, over a view of `size`) in place of the last ones.
     func draw(_ segments: [LineSegment], size: CGSize, scale: CGFloat) {
+        let pixels = CGSize(width: max(1, size.width * scale), height: max(1, size.height * scale))
+        if layer.drawableSize != pixels { resize(to: size, scale: scale) }
         // Never hold up the screen waiting for the GPU: skip this frame if it's behind.
         guard inFlight.wait(timeout: .now()) == .success else { return }
         guard let drawable = layer.nextDrawable(), let commands = queue.makeCommandBuffer() else {
