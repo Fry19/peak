@@ -21,11 +21,17 @@ public struct AlignmentSettings: Sendable {
     public var measurementNoise = 0.08
     /// At most this many skyline points are used.
     public var maxPoints = 480
+    /// Cost, in expected errors, of matching a column's lower candidate when it has a higher
+    /// one: an edge with sky over it above another is the likelier skyline.
+    public var lowerCandidatePenalty = 1.0
 
     // Acceptance gates.
     public var minValidFraction = 0.25
-    public var minInlierFraction = 0.5
+    public var minInlierFraction = 0.4
     public var maxAmbiguity = 0.75
+    /// The same, for fits less than 1.5° from the best: a plain skyline's cost has shallow
+    /// dips close together, and the best of them may not be the right one.
+    public var maxNearAmbiguity = 0.9
     public var maxRMS = 0.2
     /// Skyline at least this far away is "far": a 10 m position error moves it by under 0.15°.
     public var farDistance = 4_000.0
@@ -68,6 +74,9 @@ public struct AlignmentResult: Sendable {
     /// near 0 is a clear match, near 1 means another heading fits about as well (a flat or
     /// repetitive skyline).
     public var ambiguity: Double
+    /// The same against fits 0.3–1.5° away: near 1 means the skyline doesn't pin the
+    /// heading down to better than a degree or so.
+    public var nearAmbiguity: Double
     public var pointCount: Int
     public var accepted: Bool
     public var rejectionReason: String?
@@ -85,7 +94,9 @@ public enum SkylineAligner {
                              settings: AlignmentSettings = AlignmentSettings()) -> AlignmentResult {
         precondition(skyline.width == camera.intrinsics.width && skyline.height == camera.intrinsics.height,
                      "skyline and intrinsics must be for the same image size")
-        let all = skyline.points
+        // Each column's candidates: the detected boundary and a fainter edge above it, where
+        // there is one. Whichever fits the terrain counts.
+        let all = skyline.candidates
         let stride = max(1, Int((Double(all.count) / Double(settings.maxPoints)).rounded(.up)))
         let points = Swift.stride(from: 0, to: all.count, by: stride).map { all[$0] }
         let prior = camera.attitude
@@ -93,11 +104,11 @@ public enum SkylineAligner {
         func reject(_ reason: String, curve: [(Double, Double)] = []) -> AlignmentResult {
             AlignmentResult(attitude: prior, intrinsics: camera.intrinsics, headingCorrection: 0,
                             pitchCorrection: 0, rollCorrection: 0, rms: .nan, inlierFraction: 0, farFraction: 0,
-                            ambiguity: 1, pointCount: points.count, accepted: false,
+                            ambiguity: 1, nearAmbiguity: 1, pointCount: points.count, accepted: false,
                             rejectionReason: reason, headingCurve: curve.map { ($0.0, $0.1) })
         }
-        guard skyline.validFraction >= settings.minValidFraction, points.count >= 20 else {
-            return reject("too little skyline found (\(Int(skyline.validFraction * 100))% of columns)")
+        guard skyline.candidateFraction >= settings.minValidFraction, points.count >= 20 else {
+            return reject("too little skyline found (\(Int(skyline.candidateFraction * 100))% of columns)")
         }
 
         // Expected error for every ray of the rendered horizon.
@@ -117,7 +128,7 @@ public enum SkylineAligner {
         let headingCount = Int((settings.headingRange / settings.headingStep).rounded())
         var curve = [(Double, Double)]()
         var curveArgs = [(pitch: Double, roll: Double, offset: Double)]()
-        var directions: [[(azimuth: Double, elevation: Double)]] = []
+        var directions: [[[(azimuth: Double, elevation: Double)]]] = []
         var combos: [(Double, Double)] = []
         for dp in pitchCandidates {
             for dr in rollCandidates {
@@ -125,7 +136,7 @@ public enum SkylineAligner {
                 c.attitude.pitch += dp
                 c.attitude.roll += dr
                 let projector = c.projector
-                directions.append(points.map { projector.look(x: $0.x, y: $0.y) })
+                directions.append(points.map { p in p.ys.map { projector.look(x: p.x, y: $0) } })
                 combos.append((dp, dr))
             }
         }
@@ -141,16 +152,29 @@ public enum SkylineAligner {
             for (k, dirs) in directions.enumerated() {
                 farResiduals.removeAll(keepingCapacity: true)
                 for i in points.indices {
-                    let az = dirs[i].azimuth + dh
-                    residuals[i] = dirs[i].elevation - horizon.elevation(atAzimuth: az)
-                    let j = ray(az)
-                    sigmas[i] = raySigma[j]
-                    if rayFar[j] { farResiduals.append(residuals[i]) }
+                    // The candidate that fits best, for the pitch left over.
+                    var best = (e: Double.infinity, r: 0.0, j: 0)
+                    for (n, d) in dirs[i].enumerated() {
+                        let az = d.azimuth + dh
+                        let r = d.elevation - horizon.elevation(atAzimuth: az)
+                        let j = ray(az)
+                        let e = abs(r) / raySigma[j] + (n > 0 ? settings.lowerCandidatePenalty : 0)
+                        if e < best.e { best = (e, r, j) }
+                    }
+                    residuals[i] = best.r
+                    sigmas[i] = raySigma[best.j]
+                    if rayFar[best.j] { farResiduals.append(best.r) }
                 }
                 let offset = max(-1.5, min(1.5, median(farResiduals.count >= 10 ? farResiduals : residuals)))
                 var cost = 0.0
                 for i in points.indices {
-                    cost += points[i].weight * min(abs(residuals[i] - offset) / sigmas[i], cap)
+                    var e = Double.infinity
+                    for (n, d) in dirs[i].enumerated() {
+                        let az = d.azimuth + dh
+                        e = min(e, abs(d.elevation - horizon.elevation(atAzimuth: az) - offset) / raySigma[ray(az)]
+                                + (n > 0 ? settings.lowerCandidatePenalty : 0))
+                    }
+                    cost += points[i].weight * min(e, cap)
                 }
                 cost /= totalWeight
                 if cost < bestCost {
@@ -165,15 +189,21 @@ public enum SkylineAligner {
         // 2. Refine the best few basins with all parameters free, and score each refined
         //    solution with the same robust cost as the coarse search.
         let separation = Int(1.5 / settings.headingStep)
-        func score(_ q: [Double]) -> Double {
+        /// Each point's robust cost: its best candidate's error in expected errors, capped.
+        func errors(_ q: [Double]) -> [Double] {
             let projector = apply(q, to: camera).projector
-            var cost = 0.0
-            for p in points {
-                let d = projector.look(x: p.x, y: p.y)
-                let r = d.elevation - horizon.elevation(atAzimuth: d.azimuth)
-                cost += p.weight * min(abs(r) / raySigma[ray(d.azimuth)], cap)
+            return points.map { p in
+                var e = Double.infinity
+                for (n, y) in p.ys.enumerated() {
+                    let d = projector.look(x: p.x, y: y)
+                    e = min(e, abs(d.elevation - horizon.elevation(atAzimuth: d.azimuth)) / raySigma[ray(d.azimuth)]
+                            + (n > 0 ? settings.lowerCandidatePenalty : 0))
+                }
+                return min(e, cap)
             }
-            return cost / totalWeight
+        }
+        func score(_ q: [Double]) -> Double {
+            zip(points, errors(q)).reduce(0) { $0 + $1.0.weight * $1.1 } / totalWeight
         }
         var basins: [(params: [Double], cost: Double, score: Double)] = []
         for m in localMinima(curve.map(\.1), separation: separation).prefix(4) {
@@ -183,11 +213,31 @@ public enum SkylineAligner {
                                  sigma: { raySigma[ray($0)] }, settings: settings)
             basins.append((refined.params, refined.cost, score(refined.params)))
         }
-        guard let best = basins.min(by: { $0.cost < $1.cost }) else { return reject("no heading fits", curve: curve) }
+        guard let first = basins.min(by: { $0.cost < $1.cost }) else { return reject("no heading fits", curve: curve) }
+        // Start again a little to either side of the best, and keep any better fit found.
+        for shift in [-1.5, -0.75, 0.75, 1.5] {
+            var start = first.params
+            start[0] += shift
+            let refined = refine(start, points: points, camera: camera, horizon: horizon,
+                                 sigma: { raySigma[ray($0)] }, settings: settings)
+            basins.append((refined.params, refined.cost, score(refined.params)))
+        }
+        let best = basins.min(by: { $0.cost < $1.cost })!
         let q = best.params
-        // Ambiguity: the best fit against the best fit with a clearly different heading.
-        let rivals = basins.filter { abs($0.params[0] - q[0]) > 1.5 }.map(\.score)
-        let ambiguity = rivals.min().map { $0 > 0 ? min(1, best.score / $0) : 1 } ?? 0
+        // Ambiguity: the best fit against the best fit with a clearly different heading, over
+        // the points either one fits. A point neither fits (a roof, a wall, a tree in front)
+        // costs both the same and can't tell them apart.
+        let bestErrors = errors(q)
+        func versus(_ rival: [Double]) -> Double {
+            var a = 0.0, b = 0.0
+            for (i, e) in errors(rival).enumerated() where min(e, bestErrors[i]) < cap {
+                a += points[i].weight * bestErrors[i]
+                b += points[i].weight * e
+            }
+            return b > 0 ? min(1, a / b) : 1
+        }
+        let ambiguity = basins.filter { abs($0.params[0] - q[0]) > 1.5 }.map { versus($0.params) }.max() ?? 0
+        let nearAmbiguity = basins.filter { (0.3...1.5).contains(abs($0.params[0] - q[0])) }.map { versus($0.params) }.max() ?? 0
 
         // 3. Gate.
         let solved = apply(q, to: camera)
@@ -195,10 +245,16 @@ public enum SkylineAligner {
         var inliers = 0, farInliers = 0, sumSq = 0.0
         var farOffsets: [Double] = []
         for p in points {
-            let d = projector.look(x: p.x, y: p.y)
-            let r = d.elevation - horizon.elevation(atAzimuth: d.azimuth)
-            let j = ray(d.azimuth)
-            guard abs(r) < 2.5 * raySigma[j] else { continue }
+            // The column's candidate that fits best.
+            var best: (e: Double, r: Double, j: Int, d: (azimuth: Double, elevation: Double))?
+            for (n, y) in p.ys.enumerated() {
+                let d = projector.look(x: p.x, y: y)
+                let r = d.elevation - horizon.elevation(atAzimuth: d.azimuth)
+                let j = ray(d.azimuth)
+                let e = abs(r) / raySigma[j] + (n > 0 ? settings.lowerCandidatePenalty : 0)
+                if best.map({ e < $0.e }) ?? true { best = (e, r, j, d) }
+            }
+            guard let (_, r, j, d) = best, abs(r) < 2.5 * raySigma[j] else { continue }
             inliers += 1
             if rayFar[j] {
                 farInliers += 1
@@ -215,7 +271,8 @@ public enum SkylineAligner {
             attitude: solved.attitude, intrinsics: solved.intrinsics,
             headingCorrection: q[0], pitchCorrection: solved.attitude.pitch - prior.pitch,
             rollCorrection: solved.attitude.roll - prior.roll, rms: rms, inlierFraction: inlierFraction,
-            farFraction: farFraction, ambiguity: ambiguity, pointCount: points.count, accepted: true,
+            farFraction: farFraction, ambiguity: ambiguity, nearAmbiguity: nearAmbiguity,
+            pointCount: points.count, accepted: true,
             rejectionReason: nil, headingCurve: curve.map { ($0.0, $0.1) })
         if inlierFraction < settings.minInlierFraction {
             result.rejectionReason = "only \(Int(inlierFraction * 100))% of the skyline matches"
@@ -224,6 +281,9 @@ public enum SkylineAligner {
                 "\(Int(settings.farDistance / 1000)) km, spanning \(String(format: "%.1f", farSpan))°)"
         } else if ambiguity > settings.maxAmbiguity {
             result.rejectionReason = String(format: "ambiguous: another heading fits almost as well (%.2f)", ambiguity)
+        } else if nearAmbiguity > settings.maxNearAmbiguity {
+            result.rejectionReason = String(format: "heading not pinned down: a fit within 1.5° is almost as good (%.2f)",
+                                            nearAmbiguity)
         } else if !(rms <= settings.maxRMS) {
             result.rejectionReason = String(format: "residual too large (%.2f°)", rms)
         } else if abs(q[0]) > settings.headingRange - settings.headingStep {
@@ -247,22 +307,33 @@ public enum SkylineAligner {
         return c
     }
 
+    /// Each point's residual in units of expected error, of its column's best candidate.
+    static func residuals(_ q: [Double], points: [(x: Double, ys: [Double], weight: Double)], camera: Camera,
+                          horizon: HorizonProfile, sigma: (Double) -> Double, settings: AlignmentSettings) -> [Double] {
+        let projector = apply(q, to: camera).projector
+        return points.map { p in
+            var best = (cost: Double.infinity, e: 0.0)
+            for (n, y) in p.ys.enumerated() {
+                let d = projector.look(x: p.x, y: y)
+                let e = (d.elevation - horizon.elevation(atAzimuth: d.azimuth)) / sigma(d.azimuth)
+                let cost = abs(e) + (n > 0 ? settings.lowerCandidatePenalty : 0)
+                if cost < best.cost { best = (cost, e) }
+            }
+            return best.e
+        }
+    }
+
     /// Levenberg–Marquardt on residuals scaled by each point's expected error, with Cauchy
     /// weights (iteratively reweighted least squares) so outliers fade out.
-    static func refine(_ start: [Double], points: [(x: Double, y: Double, weight: Double)], camera: Camera,
+    static func refine(_ start: [Double], points: [(x: Double, ys: [Double], weight: Double)], camera: Camera,
                        horizon: HorizonProfile, sigma: (Double) -> Double,
                        settings: AlignmentSettings) -> (params: [Double], cost: Double) {
         let free = settings.refineFieldOfView ? 4 : 3
         let c = 2.0
         let priors = [Double.infinity, settings.pitchSigma, settings.rollSigma, settings.fieldOfViewSigma]
 
-        /// Residuals in units of expected error.
         func residuals(_ q: [Double]) -> [Double] {
-            let projector = apply(q, to: camera).projector
-            return points.map { p in
-                let d = projector.look(x: p.x, y: p.y)
-                return (d.elevation - horizon.elevation(atAzimuth: d.azimuth)) / sigma(d.azimuth)
-            }
+            Self.residuals(q, points: points, camera: camera, horizon: horizon, sigma: sigma, settings: settings)
         }
         func cost(_ r: [Double], _ q: [Double]) -> Double {
             var total = 0.0

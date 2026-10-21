@@ -23,8 +23,9 @@ final class SkylineCorrector: @unchecked Sendable {
     /// Called on the main thread with each finished match.
     var onResult: ((Outcome) -> Void)?
 
-    /// A frame kept for testing at a desk: the upright picture the matcher looked at, larger,
-    /// and a case file for `peakbench align` that names it as `imageName`.
+    /// A frame kept for testing at a desk: the upright picture the matcher looked at (at up to
+    /// 1920 pixels, before it shrinks it), and a case file for `peakbench align` that names
+    /// it as `imageName`.
     struct TestFrame {
         var image: RGBImage
         var caseFile: Data
@@ -49,11 +50,10 @@ final class SkylineCorrector: @unchecked Sendable {
     private var horizon: HorizonProfile?
     private var upright = ViewCorrection()
     private var sideways = ViewCorrection()
-    private let matcher: SkylineMatcher = {
-        var m = SkylineMatcher()
-        m.workingWidth = 640
-        return m
-    }()
+    private let matcher = SkylineMatcher()
+    /// The long side frames are matched at. What counts is pixels per degree: a far ridge in
+    /// haze may stand only half a degree over a nearer one in front, a few pixels at this size.
+    private static let workingSide = 960
 
     /// What to match against, and the corrections in use for the phone held upright and
     /// sideways. Call on any thread.
@@ -91,7 +91,7 @@ final class SkylineCorrector: @unchecked Sendable {
         // flowing to the screen.
         work.async { [weak self] in
             guard let self else { return }
-            guard let image = Self.rgbImage(pixels, maxSide: 800) else {
+            guard let image = Self.rgbImage(pixels, maxSide: 1920) else {
                 self.finish(nil)
                 return
             }
@@ -101,27 +101,26 @@ final class SkylineCorrector: @unchecked Sendable {
             prior.heading = normalizedAzimuth(prior.heading + correction.heading)
             prior.pitch += correction.pitch
             prior.roll += correction.roll
-            let m = self.matcher.match(upright.image, intrinsics: upright.camera.intrinsics, prior: prior, horizon: horizon)
+            var matcher = self.matcher
+            let (w, h) = (upright.image.width, upright.image.height)
+            matcher.workingWidth = w >= h ? Self.workingSide : Self.workingSide * w / h
+            let m = matcher.match(upright.image, intrinsics: upright.camera.intrinsics, prior: prior, horizon: horizon)
             let a = m.alignment
             let outcome = Outcome(delta: a.headingCorrection, pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
                                   sideways: isSideways, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
                                   seconds: m.seconds)
-            if let capture, let frame = Self.testFrame(pixels, lens: lens, axes: axes, correction: correction,
-                                                       horizon: horizon, outcome: outcome) {
+            if let capture, let frame = Self.testFrame(upright, correction: correction, horizon: horizon,
+                                                       measuredLens: lens.measured, outcome: outcome) {
                 DispatchQueue.main.async { capture(frame) }
             }
             self.finish(outcome)
         }
     }
 
-    /// The frame upright at up to 1920 pixels, and its case: where it was taken and the
+    /// The upright frame the matcher looked at, and its case: where it was taken and the
     /// attitude the matcher started from (the sensors with the corrections in use).
-    private static func testFrame(_ pixels: CVPixelBuffer, lens: CameraFeed.Lens,
-                                  axes: (right: SIMD3<Double>, down: SIMD3<Double>, forward: SIMD3<Double>),
-                                  correction: ViewCorrection, horizon: HorizonProfile, outcome: Outcome) -> TestFrame? {
-        guard let image = rgbImage(pixels, maxSide: 1920) else { return nil }
-        let frame = UprightFrame(image: image, intrinsics: lens.intrinsics.scaled(toWidth: image.width, height: image.height),
-                                 right: axes.right, down: axes.down, forward: axes.forward)
+    private static func testFrame(_ frame: UprightFrame, correction: ViewCorrection, horizon: HorizonProfile,
+                                  measuredLens: Bool, outcome: Outcome) -> TestFrame? {
         let sensors = frame.camera.attitude
         let k = frame.camera.intrinsics
         let formatter = DateFormatter()
@@ -156,7 +155,7 @@ final class SkylineCorrector: @unchecked Sendable {
             app: App(sensors: ["heading": sensors.heading, "pitch": sensors.pitch, "roll": sensors.roll],
                      correction: ["heading": correction.heading, "pitch": correction.pitch, "roll": correction.roll],
                      intrinsics: ["width": Double(k.width), "height": Double(k.height), "fx": k.fx, "fy": k.fy, "cx": k.cx, "cy": k.cy],
-                     measuredLens: lens.measured,
+                     measuredLens: measuredLens,
                      match: ["accepted": outcome.accepted ? "yes" : "no", "reason": outcome.reason ?? "",
                              "heading": String(format: "%+.3f", outcome.delta), "pitch": String(format: "%+.3f", outcome.pitchDelta),
                              "roll": String(format: "%+.3f", outcome.rollDelta), "rms": String(format: "%.3f", outcome.rms)]))

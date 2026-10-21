@@ -9,6 +9,21 @@ public struct Skyline: Sendable {
     public var rows: [Float]
     /// Edge contrast at the boundary, 0...1.
     public var strength: [Float]
+    /// For each column, a fainter edge above the boundary with sky over it, where there is
+    /// one (NaN otherwise). Far ranges fade into haze, so a nearer, sharper ridge in front
+    /// can take the boundary; the real skyline may be this one.
+    public var upperRows: [Float]
+    public var upperStrength: [Float]
+
+    public init(width: Int, height: Int, rows: [Float], strength: [Float], upperRows: [Float]? = nil,
+                upperStrength: [Float]? = nil) {
+        self.width = width
+        self.height = height
+        self.rows = rows
+        self.strength = strength
+        self.upperRows = upperRows ?? [Float](repeating: .nan, count: width)
+        self.upperStrength = upperStrength ?? [Float](repeating: 0, count: width)
+    }
 
     public var validCount: Int { rows.reduce(0) { $1.isNaN ? $0 : $0 + 1 } }
     public var validFraction: Double { Double(validCount) / Double(max(width, 1)) }
@@ -18,6 +33,22 @@ public struct Skyline: Sendable {
         (0..<width).compactMap { c in
             rows[c].isNaN ? nil : (Double(c) + 0.5, Double(rows[c]), Double(strength[c]))
         }
+    }
+
+    /// Each column's candidates for the skyline, topmost first: the fainter edge above the
+    /// boundary and the boundary, or either alone. Weighed by the boundary's contrast (the
+    /// upper edge's when it stands alone).
+    public var candidates: [(x: Double, ys: [Double], weight: Double)] {
+        (0..<width).compactMap { c in
+            let ys = [upperRows[c], rows[c]].filter { !$0.isNaN }.map(Double.init)
+            guard !ys.isEmpty else { return nil }
+            return (Double(c) + 0.5, ys, Double(rows[c].isNaN ? upperStrength[c] : strength[c]))
+        }
+    }
+
+    /// Fraction of columns with any candidate.
+    public var candidateFraction: Double {
+        Double((0..<width).filter { !rows[$0].isNaN || !upperRows[$0].isNaN }.count) / Double(max(width, 1))
     }
 }
 
@@ -33,6 +64,9 @@ public struct SkylineDetector: Sendable {
     public var smoothness: Float = 0.25
     /// Columns whose boundary contrast is below this are dropped.
     public var minStrength: Float = 0.08
+    /// Contrast an edge above the boundary needs to be a candidate: well clear of the sky's
+    /// own gradient and noise, though a hazy far ridge's step is often well under a near one's.
+    public var minUpperStrength: Float = 0.35
     /// Columns where the "sky" just above the boundary is busier than this are dropped
     /// (texture is 4× the mean luminance gradient; clean sky is near 0.1).
     public var maxSkyTexture: Float = 0.3
@@ -74,41 +108,68 @@ public struct SkylineDetector: Sendable {
         var rows = [Float](repeating: .nan, count: w)
         var strength = [Float](repeating: 0, count: w)
         let rim = max(3, h / 40)
-        for x in 0..<w {
-            let r = boundary[x]
-            guard r > 1, r < h - 1 else { continue }
-            // Refine on the uncapped edge, which peaks where the color step is steepest.
-            let raw = f.rawEdges
+        let raw = f.rawEdges
+        // The edge's peak near row r, to a fraction of a pixel: the uncapped edge peaks where
+        // the color step is steepest.
+        func peak(_ x: Int, near r: Int, reach: Int) -> (row: Int, offset: Float) {
             var bestY = r, bestE: Float = -1
-            for y in max(1, r - 2)...min(h - 2, r + 2) where raw[y * w + x] > bestE {
+            for y in max(1, r - reach)...min(h - 2, r + reach) where raw[y * w + x] > bestE {
                 bestE = raw[y * w + x]
                 bestY = y
             }
             let e0 = raw[(bestY - 1) * w + x], e1 = bestE, e2 = raw[(bestY + 1) * w + x]
             let denom = e0 - 2 * e1 + e2
-            let offset = denom < 0 ? max(-0.5, min(0.5, 0.5 * (e0 - e2) / denom)) : 0
-            // The evidence just above should look like sky and just below like terrain.
-            // Sky is also smooth: real sky has little texture right above the skyline.
-            // And it is blue or neutral gray, never brown or green, except low sun turns it
-            // orange near the horizon, where it stays bright and smooth.
-            var above: Float = 0, below: Float = 0, texture: Float = 0, warmth: Float = 0, light: Float = 0
+            return (bestY, denom < 0 ? max(-0.5, min(0.5, 0.5 * (e0 - e2) / denom)) : 0)
+        }
+        // Whether what's just above row r looks like sky: sky by the color models, and smooth,
+        // since real sky has little texture right above the skyline. And blue or neutral
+        // gray, never brown or green, except low sun turns it orange near the horizon, where
+        // it stays bright.
+        func skyAbove(_ x: Int, _ r: Int) -> Bool {
+            var above: Float = 0, texture: Float = 0, warmth: Float = 0, light: Float = 0
             for k in 1...rim {
                 let yAbove = max(0, r - k - 1)
                 above += llr[yAbove * w + x]
-                below += llr[min(h - 1, r + k - 1) * w + x]
                 let i = 4 * (yAbove * w + x)
                 texture += f.values[i + 3]
                 warmth += max(f.values[i], f.values[i + 1]) - f.values[i + 2]
                 light += (f.values[i] + f.values[i + 1] + f.values[i + 2]) / 3
             }
             let n = Float(rim)
-            let skyColored = warmth / n < 0.04 || light / n > 0.6
+            return above > 0 && texture / n < maxSkyTexture && (warmth / n < 0.04 || light / n > 0.6)
+        }
+        for x in 0..<w {
+            let r = boundary[x]
+            guard r > 1, r < h - 1 else { continue }
+            let (bestY, offset) = peak(x, near: r, reach: 2)
+            // Just below should look like terrain.
+            var below: Float = 0
+            for k in 1...rim { below += llr[min(h - 1, r + k - 1) * w + x] }
             strength[x] = f.edges[bestY * w + x]
-            if strength[x] >= minStrength, above > 0, below < 0, texture / n < maxSkyTexture, skyColored {
+            if strength[x] >= minStrength, below < 0, skyAbove(x, r) {
                 rows[x] = Float(bestY) + offset
             }
         }
-        return Skyline(width: w, height: h, rows: rows, strength: strength)
+
+        // The topmost clear edge above the boundary with sky over it, if any.
+        var upperRows = [Float](repeating: .nan, count: w)
+        var upperStrength = [Float](repeating: 0, count: w)
+        for x in 0..<w {
+            let r = boundary[x]
+            let top = max(rim + 2, band?[x].lowerBound ?? 0)
+            guard top < r - 3 else { continue }
+            for y in top..<(r - 3) {
+                let e = raw[y * w + x]
+                guard f.edges[y * w + x] >= minUpperStrength, e >= raw[(y - 1) * w + x], e >= raw[(y + 1) * w + x],
+                      skyAbove(x, y) else { continue }
+                let (row, offset) = peak(x, near: y, reach: 1)
+                upperRows[x] = Float(row) + offset
+                upperStrength[x] = f.edges[row * w + x]
+                break
+            }
+        }
+        return Skyline(width: w, height: h, rows: rows, strength: strength, upperRows: upperRows,
+                       upperStrength: upperStrength)
     }
 
     /// For each column, the first row from the top with a clear color step, median-filtered

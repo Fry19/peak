@@ -67,6 +67,40 @@ final class SkylineTests: XCTestCase {
         XCTAssertLessThan(errors[errors.count * 95 / 100], 2.0, "95th percentile error in pixels")
     }
 
+    /// A far range fading into haze above a sharper, darker ridge in front: the detector
+    /// may take the near ridge, but offers the far one's edge above it.
+    func testOffersAFaintFarRidgeAboveANearOne() {
+        let w = 480, h = 360
+        func far(_ x: Double) -> Double { 150 + 12 * sin(x / 53) }
+        func near(_ x: Double) -> Double { 170 + 6 * sin(x / 29) }
+        var image = RGBImage(width: w, height: h)
+        var rng = SplitMix64(seed: 8)
+        for y in 0..<h {
+            for x in 0..<w {
+                let cx = Double(x) + 0.5, cy = Double(y) + 0.5
+                var c: SIMD3<Double>
+                if cy < far(cx) {
+                    c = mix(SIMD3(120, 160, 215), SIMD3(225, 230, 235), cy / 170)
+                } else if cy < near(cx) {
+                    c = SIMD3(175, 185, 200)   // the far range, pale with haze
+                } else {
+                    let n = fractalNoise(Double(x) / 6, Double(y) / 6, seed: 4)
+                    c = SIMD3(60, 75, 50) + 50 * (n - 0.5)
+                }
+                c += 3 * SIMD3(rng.gaussian(), rng.gaussian(), rng.gaussian())
+                image.set(x, y, (clampByte(c.x), clampByte(c.y), clampByte(c.z)))
+            }
+        }
+        let skyline = SkylineDetector().detect(in: image)
+        // Each column's topmost candidate should be the far ridge.
+        let errors = (0..<w).compactMap { x -> Double? in
+            let top = [skyline.upperRows[x], skyline.rows[x]].first { !$0.isNaN }
+            return top.map { abs(Double($0) - far(Double(x) + 0.5)) }
+        }.sorted()
+        XCTAssertGreaterThan(Double(errors.count) / Double(w), 0.9)
+        XCTAssertLessThan(errors[errors.count / 2], 1.0, "median error in pixels")
+    }
+
     /// Low sun turns the sky orange near the horizon; it still counts as sky.
     func testFindsTheSkylineUnderAnOrangeSky() {
         let w = 480, h = 360

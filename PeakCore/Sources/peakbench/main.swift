@@ -12,7 +12,7 @@ peakbench: desk test harness for skyline matching.
                   [--seed S] --out NAME
       Render a synthetic photo (NAME.ppm, or NAME.png on a Mac) and its case file NAME.json.
 
-  peakbench align CASE.json [--dem DIR] [--debug FILE] [--curve] [--points FILE.csv]
+  peakbench align CASE.json [--dem DIR] [--debug FILE] [--curve] [--points FILE.csv] [--working-width W]
       Find the skyline in a photo, align it to the terrain and report the heading error
       before and after correction.
 
@@ -255,18 +255,23 @@ func alignCommand(_ args: Arguments) throws {
 
     var matcher = SkylineMatcher()
     if photo.pitch == nil || photo.roll == nil { matcher.settings = .photo }
+    // The app matches at 640 pixels wide.
+    if let width = args.int("working-width") { matcher.workingWidth = width }
     let prior = Attitude(heading: photo.heading, pitch: photo.pitch ?? 0, roll: photo.roll ?? 0)
     let match = matcher.match(image, intrinsics: intrinsics, prior: prior, horizon: horizon)
     report(match, truth: photo.truth)
     if let path = args.string("points") {
         // Each detected skyline point where the sensors put it, beside the rendered horizon.
         let projector = match.camera.projector
-        var csv = "x,y,azimuth,elevation,horizon,distance\n"
-        for p in match.skyline.points {
-            let d = projector.look(x: p.x, y: p.y)
-            let ray = Int((normalizedAzimuth(d.azimuth) / horizon.azimuthStep).rounded()) % horizon.count
-            csv += String(format: "%.1f,%.1f,%.3f,%.3f,%.3f,%.0f\n", p.x, p.y, d.azimuth, d.elevation,
-                          horizon.elevation(atAzimuth: d.azimuth), Double(horizon.distances[ray]))
+        var csv = "x,y,azimuth,elevation,horizon,distance,kind\n"
+        let sky = match.skyline
+        for x in 0..<sky.width {
+            for (y, kind) in [(sky.rows[x], "boundary"), (sky.upperRows[x], "upper")] where !y.isNaN {
+                let d = projector.look(x: Double(x) + 0.5, y: Double(y))
+                let ray = Int((normalizedAzimuth(d.azimuth) / horizon.azimuthStep).rounded()) % horizon.count
+                csv += String(format: "%.1f,%.1f,%.3f,%.3f,%.3f,%.0f,", Double(x) + 0.5, Double(y), d.azimuth, d.elevation,
+                              horizon.elevation(atAzimuth: d.azimuth), Double(horizon.distances[ray])) + kind + "\n"
+            }
         }
         try csv.write(toFile: path, atomically: true, encoding: .utf8)
         print("Wrote \(path)")
@@ -293,7 +298,7 @@ func report(_ m: SkylineMatcher.Match, truth: Attitude?) {
     print("Heading \(f(m.camera.attitude.heading))° → \(f(a.attitude.heading))° (correction \(signed(a.headingCorrection))°)")
     print("Pitch correction \(signed(a.pitchCorrection))°, roll correction \(signed(a.rollCorrection))°")
     print("Fit: \(f(a.rms, 3))° RMS; \(Int(a.inlierFraction * 100))% of points match, \(Int(a.farFraction * 100))% " +
-          "match and are far away; ambiguity \(f(a.ambiguity))")
+          "match and are far away; ambiguity \(f(a.ambiguity)), within 1.5° \(f(a.nearAmbiguity))")
     print(a.accepted ? "Accepted" : "Rejected: \(a.rejectionReason ?? "")")
     if let truth {
         let before = azimuthDifference(m.camera.attitude.heading, truth.heading)
@@ -306,7 +311,8 @@ func report(_ m: SkylineMatcher.Match, truth: Attitude?) {
 }
 
 /// The working image with the horizon where the sensors put it (red), where the correction
-/// puts it (green), ridges behind the skyline (cyan) and the detected skyline (yellow).
+/// puts it (green), ridges behind the skyline (cyan), the detected skyline (yellow) and the
+/// fainter edges above it (magenta).
 func debugOverlay(_ m: SkylineMatcher.Match, horizon: HorizonProfile) -> RGBImage {
     var image = m.image
     let w = image.width
@@ -336,6 +342,11 @@ func debugOverlay(_ m: SkylineMatcher.Match, horizon: HorizonProfile) -> RGBImag
         return r.isNaN ? (.nan, .nan) : (Double(x) + 0.5, Double(r))
     }
     image.drawPolyline(detected, color: (255, 220, 0), thickness: 1, maxGap: 6)
+    let upper = (0..<m.skyline.width).map { x -> (Double, Double) in
+        let r = m.skyline.upperRows[x]
+        return r.isNaN ? (.nan, .nan) : (Double(x) + 0.5, Double(r))
+    }
+    image.drawPolyline(upper, color: (255, 64, 255), thickness: 1, maxGap: 6)
     return image
 }
 
@@ -604,6 +615,7 @@ func benchCommand(_ args: Arguments) throws {
         print(String(format: "%4d  %6.1f°  %3.0f°  %4.2f  %4.2f  %5.1f km  %+6.2f°  %+7.3f°  %@  %4.0f ms",
                      run + 1, truth.heading, fov, scene.clouds, scene.trees, skylineKm, r.before, r.after,
                      r.accepted ? "yes" : " no", r.seconds * 1000)
+              + String(format: "  near %.2f", m.alignment.nearAmbiguity)
               + (m.alignment.rejectionReason.map { "  (\($0))" } ?? ""))
         if let dir = args.string("save") {
             try saveImage(debugOverlay(m, horizon: horizon), to: "\(dir)/run\(run + 1).\(defaultImageExtension)")
