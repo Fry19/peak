@@ -67,6 +67,8 @@ jobs:
           for text in "copernicus-dem-30m" "overpass-api.de" "not enough distant skyline"; do
             strings "$APP/Peak" | grep -q "$text" || { echo "missing from the binary: $text"; exit 1; }
           done
+          # The overlay's lines are drawn by the Metal shaders compiled into this library.
+          test -s "$APP/default.metallib" || { echo "missing from the bundle: default.metallib"; exit 1; }
           plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleShortVersionString|NSCameraUsageDescription|NSLocationWhenInUseUsageDescription"
       - name: Upload IPA
         uses: actions/upload-artifact@v7
