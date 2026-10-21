@@ -20,8 +20,11 @@ struct TerrainScene: @unchecked Sendable {
     let horizon: HorizonProfile
     /// Ridge segments bucketed by whole degree of azimuth, for drawing only what's in view.
     let segments: [[RidgeSegment]]
-    /// Visible peaks, highest first, so labels for the big peaks are placed first.
+    /// Visible peaks, the most worth a label first (`PeakRanking`): prominent summits that
+    /// stand out from here, not every sub-summit of a high massif.
     let peaks: [VisiblePeak]
+    /// Each visible peak's rank score, by id.
+    let scores: [Int64: Double]
     /// Every peak within range, visible or not, by id.
     let allPeaks: [Int64: PeakView]
 
@@ -39,8 +42,13 @@ struct TerrainScene: @unchecked Sendable {
         for s in horizon.ridgeSegments() {
             buckets[Int(s.azimuth0) % 360].append(s)
         }
-        let visible = renderer.visiblePeaks(peaks, from: observer, maxDistance: radius, settings: settings)
-            .sorted { $0.peak.elevation > $1.peak.elevation }
+        var scores: [Int64: Double] = [:]
+        let found = renderer.visiblePeaks(peaks, from: observer, maxDistance: radius, settings: settings)
+        for v in found {
+            let rise = horizon.rise(azimuth: v.azimuth, elevation: v.elevation)
+            scores[v.id] = PeakRanking.score(v.peak, rise: rise, distance: v.distance)
+        }
+        let visible = found.sorted { scores[$0.id, default: 0] > scores[$1.id, default: 0] }
         let frame = LocalFrame(origin: observer)
         var all: [Int64: PeakView] = [:]
         for p in peaks {
@@ -50,7 +58,8 @@ struct TerrainScene: @unchecked Sendable {
             }
         }
         for v in visible { all[v.id]?.isVisible = true }
-        return TerrainScene(observer: observer, terrain: terrain, horizon: horizon, segments: buckets, peaks: visible, allPeaks: all)
+        return TerrainScene(observer: observer, terrain: terrain, horizon: horizon, segments: buckets, peaks: visible,
+                            scores: scores, allPeaks: all)
     }
 
     /// A trail laid on the terrain as seen from here, with the stretches behind nearer

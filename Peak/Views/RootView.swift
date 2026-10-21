@@ -7,53 +7,62 @@ import SwiftUI
 struct RootView: View {
     @Bindable var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
+    /// Where the chips at the top and the controls at the bottom are, for labels to keep clear of.
+    @State private var topControls = CGRect.zero
+    @State private var bottomControls = CGRect.zero
 
     var body: some View {
         ZStack {
-            CameraScreen(model: model)
+            CameraScreen(model: model, keepClear: [topControls, bottomControls])
                 .ignoresSafeArea()
             VStack(spacing: 10) {
-                if model.aligning {
-                    AlignBanner(model: model)
-                } else if let trail = model.arTrail {
-                    TrailChip(model: model, trail: trail)
-                }
-                if model.zoom > 1.05 {
-                    Button {
-                        model.setZoom(1)
-                    } label: {
-                        Text(String(format: "%.1f×", model.zoom))
-                            .font(.system(size: 13, weight: .semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(.ultraThinMaterial, in: Capsule())
-                            .environment(\.colorScheme, .dark)
+                VStack(spacing: 10) {
+                    if model.aligning {
+                        AlignBanner(model: model)
+                    } else if let trail = model.arTrail {
+                        TrailChip(model: model, trail: trail)
                     }
-                    .accessibilityLabel("Zoomed \(String(format: "%.1f", model.zoom)) times; tap to zoom out")
-                }
-                if model.settings.showDiagnostics {
-                    DebugPanel(model: model)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10)
-                }
-                Spacer()
-                HStack(alignment: .center, spacing: 10) {
-                    if !model.aligning {
-                        RoundButton(systemImage: "list.bullet", label: "Peaks") { model.sheet = .list }
-                    }
-                    StatusPill(model: model)
-                    if !model.aligning {
-                        RoundButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right", label: "Line up by hand") {
-                            model.startAligning()
+                    if model.zoom > 1.05 {
+                        Button {
+                            model.setZoom(1)
+                        } label: {
+                            Text(String(format: "%.1f×", model.zoom))
+                                .font(.system(size: 13, weight: .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .environment(\.colorScheme, .dark)
                         }
-                        RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
+                        .accessibilityLabel("Zoomed \(String(format: "%.1f", model.zoom)) times; tap to zoom out")
+                    }
+                    if model.settings.showDiagnostics {
+                        DebugPanel(model: model)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10)
                     }
                 }
-                Text("Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.white.opacity(0.45))
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { topControls = $0 }
+                Spacer()
+                VStack(spacing: 10) {
+                    HStack(alignment: .center, spacing: 10) {
+                        if !model.aligning {
+                            RoundButton(systemImage: "list.bullet", label: "Peaks") { model.sheet = .list }
+                        }
+                        StatusPill(model: model)
+                        if !model.aligning {
+                            RoundButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right", label: "Line up by hand") {
+                                model.startAligning()
+                            }
+                            RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
+                        }
+                    }
+                    Text("Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { bottomControls = $0 }
             }
             .padding(.top, 8)
             .padding(.bottom, 12)

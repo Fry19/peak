@@ -57,7 +57,8 @@ vertex VertexOut lineVertex(uint vid [[vertex_id]],
 }
 
 // The line itself, antialiased over about a pixel, with a soft glow falling off around it.
-// Blending takes the brighter of overlapping quads, so joins don't double up.
+// Ridgelines blend by taking the brighter of overlapping quads, so joins don't double up;
+// the trail and dots are laid over them (see LineRenderer).
 fragment float4 lineFragment(VertexOut in [[stage_in]], constant Uniforms &u [[buffer(1)]]) {
     float2 pa = in.p - in.a;
     float2 ba = in.b - in.a;

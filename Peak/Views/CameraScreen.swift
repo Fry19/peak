@@ -6,6 +6,8 @@ import UIKit
 /// The camera picture with the ridgelines, labels and trails drawn over it.
 struct CameraScreen: UIViewRepresentable {
     let model: AppModel
+    /// Controls over the view, in global (window) coordinates, for labels to keep clear of.
+    var keepClear: [CGRect] = []
 
     func makeUIView(context: Context) -> CameraScreenView {
         let view = CameraScreenView(model: model)
@@ -13,7 +15,9 @@ struct CameraScreen: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ view: CameraScreenView, context: Context) {}
+    func updateUIView(_ view: CameraScreenView, context: Context) {
+        view.overlay.keepClear = keepClear.filter { !$0.isEmpty }
+    }
 }
 
 /// Shows camera frames itself, rather than through a preview layer, so it knows exactly
