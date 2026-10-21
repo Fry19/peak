@@ -491,6 +491,9 @@ struct BenchRun {
     var after: Double
     var accepted: Bool
     var seconds: Double
+    /// Pitch and roll errors before (the sensors) and after matching, degrees.
+    var pitch: (before: Double, after: Double) = (0, 0)
+    var roll: (before: Double, after: Double) = (0, 0)
 }
 
 func benchCommand(_ args: Arguments) throws {
@@ -556,7 +559,9 @@ func benchCommand(_ args: Arguments) throws {
             abs(azimuthDifference(horizon.azimuth(ofRay: $0), truth.heading)) <= half
         }.map { Double(horizon.distances[$0]) }.sorted()
         let skylineKm = inView.isEmpty ? 0 : inView[inView.count / 2] / 1000
-        let r = BenchRun(before: compassError, after: after, accepted: m.alignment.accepted, seconds: m.seconds)
+        var r = BenchRun(before: compassError, after: after, accepted: m.alignment.accepted, seconds: m.seconds)
+        r.pitch = (prior.pitch - truth.pitch, m.alignment.attitude.pitch - truth.pitch)
+        r.roll = (prior.roll - truth.roll, m.alignment.attitude.roll - truth.roll)
         results.append(r)
         print(String(format: "%4d  %6.1f°  %3.0f°  %4.2f  %4.2f  %5.1f km  %+6.2f°  %+7.3f°  %@  %4.0f ms",
                      run + 1, truth.heading, fov, scene.clouds, scene.trees, skylineKm, r.before, r.after,
@@ -584,9 +589,16 @@ func benchSummary(_ results: [BenchRun], mode: String, aim: String) -> String {
     let before = stats(results.map(\.before))
     let after = stats(accepted.map(\.after))
     let bad = accepted.filter { abs($0.after) > 0.5 }.count
-    var md = "| Heading error (\(mode) mode, aim \(aim)) | median | 90th percentile | worst |\n|---|---|---|---|\n"
+    var md = "| Error (\(mode) mode, aim \(aim)) | median | 90th percentile | worst |\n|---|---|---|---|\n"
     md += "| Compass (before) | \(f(before.median))° | \(f(before.p90))° | \(f(before.max))° |\n"
-    md += "| Skyline matched (after) | \(f(after.median, 3))° | \(f(after.p90, 3))° | \(f(after.max, 3))° |\n\n"
+    md += "| Skyline matched (after) | \(f(after.median, 3))° | \(f(after.p90, 3))° | \(f(after.max, 3))° |\n"
+    // The level as the motion sensors give it, and after matching (accepted frames).
+    let pitchBefore = stats(accepted.map(\.pitch.before)), pitchAfter = stats(accepted.map(\.pitch.after))
+    let rollBefore = stats(accepted.map(\.roll.before)), rollAfter = stats(accepted.map(\.roll.after))
+    md += "| Pitch, sensors (before) | \(f(pitchBefore.median, 3))° | \(f(pitchBefore.p90, 3))° | \(f(pitchBefore.max, 3))° |\n"
+    md += "| Pitch, matched (after) | \(f(pitchAfter.median, 3))° | \(f(pitchAfter.p90, 3))° | \(f(pitchAfter.max, 3))° |\n"
+    md += "| Roll, sensors (before) | \(f(rollBefore.median, 3))° | \(f(rollBefore.p90, 3))° | \(f(rollBefore.max, 3))° |\n"
+    md += "| Roll, matched (after) | \(f(rollAfter.median, 3))° | \(f(rollAfter.p90, 3))° | \(f(rollAfter.max, 3))° |\n\n"
     md += "Accepted \(accepted.count) of \(results.count) frames; \(bad) accepted with an error over 0.5°. "
     md += String(format: "Median matching time %.0f ms.\n", stats(results.map(\.seconds)).median * 1000)
     return md
