@@ -295,43 +295,39 @@ actor DataStore {
         URL(string: "https://overpass.kumi.systems/api/interpreter")!,
     ]
 
-    /// Runs an Overpass query. The first two servers are asked at once and the first good
-    /// answer wins; if both fail, the others are tried in turn. A server that answers but
-    /// reports the query failed (it ran out of time) counts as failing.
-    private func overpass(_ query: String, timeout: TimeInterval = 30) async throws -> Data {
+    /// Runs an Overpass query, asking the servers two at a time: the first good answer
+    /// wins, and the next two are asked only if both fail. A server that answers but reports
+    /// the query failed (it ran out of time) counts as failing. Busy servers often queue a
+    /// query for most of a minute before answering, so `timeout` is generous.
+    private func overpass(_ query: String, timeout: TimeInterval = 75) async throws -> Data {
         let body = Data(("data=" + (query.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")).utf8)
         let servers = Self.overpassServers
         var lastError: Error = Failure.download("map data")
-        do {
-            let data = try await withThrowingTaskGroup(of: Data.self) { group in
-                for server in servers.prefix(2) {
-                    group.addTask { try await Self.ask(server, body: body, timeout: timeout) }
-                }
-                var error: Error = Failure.download("map data")
-                while let result = await group.nextResult() {
-                    switch result {
-                    case let .success(data):
-                        group.cancelAll()
-                        return data
-                    case let .failure(e):
-                        error = e
-                    }
-                }
-                throw error
-            }
-            bytesDownloaded += data.count
-            return data
-        } catch {
-            lastError = error
-        }
-        for server in servers.dropFirst(2) {
+        for first in stride(from: 0, to: servers.count, by: 2) {
+            let pair = servers[first..<min(first + 2, servers.count)]
             do {
-                let data = try await Self.ask(server, body: body, timeout: timeout)
+                let data = try await withThrowingTaskGroup(of: Data.self) { group in
+                    for server in pair {
+                        group.addTask { try await Self.ask(server, body: body, timeout: timeout) }
+                    }
+                    var error: Error = Failure.download("map data")
+                    while let result = await group.nextResult() {
+                        switch result {
+                        case let .success(data):
+                            group.cancelAll()
+                            return data
+                        case let .failure(e):
+                            error = e
+                        }
+                    }
+                    throw error
+                }
                 bytesDownloaded += data.count
                 return data
             } catch {
                 lastError = error
             }
+            try Task.checkCancellation()
         }
         throw lastError
     }
@@ -374,7 +370,7 @@ actor DataStore {
         let r = radius + 20_000
         let dlat = r / 111_000, dlon = r / (111_000 * max(cos(cellLat * .pi / 180), 0.05))
         let query = Overpass.peaksQuery(south: cellLat - dlat, west: cellLon - dlon, north: cellLat + dlat, east: cellLon + dlon)
-        if let data = try? await overpass(query, timeout: 60), let peaks = try? Overpass.peaks(fromJSON: data) {
+        if let data = try? await overpass(query, timeout: 90), let peaks = try? Overpass.peaks(fromJSON: data) {
             try? data.write(to: cache)
             return peaks
         }

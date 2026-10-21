@@ -136,7 +136,10 @@ struct PeakDetailView: View {
         case .loading:
             HStack(spacing: 10) {
                 ProgressView()
-                Text("Searching OpenStreetMap for hikes…").foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Searching OpenStreetMap for hikes…").foregroundStyle(.secondary)
+                    Text("Its servers can take up to a minute when they're busy.").font(.caption).foregroundStyle(.tertiary)
+                }
             }
         case let .failed(message):
             VStack(alignment: .leading, spacing: 8) {

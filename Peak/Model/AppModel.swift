@@ -859,7 +859,7 @@ final class PeakDetails {
                 case .notConnectedToInternet, .dataNotAllowed, .networkConnectionLost, .internationalRoamingOff:
                     hikesState = .failed("No connection. To have hikes without a signal, save the area beforehand in Settings › Offline areas.")
                 case .timedOut:
-                    hikesState = .failed("OpenStreetMap didn't answer in time. Try again in a minute.")
+                    hikesState = .failed("OpenStreetMap's servers are overloaded and didn't answer. Try again in a few minutes.")
                 default:
                     hikesState = .failed("Couldn't reach OpenStreetMap (\(error.localizedDescription)).")
                 }
