@@ -1,6 +1,6 @@
 import Foundation
 
-/// A named summit from OpenStreetMap (`natural=peak`).
+/// A named summit from OpenStreetMap (`natural=peak` or `natural=volcano`).
 public struct Peak: Codable, Sendable, Hashable, Identifiable {
     public var id: Int64
     public var name: String
@@ -38,10 +38,11 @@ public struct Peak: Codable, Sendable, Hashable, Identifiable {
 public enum Overpass {
     public static let endpoint = URL(string: "https://overpass-api.de/api/interpreter")!
 
-    /// Query for named peaks inside a bounding box (degrees).
+    /// Query for named peaks inside a bounding box (degrees). Volcanoes such as Rainier,
+    /// Fuji and Kilimanjaro are tagged `natural=volcano` rather than `peak`.
     public static func peaksQuery(south: Double, west: Double, north: Double, east: Double) -> String {
         let box = String(format: "%.4f,%.4f,%.4f,%.4f", south, west, north, east)
-        return "[out:json][timeout:90];node[\"natural\"=\"peak\"][\"name\"](\(box));out body;"
+        return "[out:json][timeout:90];node[\"natural\"~\"^(peak|volcano)$\"][\"name\"](\(box));out body;"
     }
 
     /// Peaks in an Overpass JSON response. Peaks without a usable elevation are kept with
@@ -68,19 +69,38 @@ public enum Overpass {
         }
     }
 
-    /// Parses OSM `ele` values: "4478", "4478.5", "4,478", "4478 m", "14505 ft", "4478,5".
+    /// Parses OSM `ele` values: "4478", "4478.5", "4,478", "4478,5", "4 478 m", "14505 ft",
+    /// "~3000", "ca. 3000", "1200 ft (approx)". Nil for anything that isn't a height above 0.
     public static func parseElevation(_ raw: String) -> Double? {
-        var s = raw.trimmingCharacters(in: .whitespaces).lowercased()
-        let feet = s.hasSuffix("ft") || s.hasSuffix("'") || s.hasSuffix("feet")
-        s = String(s.prefix { $0.isNumber || $0 == "." || $0 == "," || $0 == "-" })
-        if let comma = s.firstIndex(of: ",") {
-            // "4,478" groups thousands; "4478,5" is a decimal comma.
-            let after = s[s.index(after: comma)...]
-            s = after.count == 3 && !after.contains(",") && !s.contains(".")
-                ? s.replacingOccurrences(of: ",", with: "")
-                : s.replacingOccurrences(of: ",", with: ".")
+        var s = raw.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in ["~", "ca.", "ca", "c.", "approx.", "approx", "about"] where s.hasPrefix(prefix) {
+            s = String(s.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+            break
         }
-        guard let v = Double(s), v > -500, v < 9000 * (feet ? 3.3 : 1) else { return nil }
+        // The number, with spaces (plain, no-break or thin) allowed between digit groups.
+        let spaces: Set<Character> = [" ", "\u{00A0}", "\u{202F}", "\u{2009}"]
+        var number = String(s.prefix { $0.isASCII && ($0.isNumber || $0 == "." || $0 == ",") || spaces.contains($0) })
+        let rest = s.dropFirst(number.count)
+        let groups = number.split(whereSeparator: { spaces.contains($0) }).map(String.init)
+        guard let first = groups.first else { return nil }
+        // "4 478" groups thousands; otherwise only the first group is the number.
+        let grouped = groups.count > 1 && groups.dropFirst().allSatisfy { $0.count == 3 && $0.allSatisfy(\.isNumber) }
+        number = grouped ? groups.joined() : first
+        let unit = grouped || groups.count == 1 ? String(rest) : String(s.dropFirst(first.count))
+        let feet = unit.contains("ft") || unit.contains("feet") || unit.contains("foot") || unit.contains("'")
+        let comma = number.lastIndex(of: ","), dot = number.lastIndex(of: ".")
+        if let comma, let dot {
+            // Both: the last one is the decimal point ("4,478.5", "4.478,5").
+            number = comma > dot ? number.replacingOccurrences(of: ".", with: "").replacingOccurrences(of: ",", with: ".")
+                                 : number.replacingOccurrences(of: ",", with: "")
+        } else if let comma {
+            // "4,478" groups thousands; "4478,5" is a decimal comma.
+            let after = number[number.index(after: comma)...]
+            number = after.count == 3
+                ? number.replacingOccurrences(of: ",", with: "")
+                : number.replacingOccurrences(of: ",", with: ".")
+        }
+        guard let v = Double(number), v > 0, v < 9000 * (feet ? 3.3 : 1) else { return nil }
         return feet ? v * 0.3048 : v
     }
 }

@@ -138,7 +138,8 @@ final class TrailTests: XCTestCase {
             }
         }
         let south = renderer.drape([line(0.5, 3.5, azimuth: 175)], from: observer, horizon: horizon)
-        let north = renderer.drape([line(0.8, 3.5, azimuth: 5)], from: observer, horizon: horizon)
+        // From 100 m past the summit: everything there is behind it.
+        let north = renderer.drape([line(0.1, 3.5, azimuth: 5)], from: observer, horizon: horizon)
         XCTAssertEqual(south.count, 1)
         XCTAssertGreaterThan(south[0].count, 150)
         XCTAssertTrue(north.isEmpty, "\(north.map(\.count))")
@@ -150,7 +151,7 @@ final class TrailTests: XCTestCase {
 
         // Seeing through the cone: the north face comes back, marked hidden, and a trail over
         // the top is one line, in sight up to the summit and hidden beyond it.
-        let throughNorth = renderer.drape([line(0.8, 3.5, azimuth: 5)], from: observer, horizon: horizon, includeHidden: true)
+        let throughNorth = renderer.drape([line(0.1, 3.5, azimuth: 5)], from: observer, horizon: horizon, includeHidden: true)
         XCTAssertEqual(throughNorth.count, 1)
         XCTAssertGreaterThan(throughNorth[0].count, 150)
         XCTAssertTrue(throughNorth[0].allSatisfy { !$0.isInSight })
@@ -163,9 +164,9 @@ final class TrailTests: XCTestCase {
         let firstHidden = try XCTUnwrap(over[0].firstIndex { !$0.isInSight })
         XCTAssertTrue(over[0][..<firstHidden].allSatisfy(\.isInSight))
         XCTAssertTrue(over[0][firstHidden...].allSatisfy { !$0.isInSight })
-        // The switch is within a few hundred meters of the summit.
+        // The switch is at the summit, give or take a pixel of the terrain model.
         let summit = LatLon(46.05, 8.0).distance(to: LatLon(46.2, 8.0))
-        XCTAssertEqual(Double(over[0][firstHidden].distance), summit, accuracy: 400)
+        XCTAssertEqual(Double(over[0][firstHidden].distance), summit, accuracy: 100)
     }
 }
 

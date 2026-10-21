@@ -44,6 +44,7 @@ public struct VisiblePeak: Sendable, Identifiable {
     public var azimuth: Double
     /// Apparent elevation angle, with refraction, degrees.
     public var elevation: Double
+    /// Distance along the ground (horizontal, as on a map), meters.
     public var distance: Double
     public var id: Int64 { peak.id }
 }
@@ -52,9 +53,8 @@ extension HorizonRenderer {
     /// The peaks within `maxDistance` that aren't hidden behind nearer terrain.
     public func visiblePeaks(_ peaks: [Peak], from observer: GeoPoint, maxDistance: Double,
                              settings: HorizonSettings = HorizonSettings()) -> [VisiblePeak] {
-        let frame = LocalFrame(origin: observer)
         let near = peaks.filter {
-            let d = frame.look(at: $0.point).distance
+            let d = groundDistance(from: observer, to: $0.point)
             return d > 200 && d < maxDistance
         }
         var results = [VisiblePeak?](repeating: nil, count: near.count)
@@ -82,11 +82,29 @@ public struct DrapedPoint: Sendable {
 
 extension HorizonProfile {
     /// Whether a point on the terrain, seen at (azimuth, elevation) from `distance` meters
-    /// away, is in sight rather than behind nearer terrain. The depth map gives the distance
-    /// to the first terrain in that direction; for a visible point that is the point itself.
+    /// away (along the ground), is in sight rather than behind nearer terrain: nothing
+    /// nearer than the point rises above it. The terrain within 0.2% + 30 m of the point is
+    /// its own slope and doesn't count, and the point may sit 15 m below what's in front.
+    /// (A wider window skips the crest itself for points just behind it: at 1% + 30 m,
+    /// points 100 m behind a summit 17 km away passed as in sight.)
+    /// The nearer terrain's height is interpolated between the two rays either side.
     public func isInSight(azimuth: Double, elevation: Double, distance: Double) -> Bool {
-        guard let hit = self.distance(atAzimuth: azimuth, elevation: elevation) else { return true }
-        return hit >= distance * 0.97 - 30
+        let x = normalizedAzimuth(azimuth) / settings.azimuthStep
+        let i = Int(x), f = x - Double(i)
+        let limit = Float(distance * 0.998 - 30)
+        func blocking(_ ray: Int) -> Double {
+            let points = envelope(ofRay: ray % count)
+            // Last point nearer than the limit; the envelope is sorted by distance.
+            var lo = points.startIndex, hi = points.endIndex
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if points[mid].distance < limit { lo = mid + 1 } else { hi = mid }
+            }
+            return lo > points.startIndex ? Double(points[lo - 1].elevation) : -90
+        }
+        let nearer = blocking(i) * (1 - f) + blocking(i + 1) * f
+        let slack = atan(15 / max(distance, 1)) * 180 / .pi
+        return nearer <= elevation + slack
     }
 }
 

@@ -251,6 +251,7 @@ public final class Terrain: @unchecked Sendable {
     /// Bilinearly interpolated height in meters, or NaN outside the loaded area.
     @inline(__always)
     public func height(latitude: Double, longitude: Double) -> Double {
+        guard latitude.isFinite, longitude.isFinite else { return .nan }
         // A tile owns latitudes in (south, south + 1] and longitudes in [west, west + 1).
         let south = Int((latitude).rounded(.up)) - 1
         let west = Int(longitude.rounded(.down))
@@ -297,12 +298,28 @@ public final class Terrain: @unchecked Sendable {
             let i = r0 * tile.cols + c0
             let h00 = Double(tile.heights[i]), h01 = Double(tile.heights[i + 1])
             let h10 = Double(tile.heights[i + tile.cols]), h11 = Double(tile.heights[i + tile.cols + 1])
-            return (h00 * (1 - fx) + h01 * fx) * (1 - fy) + (h10 * (1 - fx) + h11 * fx) * fy
+            return bilinear(h00, h01, h10, h11, fx, fy)
         }
         // On the last row or column the neighbors live in the next tile.
         let h00 = sample(tile, r0, c0), h01 = sample(tile, r0, c0 + 1)
         let h10 = sample(tile, r0 + 1, c0), h11 = sample(tile, r0 + 1, c0 + 1)
-        return (h00 * (1 - fx) + h01 * fx) * (1 - fy) + (h10 * (1 - fx) + h11 * fx) * fy
+        return bilinear(h00, h01, h10, h11, fx, fy)
+    }
+
+    /// Bilinear interpolation between four pixels. Pixels without data (voids in the DEM)
+    /// are left out and the others weighted up; with none left, the height is `missing`.
+    @inline(__always)
+    func bilinear(_ h00: Double, _ h01: Double, _ h10: Double, _ h11: Double, _ fx: Double, _ fy: Double) -> Double {
+        let void = Double(ElevationTile.noData)
+        if h00 != void, h01 != void, h10 != void, h11 != void {
+            return (h00 * (1 - fx) + h01 * fx) * (1 - fy) + (h10 * (1 - fx) + h11 * fx) * fy
+        }
+        var sum = 0.0, weight = 0.0
+        for (h, w) in [(h00, (1 - fx) * (1 - fy)), (h01, fx * (1 - fy)), (h10, (1 - fx) * fy), (h11, fx * fy)] where h != void {
+            sum += h * w
+            weight += w
+        }
+        return weight > 1e-9 ? sum / weight : missing
     }
 
     /// Height of pixel (row, col) of `tile`, following it into a neighbor tile when out of range.

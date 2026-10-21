@@ -159,6 +159,16 @@ public func destination(from origin: GeoPoint, azimuth: Double, distance: Double
     return ray.point(cosDelta: cos(delta), sinDelta: sin(delta))
 }
 
+/// Distance along the ground from `origin` to `p`, meters: the inverse of `destination`,
+/// and the distance the horizon renderer marches. Heights don't count.
+public func groundDistance(from origin: GeoPoint, to p: GeoPoint) -> Double {
+    let sphere = ConformalSphere(latitude: origin.latitude)
+    let c1 = sphere.chi0, c2 = ConformalSphere.conformalLatitude(p.latitude * .pi / 180)
+    let dl = (p.longitude - origin.longitude) * .pi / 180
+    let a = sin((c2 - c1) / 2) * sin((c2 - c1) / 2) + cos(c1) * cos(c2) * sin(dl / 2) * sin(dl / 2)
+    return 2 * asin(min(1, a.squareRoot())) / sphere.radiansPerMeter
+}
+
 /// Azimuth in [0, 360).
 public func normalizedAzimuth(_ degrees: Double) -> Double {
     let r = degrees.truncatingRemainder(dividingBy: 360)

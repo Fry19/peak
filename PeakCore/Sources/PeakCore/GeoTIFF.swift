@@ -26,6 +26,8 @@ public enum GeoTIFF {
         var predictor: Int
         var bitsPerSample: Int
         var sampleFormat: Int
+        /// The value marking pixels without data (GDAL_NODATA), if the file names one.
+        var noData: Double?
 
         /// The bytes of the file holding this image's data.
         public var byteRange: Range<Int> {
@@ -187,8 +189,11 @@ public enum GeoTIFF {
                     } else {
                         value = Double(Int16(bitPattern: UInt16(block[i]) | UInt16(block[i + 1]) << 8))
                     }
+                    // Voids: the file's no-data value, NaN, and the usual fill values
+                    // (−32768, −32767, −9999, −999999), which are all far below any land.
+                    let void = !value.isFinite || value < -1000 || img.noData.map { Float($0) == Float(value) } == true
                     heights[(by + r - row0) * cols + bx + c - col0] =
-                        Int16(max(-32767, min(32767, value.isFinite ? value.rounded(.toNearestOrEven) : 0)))
+                        void ? ElevationTile.noData : Int16(min(32767, value.rounded(.toNearestOrEven)))
                 }
             }
         }
@@ -217,17 +222,36 @@ public enum GeoTIFF {
         guard (sampleFormat == 3 && bitsPerSample == 32) || (sampleFormat != 3 && bitsPerSample == 16) else {
             throw Failure("\(bitsPerSample)-bit samples of format \(sampleFormat) are not supported")
         }
-        // Blocks are tiles, or strips as full-width tiles.
-        if let tw = one(322), let th = one(323), let o = tags[324], let c = tags[325] {
-            return Image(width: width, height: height, blockWidth: tw, blockHeight: th, tiled: true,
-                         offsets: o.map { Int($0) }, counts: c.map { Int($0) }, compression: compression,
-                         predictor: one(317) ?? 1, bitsPerSample: bitsPerSample, sampleFormat: sampleFormat)
-        } else if let o = tags[273], let c = tags[279] {
-            return Image(width: width, height: height, blockWidth: width, blockHeight: min(one(278) ?? height, height),
-                         tiled: false, offsets: o.map { Int($0) }, counts: c.map { Int($0) }, compression: compression,
-                         predictor: one(317) ?? 1, bitsPerSample: bitsPerSample, sampleFormat: sampleFormat)
+        // GDAL_NODATA is ASCII text, such as "-32767".
+        let noData = tags[42113].flatMap { chars in
+            Double(String(decoding: chars.prefix { $0 != 0 }.map { UInt8(clamping: Int($0)) }, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        throw Failure("no tile or strip offsets")
+        guard (1...1 << 20).contains(width), (1...1 << 20).contains(height) else {
+            throw Failure("image size \(width)×\(height) is not supported")
+        }
+        // Blocks are tiles, or strips as full-width tiles.
+        let img: Image
+        if let tw = one(322), let th = one(323), let o = tags[324], let c = tags[325] {
+            img = Image(width: width, height: height, blockWidth: tw, blockHeight: th, tiled: true,
+                        offsets: o.map { Int($0) }, counts: c.map { Int($0) }, compression: compression,
+                        predictor: one(317) ?? 1, bitsPerSample: bitsPerSample, sampleFormat: sampleFormat, noData: noData)
+        } else if let o = tags[273], let c = tags[279] {
+            img = Image(width: width, height: height, blockWidth: width, blockHeight: min(one(278) ?? height, height),
+                        tiled: false, offsets: o.map { Int($0) }, counts: c.map { Int($0) }, compression: compression,
+                        predictor: one(317) ?? 1, bitsPerSample: bitsPerSample, sampleFormat: sampleFormat, noData: noData)
+        } else {
+            throw Failure("no tile or strip offsets")
+        }
+        guard (1...1 << 16).contains(img.blockWidth), (1...1 << 20).contains(img.blockHeight) else {
+            throw Failure("block size \(img.blockWidth)×\(img.blockHeight) is not supported")
+        }
+        let blocksDown = (height + img.blockHeight - 1) / img.blockHeight
+        guard img.offsets.count == img.blocksAcross * blocksDown, img.counts.count == img.offsets.count else {
+            throw Failure("\(img.offsets.count) block offsets and \(img.counts.count) sizes for \(img.blocksAcross * blocksDown) blocks")
+        }
+        guard img.offsets.allSatisfy({ $0 >= 0 }), img.counts.allSatisfy({ $0 >= 0 }) else { throw Failure("negative block offset or size") }
+        return img
     }
 
     /// Pixel spacing and the first pixel's center, from the GeoTIFF tags.

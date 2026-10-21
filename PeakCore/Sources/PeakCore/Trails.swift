@@ -175,7 +175,13 @@ public struct Trail: Codable, Sendable, Identifiable, Hashable {
     /// Joins lines that share end points into as few lines as possible, longest first.
     /// OpenStreetMap ways of one route meet at shared nodes, so their ends match exactly.
     public static func chain(_ parts: [[LatLon]]) -> [[LatLon]] {
-        let remaining = parts.filter { $0.count >= 2 }
+        chainParts(parts).map(\.line)
+    }
+
+    /// `chain`, with the indices in `parts` of the parts each line is made of.
+    static func chainParts(_ parts: [[LatLon]]) -> [(line: [LatLon], parts: [Int])] {
+        let kept = parts.indices.filter { parts[$0].count >= 2 }
+        let remaining = kept.map { parts[$0] }
         guard !remaining.isEmpty else { return [] }
         func key(_ p: LatLon) -> [Int] { [Int((p.latitude * 1e6).rounded()), Int((p.longitude * 1e6).rounded())] }
         var used = [Bool](repeating: false, count: remaining.count)
@@ -185,20 +191,22 @@ public struct Trail: Codable, Sendable, Identifiable, Hashable {
             byEnd[key(part.last!), default: []].append(i)
         }
         let order = remaining.indices.sorted { length(of: remaining[$0]) > length(of: remaining[$1]) }
-        var chains: [[LatLon]] = []
+        var chains: [(line: [LatLon], parts: [Int])] = []
         for start in order where !used[start] {
             used[start] = true
             var line = remaining[start]
+            var members = [kept[start]]
             // Grow at the end, then at the start, while some unused part touches it.
             for _ in 0..<2 {
                 while let next = byEnd[key(line.last!)]?.first(where: { !used[$0] }) {
                     used[next] = true
+                    members.append(kept[next])
                     let part = remaining[next]
                     line += key(part.first!) == key(line.last!) ? Array(part.dropFirst()) : Array(part.reversed().dropFirst())
                 }
                 line.reverse()
             }
-            chains.append(line)
+            chains.append((line, members))
         }
         return chains
     }
@@ -215,7 +223,8 @@ public struct TrailProfile: Sendable {
 
     /// Points along the main line, from its lower end.
     public var points: [Point]
-    /// Total climb and descent over all lines, each walked from its lower end, meters.
+    /// Total climb and descent, walking every line the same way (up from the main line's
+    /// lower end), meters.
     public var gain: Double
     public var loss: Double
     public var highest: Double
@@ -226,9 +235,12 @@ public struct TrailProfile: Sendable {
 }
 
 extension Trail {
-    /// Samples the terrain every `spacing` meters along the trail. Climbs smaller than
-    /// `threshold` meters are ignored as noise. Nil when the terrain doesn't cover it.
-    public func profile(on terrain: Terrain, spacing: Double = 25, threshold: Double = 3) -> TrailProfile? {
+    /// Samples the terrain every `spacing` meters along the trail. For the climb, heights
+    /// are smoothed over `smoothing` meters and changes smaller than `threshold` meters
+    /// are ignored, since the terrain model's noise would otherwise add up to hundreds of
+    /// meters. Nil when the terrain doesn't cover the trail.
+    public func profile(on terrain: Terrain, spacing: Double = 25, smoothing: Double = 100,
+                        threshold: Double = 8) -> TrailProfile? {
         func sample(_ line: [LatLon]) -> [TrailProfile.Point] {
             var out: [TrailProfile.Point] = []
             var along = 0.0
@@ -239,27 +251,59 @@ extension Trail {
                 let h = terrain.height(latitude: p.latitude, longitude: p.longitude)
                 if h.isFinite { out.append(.init(distance: along, elevation: h, position: p)) }
             }
-            // Start at the lower end.
-            if let first = out.first, let end = out.last, end.elevation < first.elevation {
-                let total = end.distance
-                out = out.reversed().map { .init(distance: total - $0.distance, elevation: $0.elevation, position: $0.position) }
-            }
             return out
         }
+        func reversed(_ points: [TrailProfile.Point]) -> [TrailProfile.Point] {
+            let total = points.last?.distance ?? 0
+            return points.reversed().map { .init(distance: total - $0.distance, elevation: $0.elevation, position: $0.position) }
+        }
+        /// Climb and descent along points, after a moving average over `smoothing` meters
+        /// (narrower toward the ends, so the ends keep their heights).
         func climb(_ points: [TrailProfile.Point]) -> (Double, Double) {
-            guard var anchor = points.first?.elevation else { return (0, 0) }
-            var up = 0.0, down = 0.0
-            for p in points.dropFirst() {
-                let d = p.elevation - anchor
-                if d >= threshold { up += d; anchor = p.elevation } else if d <= -threshold { down -= d; anchor = p.elevation }
+            guard let first = points.first?.distance, let last = points.last?.distance else { return (0, 0) }
+            let smooth = points.indices.map { i -> Double in
+                let d = points[i].distance
+                let half = min(smoothing / 2, d - first, last - d)
+                var sum = points[i].elevation, n = 1.0
+                var j = i - 1
+                while j >= 0, points[j].distance >= d - half { sum += points[j].elevation; n += 1; j -= 1 }
+                j = i + 1
+                while j < points.count, points[j].distance <= d + half { sum += points[j].elevation; n += 1; j += 1 }
+                return sum / n
             }
+            var anchor = smooth[0], up = 0.0, down = 0.0
+            for h in smooth.dropFirst() {
+                let d = h - anchor
+                if d >= threshold { up += d; anchor = h } else if d <= -threshold { down -= d; anchor = h }
+            }
+            // What's left at the end counts too.
+            let rest = smooth[smooth.count - 1] - anchor
+            if rest > 0 { up += rest } else { down -= rest }
             return (up, down)
         }
-        let main = sample(mainLine)
+
+        var main = sample(mainLine)
         guard main.count >= 2 else { return nil }
+        // Start at the lower end.
+        if main.last!.elevation < main.first!.elevation { main = reversed(main) }
+        // Walk the other lines the same way: along the main line, from its start to its end.
+        let ax = main.last!.position.longitude - main.first!.position.longitude
+        let ay = main.last!.position.latitude - main.first!.position.latitude
+        let k = cos(main.first!.position.latitude * .pi / 180)
         var gain = 0.0, loss = 0.0, highest = -Double.infinity, lowest = Double.infinity
+        var mainDone = false
         for line in lines {
-            let points = sample(line)
+            var points: [TrailProfile.Point]
+            if !mainDone, line == mainLine {
+                points = main
+                mainDone = true
+            } else {
+                points = sample(line)
+                if let a = points.first?.position, let b = points.last?.position,
+                   (b.longitude - a.longitude) * ax * k * k + (b.latitude - a.latitude) * ay < 0 {
+                    points = reversed(points)
+                }
+            }
             let (up, down) = climb(points)
             gain += up
             loss += down
@@ -347,7 +391,7 @@ extension Overpass {
         }
         func meters(_ raw: String?) -> Double? {
             guard var s = raw?.trimmingCharacters(in: .whitespaces).lowercased(), !s.isEmpty else { return nil }
-            let miles = s.hasSuffix("mi")
+            let miles = s.hasSuffix("mi") || s.hasSuffix("mile") || s.hasSuffix("miles")
             let meters = s.hasSuffix("m") && !s.hasSuffix("km")
             s = String(s.prefix { $0.isNumber || $0 == "." || $0 == "," }).replacingOccurrences(of: ",", with: ".")
             guard let v = Double(s), v > 0 else { return nil }
@@ -402,14 +446,16 @@ extension Overpass {
         let unnamed = elements.filter {
             $0.type == "way" && $0.geometry != nil && !routeWays.contains($0.id) && ($0.tags?["name"] ?? "").isEmpty
         }
-        let unnamedParts = unnamed.map { (way: $0, pieces: pieces($0.geometry ?? [])) }
-        for line in Trail.chain(unnamedParts.flatMap(\.pieces)) {
-            let points = Set(line.map { [Int(($0.latitude * 1e6).rounded()), Int(($0.longitude * 1e6).rounded())] })
-            let ways = unnamedParts.filter { part in
-                part.pieces.contains { piece in piece.contains { points.contains([Int(($0.latitude * 1e6).rounded()), Int(($0.longitude * 1e6).rounded())]) } }
-            }.map(\.way)
+        // The id and difficulty come from the ways the line is made of, not ones that merely
+        // touch it: at a T-junction each branch is its own line with its own id.
+        let unnamedPieces = unnamed.flatMap { way in pieces(way.geometry ?? []).map { (way: way, piece: $0) } }
+        for (line, members) in Trail.chainParts(unnamedPieces.map(\.piece)) {
+            var seen = Set<Int64>()
+            let ways = members.map { unnamedPieces[$0].way }.filter { seen.insert($0.id).inserted }
             let difficulty = ways.compactMap { wayDifficulty[$0.id] }.max()
-            let id = ways.map(\.id).min().map { "u\($0)" } ?? "u"
+            var id = ways.map(\.id).min().map { "u\($0)" } ?? "u"
+            // Pieces of one way clipped apart make lines of their own.
+            if trails.contains(where: { $0.id == id }) { id += "." + String(trails.filter { $0.id.hasPrefix(id) }.count) }
             trails.append(Trail(id: id, name: "Unnamed path" + (difficulty.map { " (\($0.grade))" } ?? ""), kind: .path,
                                 lines: [line], difficulty: difficulty,
                                 isPartial: ways.contains { $0.geometry?.contains(where: { $0 == nil }) ?? false }))

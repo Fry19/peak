@@ -398,7 +398,8 @@ actor DataStore {
     func peaks(latitude: Double, longitude: Double, radius: Double) async throws -> [Peak] {
         // Cache by a 0.25° grid cell so nearby spots share one download.
         let cellLat = (latitude * 4).rounded() / 4, cellLon = (longitude * 4).rounded() / 4
-        let cache = peakDirectory.appendingPathComponent(String(format: "%.2f_%.2f_%d.json", cellLat, cellLon, Int(radius / 1000)))
+        // "v2": since volcanoes are fetched too, so caches without them are fetched again.
+        let cache = peakDirectory.appendingPathComponent(String(format: "%.2f_%.2f_%d_v2.json", cellLat, cellLon, Int(radius / 1000)))
         // None at all is more likely a download gone wrong than a place without peaks, so
         // ask again after a day.
         if let peaks = cachedPeaks(cache), age(of: cache) < (peaks.isEmpty ? 86_400 : 30 * 86_400) { return peaks }

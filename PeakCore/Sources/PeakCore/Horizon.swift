@@ -146,6 +146,7 @@ public final class HorizonRenderer: @unchecked Sendable {
     public struct Visibility: Sendable {
         public var azimuth: Double
         public var elevation: Double
+        /// Distance along the ground (horizontal, as on a map), meters.
         public var distance: Double
         /// How far the target clears the terrain in front of it, in degrees (negative: hidden).
         public var clearance: Double
@@ -159,11 +160,14 @@ public final class HorizonRenderer: @unchecked Sendable {
                            summitRadius: Double = 250, tolerance: Double = 15,
                            settings: HorizonSettings = HorizonSettings()) -> Visibility {
         let look = LocalFrame(origin: observer).look(at: target, refraction: settings.refraction)
+        // The march measures distance along the ground. The straight-line distance is longer
+        // for a summit far above or below, and would let terrain behind the summit block it.
+        let ground = groundDistance(from: observer, to: target)
         let blocking = maxElevation(from: observer, azimuth: look.azimuth,
-                                    upTo: max(0, look.distance - summitRadius), settings: settings)
+                                    upTo: max(0, ground - summitRadius), settings: settings)
         let slack = atan(tolerance / max(look.distance, 1)) * 180 / .pi
         let clearance = look.elevation - blocking
-        return Visibility(azimuth: look.azimuth, elevation: look.elevation, distance: look.distance,
+        return Visibility(azimuth: look.azimuth, elevation: look.elevation, distance: ground,
                           clearance: clearance, isVisible: clearance + slack >= 0)
     }
 }
