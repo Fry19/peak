@@ -143,7 +143,7 @@ jobs:
           # Ask Overpass a query (file $1) and save the answer in $2, trying the servers the
           # app uses in turn; an answer reporting a failed query counts as none.
           overpass() {
-            for server in https://maps.mail.ru/osm/tools/overpass https://overpass-api.de https://overpass.private.coffee https://overpass.kumi.systems; do
+            for server in https://overpass-api.de https://overpass.openstreetmap.fr https://overpass.kumi.systems https://overpass.private.coffee https://maps.mail.ru/osm/tools/overpass; do
               if curl -sSf -m "${3:-90}" -A "$UA" --data-urlencode "data@$1" "$server/api/interpreter" -o "$2" \
                  && ! grep -q '"remark": *"[^"]*[Ee]rror' "$2"; then
                 echo "From $server"

@@ -57,7 +57,8 @@ struct StatusPill: View {
                 Circle()
                     .fill(state == .locked ? Color.green : state == .byHand ? Color.cyan : Color.orange)
                     .frame(width: 7, height: 7)
-                Text((heading.map { "\($0) · " } ?? "") + (state == .locked ? "Locked" : state == .byHand ? "Lined up" : "Compass"))
+                Text((heading.map { "\($0) · " } ?? "") + (state == .locked ? "Locked" : state == .byHand ? "Lined up" : "Compass")
+                     + (model.waitingForPeaks ? " · Getting peaks…" : ""))
             }
         }
     }

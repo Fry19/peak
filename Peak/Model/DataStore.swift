@@ -287,12 +287,14 @@ actor DataStore {
     // MARK: OpenStreetMap
 
     /// Overpass servers, tried in turn when one is busy or down (the main one often answers
-    /// 502 or 504 under load).
+    /// 502 or 504 under load, or queues a query for most of a minute). OpenStreetMap France's
+    /// has the whole world and is often the quicker of the first two.
     private static let overpassServers = [
         Overpass.endpoint,
-        URL(string: "https://maps.mail.ru/osm/tools/overpass/api/interpreter")!,
-        URL(string: "https://overpass.private.coffee/api/interpreter")!,
+        URL(string: "https://overpass.openstreetmap.fr/api/interpreter")!,
         URL(string: "https://overpass.kumi.systems/api/interpreter")!,
+        URL(string: "https://overpass.private.coffee/api/interpreter")!,
+        URL(string: "https://maps.mail.ru/osm/tools/overpass/api/interpreter")!,
     ]
 
     /// Runs an Overpass query, asking the servers two at a time: the first good answer
@@ -349,33 +351,64 @@ actor DataStore {
         return data
     }
 
+    /// How long ago a file was written, seconds; infinity when there's none.
+    private func age(of url: URL) -> TimeInterval {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+            .map { Date().timeIntervalSince($0) } ?? .infinity
+    }
+
     /// A cached file younger than `maxAge` seconds, if there is one.
     private func cached(_ url: URL, maxAge: TimeInterval) -> Data? {
-        let age = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
-            .map { Date().timeIntervalSince($0) } ?? .infinity
-        return age < maxAge ? try? Data(contentsOf: url) : nil
+        age(of: url) < maxAge ? try? Data(contentsOf: url) : nil
+    }
+
+    /// The peaks in a cached Overpass answer. Before 0.8 the answer to a query the server
+    /// gave up on was kept too, with no peaks in it; that doesn't count.
+    private func cachedPeaks(_ url: URL) -> [Peak]? {
+        guard let data = try? Data(contentsOf: url), Overpass.failure(inJSON: data) == nil else { return nil }
+        return try? Overpass.peaks(fromJSON: data)
     }
 
     /// Named peaks from OpenStreetMap, cached for a month. Inside an area saved for offline
-    /// use, the area's peaks; otherwise falls back to an older cache, or no peaks, when there
-    /// is no connection.
-    func peaks(latitude: Double, longitude: Double, radius: Double) async -> [Peak] {
+    /// use, the area's peaks; when the servers can't be reached, an older cache or what saved
+    /// areas nearby have. Throws when there's none of that, so the caller can try again.
+    func peaks(latitude: Double, longitude: Double, radius: Double) async throws -> [Peak] {
         // Cache by a 0.25° grid cell so nearby spots share one download.
         let cellLat = (latitude * 4).rounded() / 4, cellLon = (longitude * 4).rounded() / 4
         let cache = peakDirectory.appendingPathComponent(String(format: "%.2f_%.2f_%d.json", cellLat, cellLon, Int(radius / 1000)))
-        if let data = cached(cache, maxAge: 30 * 86_400), let peaks = try? Overpass.peaks(fromJSON: data) { return peaks }
+        // None at all is more likely a download gone wrong than a place without peaks, so
+        // ask again after a day.
+        if let peaks = cachedPeaks(cache), age(of: cache) < (peaks.isEmpty ? 86_400 : 30 * 86_400) { return peaks }
         let here = LatLon(latitude, longitude)
         if let saved = areaPeaks(around: here, radius: radius, coveredOnly: true) { return saved }
+        do {
+            return try await downloadPeaks(cellLat: cellLat, cellLon: cellLon, radius: radius, to: cache)
+        } catch {
+            if let peaks = cachedPeaks(cache) { return peaks }
+            if let saved = areaPeaks(around: here, radius: radius, coveredOnly: false) { return saved }
+            throw error
+        }
+    }
+
+    /// Peak downloads under way, by cache file: a second load for the same place waits for
+    /// the first instead of asking the servers again.
+    private var peakDownloads: [URL: Task<[Peak], Error>] = [:]
+
+    private func downloadPeaks(cellLat: Double, cellLon: Double, radius: Double, to cache: URL) async throws -> [Peak] {
+        if let running = peakDownloads[cache] { return try await running.value }
         // A little beyond the radius, around the cell's center, so the whole circle is covered.
         let r = radius + 20_000
         let dlat = r / 111_000, dlon = r / (111_000 * max(cos(cellLat * .pi / 180), 0.05))
         let query = Overpass.peaksQuery(south: cellLat - dlat, west: cellLon - dlon, north: cellLat + dlat, east: cellLon + dlon)
-        if let data = try? await overpass(query, timeout: 90), let peaks = try? Overpass.peaks(fromJSON: data) {
+        let download = Task {
+            let data = try await self.overpass(query, timeout: 90)
+            let peaks = try Overpass.peaks(fromJSON: data)
             try? data.write(to: cache)
             return peaks
         }
-        if let data = try? Data(contentsOf: cache), let peaks = try? Overpass.peaks(fromJSON: data) { return peaks }
-        return areaPeaks(around: here, radius: radius, coveredOnly: false) ?? []
+        peakDownloads[cache] = download
+        defer { peakDownloads[cache] = nil }
+        return try await download.value
     }
 
     /// How far from a summit hikes are looked for, meters.

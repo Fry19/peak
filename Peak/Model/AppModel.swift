@@ -100,7 +100,16 @@ final class AppModel {
         var runs: [[DrapedPoint]]?
     }
 
+    /// Getting the peaks around you: under way, waiting to try again, or done.
+    enum PeaksState: Equatable {
+        case loading
+        /// No connection or the servers were busy, and none were saved; trying again at `at`.
+        case retrying(at: Date, reason: String)
+        case loaded
+    }
+
     var phase: Phase = .locating
+    private(set) var peaksState: PeaksState = .loading
     var scene: TerrainScene?
     var correction = Correction()
     var frozen: Frozen?
@@ -347,6 +356,11 @@ final class AppModel {
         scene?.allPeaks[id]?.peak ?? peaks.first { $0.id == id }
     }
 
+    /// No peaks to show yet because they're still on their way, not because there are none.
+    var waitingForPeaks: Bool {
+        peaks.isEmpty && peaksState != .loaded
+    }
+
     /// Opens a peak's card and highlights it in the view.
     func select(_ id: Int64) {
         selectedPeakID = id
@@ -421,12 +435,30 @@ final class AppModel {
         let here = DataStore.Key(south: Int(lat.rounded(.down)), west: Int(lon.rounded(.down)))
         let store = self.store
 
-        // Peaks come from a different server; don't wait for them to show the terrain.
+        // Peaks come from a different server; don't wait for them to show the terrain. With
+        // no signal or the servers busy, keep trying until a newer load takes over.
+        peaksState = .loading
         Task { @MainActor in
-            let found = await store.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
-            guard generation == loadGeneration else { return }
-            peaks = found
-            if scene != nil { await rebuild() }
+            var wait = 10.0
+            while true {
+                do {
+                    let found = try await store.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
+                    // A newer load's peaks win, but these, from a few km away, do until then.
+                    let current = generation == loadGeneration
+                    guard current || peaks.isEmpty else { return }
+                    peaks = found
+                    if current { peaksState = .loaded }
+                    if scene != nil { await rebuild() }
+                    return
+                } catch {
+                    guard generation == loadGeneration else { return }
+                    peaksState = .retrying(at: Date().addingTimeInterval(wait), reason: error.localizedDescription)
+                    try? await Task.sleep(for: .seconds(wait))
+                    guard generation == loadGeneration else { return }
+                    peaksState = .loading
+                    wait = min(wait * 2, 60)
+                }
+            }
         }
 
         loadTask = Task { @MainActor in
@@ -779,6 +811,14 @@ final class AppModel {
         if let scene {
             lines.append(String(format: "view: built in %.2f s, %ld peaks, %ld visible, eye at %.0f m", lastBuildSeconds,
                                 peaks.count, scene.peaks.count, scene.observer.height))
+        }
+        switch peaksState {
+        case .loading:
+            lines.append("peaks: downloading…")
+        case let .retrying(at, reason):
+            lines.append(String(format: "peaks: trying again in %.0f s (%@)", max(0, at.timeIntervalSinceNow), reason))
+        case .loaded:
+            break
         }
         if let lens = camera.lens {
             let k = lens.intrinsics
