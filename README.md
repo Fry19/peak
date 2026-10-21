@@ -32,7 +32,7 @@ You need an iPhone with iOS 17 or later. Both ways work with a free Apple ID; wi
 
 ### Option 1: Sideload the IPA (no Xcode)
 
-Every push builds an unsigned `Peak.ipa`: open the latest **Build** run under the repo's Actions tab and download the **Peak-ipa** artifact (a zip with the IPA inside). Tagged versions (`v0.1.0` and so on) also put `Peak_<version>.ipa` on the Releases page.
+Every push builds an unsigned `Peak.ipa`: open the latest **Build** run under the repo's Actions tab and download the **Peak.ipa** artifact. Tagged versions (`v0.1.0` and so on) also put `Peak_<version>.ipa` on the Releases page.
 
 iPhones can't install an app file directly, so a sideloading tool signs it with your Apple ID:
 
@@ -159,7 +159,7 @@ A `.pkdem` file is a 64-byte header (magic `PKDM`, version, south and west edge 
 GitHub Actions runs on every push:
 
 - **PeakCore tests** on macOS and on Linux.
-- **Build app**: archives the app for iPhone and uploads an unsigned `Peak.ipa` as the `Peak-ipa` artifact.
+- **Build app**: archives the app for iPhone and uploads the unsigned `Peak.ipa` as an artifact (not zipped).
 - **Skyline matching benchmark** on macOS: downloads the DEM (cached between runs), runs the three benchmarks above, and posts the tables in the job summary. The panorama, the Matterhorn example and the benchmark frames are saved as a `skyline-matching` artifact.
 
 **Release** runs when a `v*` tag is pushed (or by hand with a tag name): it builds `Peak_<version>.ipa` and publishes it on the Releases page.
