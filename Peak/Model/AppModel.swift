@@ -814,7 +814,7 @@ final class PeakDetails {
 
 /// Time to finish work after Peak goes to the background (about half a minute), given back
 /// when done or when the time is up.
-private final class BackgroundTime {
+@MainActor private final class BackgroundTime {
     private var id = UIBackgroundTaskIdentifier.invalid
 
     init(name: String) {
