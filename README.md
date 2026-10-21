@@ -2,29 +2,31 @@
 
 An iPhone app that labels the mountains in your camera view and stays lined up with them. Phone compasses are often 5–15° off, which is why other peak apps drift. Peak corrects the heading by matching the skyline the camera sees against the skyline the terrain says should be there.
 
-This repo holds the skyline matching from the [project brief](CLAUDE.md), built and measured at a desk first, and a first version of the iPhone app (0.1) that uses it in a live camera view.
+This repo holds the skyline matching from the [project brief](CLAUDE.md), built and measured at a desk first, and an early version of the iPhone app (0.2) that uses it in a live camera view.
 
 ![Synthetic photo toward the Matterhorn from Gornergrat. Red: the horizon where an 8° wrong compass puts it. Green: after skyline matching. Yellow: the detected skyline. Cyan: ridges behind the skyline.](docs/matterhorn-aligned.jpg)
 
 *Red is where an 8° wrong compass puts the horizon, green is after correction (0.02° off), yellow is the detected skyline, and cyan marks ridges behind it.*
 
-## The app (0.1)
+## The app (0.2)
 
-Peak opens straight into the camera. The first time you use it somewhere, it downloads the terrain and the named peaks for 80 km around you and keeps them, so the same area works offline afterwards. Then it draws:
+Peak opens straight into the camera. The labels follow the phone the way PeakVisor's do: the phone's motion sensors (gyroscope, accelerometer and compass, referenced to true north) give its orientation instantly, and the overlay is redrawn on every display frame. Since the mountains are kilometers away, only the phone's rotation matters, so there's no ARKit world tracking to wait for.
+
+The first time you use it somewhere, it downloads the terrain and the named peaks for 80 km around you and keeps them, so the same area works offline afterwards. Then it draws:
 
 - the skyline and the ridges in front of it as thin glowing lines, nearer ones brighter and farther ones fading;
 - labels (name and height) for up to 10 of the highest peaks you can actually see. Peaks hidden behind a nearer ridge aren't labeled.
 
-About once a second, while the phone is steady enough for ARKit to track, Peak matches the skyline in the camera picture against the terrain and corrects the compass. The pill at the bottom shows which mode it's in:
+About once a second, while you hold the phone steady, Peak matches the skyline in the camera picture against the terrain and corrects the compass. The pill at the bottom shows which mode it's in:
 
 - **Locked to the skyline** (green): the last match was within 20 seconds. It also shows how far off your compass was.
-- **Using the compass** (orange): no match yet. Point the phone at mountains with a clear skyline.
+- **Using the compass** (orange): no match yet. Point the phone at mountains with a clear skyline and hold it still for a moment.
 
 Tap anywhere to freeze the view so you can lower the phone and look; tap again to go live. A light tick marks a labeled peak crossing the middle of the screen.
 
-**Downloads:** terrain comes as 1° tiles of about 40 MB each, and 80 km around you is usually 4 to 9 tiles, so set it up on Wi-Fi. Peaks come from OpenStreetMap through the Overpass API (a few hundred KB). Both are cached on the phone.
+**Downloads:** the Copernicus tiles have lower-resolution copies built in, so Peak first fetches every tile around you at 120 m (about 2 MB each; 60 m, 8 MB, for the tile you're standing in), all at once, and shows the view. Then it sharpens the terrain in the background: the full 30 m within 15 km (about 31 MB a tile) and 60 m within 40 km. Peaks come from OpenStreetMap through the Overpass API (a few hundred KB). Everything is cached on the phone.
 
-Not in 0.1 yet: tapping a peak for details, trails, downloading a region ahead of time, and a learned skyline detector. The app has only been built in CI, not tried on a phone yet, so expect rough edges.
+Not in 0.2 yet: tapping a peak for details, trails, downloading a region ahead of time, and a learned skyline detector.
 
 ## Installing on your iPhone
 
@@ -128,8 +130,8 @@ iPhone photos record where they were taken and which way the camera faced (the c
 ```
 Peak.xcodeproj
 Peak/                      The iPhone app (SwiftUI and ARKit)
-  Model/                   Location, downloads and caching, skyline correction, projection to the screen
-  Views/                   Camera, overlay with ridgelines and labels, status pill
+  Model/                   Motion sensors, camera, location, downloads and caching, skyline correction
+  Views/                   Camera preview, overlay with ridgelines and labels, status pill
 PeakCore/                  Swift package, no iOS dependencies (builds on macOS and Linux)
   Sources/PeakCore/
     Geodesy.swift          WGS84, east-north-up frames, conformal-sphere rays
@@ -141,7 +143,7 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
     SkylineMatcher.swift   Detection and alignment for one frame
     Anchors.swift          True attitude of a real photo from marked summits
     Scene.swift            Ridge segments to draw and visible peaks
-    GeoTIFF.swift          Reads Copernicus tiles on the phone (with Inflate.swift)
+    GeoTIFF.swift          Reads Copernicus tiles and their built-in lower resolutions (with Inflate.swift)
     Peaks.swift            Peaks from OpenStreetMap's Overpass API
     UprightFrame.swift     Turns sideways camera frames so the sky is up
     SyntheticPhoto.swift   Fake photos with a known camera, for testing

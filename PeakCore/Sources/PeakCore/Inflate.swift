@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Compression)
+import Compression
+#endif
 
 /// A DEFLATE decoder (RFC 1951, with the zlib wrapper of RFC 1950), so GeoTIFF tiles can
 /// be read the same way on every platform without a system library.
@@ -14,8 +17,29 @@ public enum Inflate {
         let cmf = Int(data[0]), flg = Int(data[1])
         guard cmf & 0x0F == 8, (cmf << 8 | flg) % 31 == 0 else { throw Failure("not a zlib stream") }
         guard flg & 0x20 == 0 else { throw Failure("zlib preset dictionaries are not supported") }
+        #if canImport(Compression)
+        // Apple's decoder is several times faster; use it when the output size is known.
+        if expectedSize > 0, let out = system(data, from: 2, expectedSize: expectedSize) { return out }
+        #endif
         return try raw(data, from: 2, expectedSize: expectedSize)
     }
+
+    #if canImport(Compression)
+    /// Raw DEFLATE through the Compression framework, or nil if the output isn't exactly
+    /// `expectedSize` bytes (then the portable decoder takes over).
+    static func system(_ data: [UInt8], from start: Int, expectedSize: Int) -> [UInt8]? {
+        var out = [UInt8](repeating: 0, count: expectedSize + 1)
+        let written = data.withUnsafeBufferPointer { src in
+            out.withUnsafeMutableBufferPointer { dst in
+                compression_decode_buffer(dst.baseAddress!, dst.count, src.baseAddress! + start, src.count - start,
+                                          nil, COMPRESSION_ZLIB)
+            }
+        }
+        guard written == expectedSize else { return nil }
+        out.removeLast()
+        return out
+    }
+    #endif
 
     /// Decompresses raw DEFLATE data starting at byte `start`.
     public static func raw(_ data: [UInt8], from start: Int = 0, expectedSize: Int = 0) throws -> [UInt8] {

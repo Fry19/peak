@@ -24,7 +24,7 @@ peakbench: desk test harness for skyline matching.
   peakbench detect IMAGE [--width W] [--debug FILE]
       Run only the skyline detector and draw what it found.
 
-  peakbench geotiff FILE.tif [--out FILE.pkdem] [--compare FILE.pkdem]
+  peakbench geotiff FILE.tif [--level N] [--ranged] [--out FILE.pkdem] [--compare FILE.pkdem]
       Decode a Copernicus GeoTIFF with PeakCore's own reader (what the app does).
 
   peakbench case PHOTO.jpg [--out CASE.json]          (macOS only)
@@ -58,14 +58,20 @@ struct Arguments {
     var options: [String: String] = [:]
 
     init(_ args: ArraySlice<String>) {
-        var it = args.makeIterator()
-        while let a = it.next() {
+        let list = Array(args)
+        var i = 0
+        while i < list.count {
+            let a = list[i]
+            i += 1
             if a.hasPrefix("--") {
                 let key = String(a.dropFirst(2))
                 if let eq = key.firstIndex(of: "=") {
                     options[String(key[..<eq])] = String(key[key.index(after: eq)...])
+                } else if i < list.count, !list[i].hasPrefix("--") {
+                    options[key] = list[i]
+                    i += 1
                 } else {
-                    options[key] = it.next() ?? ""
+                    options[key] = ""   // a switch, like --ranged
                 }
             } else {
                 positional.append(a)
@@ -322,7 +328,19 @@ func detectCommand(_ args: Arguments) throws {
 func geotiffCommand(_ args: Arguments) throws {
     guard let path = args.positional.first else { throw HarnessError("which GeoTIFF?") }
     let data = try Data(contentsOf: URL(fileURLWithPath: path))
-    let tile = try timed("Decode") { try GeoTIFF.elevationTile(data) }
+    let level = args.int("level") ?? 0
+    let tile: ElevationTile
+    if args.options["ranged"] != nil {
+        // As the app does it: the directories from the first 16 KB, then one level's bytes.
+        let bytes = [UInt8](data)
+        let layout = try GeoTIFF.layout(Array(bytes.prefix(16_384)))
+        let range = layout.images[level].byteRange
+        print("Levels: " + layout.images.map { "\($0.width)×\($0.height)" }.joined(separator: ", ") +
+              "; level \(level) is bytes \(range.lowerBound)..<\(range.upperBound) (\(range.count / 1000) KB)")
+        tile = try timed("Decode") { try GeoTIFF.decode(layout, level: level, bytes: Array(bytes[range]), base: range.lowerBound) }
+    } else {
+        tile = try timed("Decode") { try GeoTIFF.elevationTile(data, level: level) }
+    }
     let heights = tile.heightValues
     print("Tile \(tile.south), \(tile.west): \(tile.rows)×\(tile.cols), first pixel at \(tile.originLatitude), " +
           "\(tile.originLongitude), \(heights.min()!)–\(heights.max()!) m")

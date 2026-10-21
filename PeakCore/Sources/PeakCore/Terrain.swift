@@ -120,9 +120,10 @@ public enum TerrainError: Error, CustomStringConvertible {
 
 /// A set of 1° tiles with bilinear height lookups that work across tile edges.
 ///
-/// Inside the bounding box of the loaded tiles a missing tile reads as sea level, since
-/// the Copernicus bucket has no tiles over open ocean. Outside it, heights are NaN, so
-/// rays stop where the data stops instead of seeing a flat sea.
+/// By default, a missing tile inside the bounding box of the loaded tiles reads as sea
+/// level, since the Copernicus bucket has no tiles over open ocean. Outside the box, or
+/// everywhere with `missingIsSea: false`, missing heights are NaN, so rays stop where the
+/// data stops instead of seeing a flat sea.
 public final class Terrain: @unchecked Sendable {
     public let tiles: [ElevationTile]
     let minSouth: Int
@@ -130,9 +131,11 @@ public final class Terrain: @unchecked Sendable {
     let latCount: Int
     let lonCount: Int
     let grid: [ElevationTile?]
+    let missing: Double
 
-    public init(tiles: [ElevationTile]) {
+    public init(tiles: [ElevationTile], missingIsSea: Bool = true) {
         self.tiles = tiles
+        missing = missingIsSea ? 0 : .nan
         minSouth = tiles.map(\.south).min() ?? 0
         minWest = tiles.map(\.west).min() ?? 0
         latCount = tiles.isEmpty ? 0 : (tiles.map(\.south).max()! - minSouth + 1)
@@ -159,7 +162,7 @@ public final class Terrain: @unchecked Sendable {
         let west = Int(longitude.rounded(.down))
         let li = south - minSouth, wi = west - minWest
         guard li >= 0, li < latCount, wi >= 0, wi < lonCount else { return .nan }
-        guard let tile = grid[li * lonCount + wi] else { return 0 }
+        guard let tile = grid[li * lonCount + wi] else { return missing }
         let y = (tile.originLatitude - latitude) / tile.stepLatitude
         let x = (longitude - tile.originLongitude) / tile.stepLongitude
         let r0 = Int(y.rounded(.down)), c0 = Int(x.rounded(.down))
@@ -186,7 +189,7 @@ public final class Terrain: @unchecked Sendable {
         let south = Int(lat.rounded(.up)) - 1, west = Int(lon.rounded(.down))
         let li = south - minSouth, wi = west - minWest
         guard li >= 0, li < latCount, wi >= 0, wi < lonCount else { return .nan }
-        guard let other = grid[li * lonCount + wi] else { return 0 }
+        guard let other = grid[li * lonCount + wi] else { return missing }
         let r = Int(((other.originLatitude - lat) / other.stepLatitude).rounded())
         let c = Int(((lon - other.originLongitude) / other.stepLongitude).rounded())
         return Double(other.value(row: max(0, min(other.rows - 1, r)), col: max(0, min(other.cols - 1, c))))

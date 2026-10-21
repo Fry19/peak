@@ -53,6 +53,34 @@ final class GeoTIFFTests: XCTestCase {
         }
     }
 
+    func testOverviewLevelsFromRangedReads() throws {
+        let bytes = [UInt8](Fixtures.pyramidTIFF)
+        // tifffile writes the overview's directory after the first image's data, unlike a
+        // cloud-optimized file, so a short prefix doesn't hold it.
+        XCTAssertThrowsError(try GeoTIFF.layout(Array(bytes.prefix(1024))))
+        let layout = try GeoTIFF.layout(bytes)
+        XCTAssertEqual(layout.images.map(\.width), [32, 16])
+        // Decode the overview from just its own bytes, as the app does with a range request.
+        let range = layout.images[1].byteRange
+        let overview = try GeoTIFF.decode(layout, level: 1, bytes: Array(bytes[range]), base: range.lowerBound)
+        XCTAssertEqual(overview.rows, 16)
+        XCTAssertEqual(overview.south, 45)
+        XCTAssertEqual(overview.west, 9)
+        let h = overview.heightValues
+        for r in 0..<16 {
+            for c in 0..<16 { XCTAssertEqual(h[r * 16 + c], Int16(2007 + 20 * r + 8 * c)) }
+        }
+        // Both levels describe the same plane, so they must agree everywhere in between:
+        // this checks the overview's pixel positions.
+        let full = Terrain(tiles: [try GeoTIFF.elevationTile(Fixtures.pyramidTIFF, level: 0)])
+        let coarse = Terrain(tiles: [overview])
+        var rng = SplitMix64(seed: 4)
+        for _ in 0..<200 {
+            let lat = 46 - (1 + 29 * rng.uniform()) / 3600, lon = 9 + (1 + 29 * rng.uniform()) / 3600
+            XCTAssertEqual(coarse.height(latitude: lat, longitude: lon), full.height(latitude: lat, longitude: lon), accuracy: 0.01)
+        }
+    }
+
     func testRejectsNonTIFF() {
         XCTAssertThrowsError(try GeoTIFF.elevationTile(Data("hello".utf8)))
     }

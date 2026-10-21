@@ -1,23 +1,27 @@
-import ARKit
 import PeakCore
 import SwiftUI
 
 /// Thin glowing ridgelines, nearer ones brighter and farther ones fading like haze, and a
-/// few labels for the most prominent visible peaks. Redrawn every display frame from
-/// ARKit's latest camera, so the overlay moves with the picture.
+/// few labels for the most prominent visible peaks. Redrawn every display frame from the
+/// phone's latest orientation, so the overlay moves with the picture.
 struct OverlayView: View {
     let model: AppModel
     @State private var haptics = CenterHaptics()
+    @State private var smoothing = Smoothing()
 
     var body: some View {
-        TimelineView(.animation) { _ in
+        TimelineView(.animation) { timeline in
             Canvas { context, size in
-                guard let scene = model.scene,
-                      let camera = model.frozen?.camera ?? model.session.currentFrame?.camera else { return }
-                let projector = ScreenProjector(camera: camera, size: size, correction: model.correction.degrees)
-                drawRidges(scene, projector, in: &context)
-                let placed = drawLabels(scene, projector, in: &context)
-                if model.frozen == nil { haptics.update(placed, centerX: size.width / 2) }
+                // Reading the frame time ties the drawing to every display frame.
+                let now = timeline.date
+                guard let scene = model.scene, let pose = model.frozen?.pose ?? model.motion.pose else { return }
+                let correction = model.frozen?.correction ?? smoothing.value(toward: model.correction.degrees, at: now)
+                let camera = Camera(intrinsics: model.camera.screenIntrinsics(for: size),
+                                    attitude: CameraGeometry.attitude(pose, correction: correction))
+                let projector = camera.projector
+                drawRidges(scene, projector, heading: camera.attitude.heading, in: &context)
+                let placed = drawLabels(scene, projector, heading: camera.attitude.heading, size: size, in: &context)
+                if model.frozen == nil { haptics.update(placed, centerX: size.width / 2, at: now) }
             }
         }
         .allowsHitTesting(false)
@@ -26,14 +30,19 @@ struct OverlayView: View {
     /// Distance bands: (farthest distance in meters, opacity).
     private static let bands: [(Float, Double)] = [(3_000, 0.95), (10_000, 0.75), (30_000, 0.55), (.infinity, 0.35)]
 
-    private func drawRidges(_ scene: TerrainScene, _ projector: ScreenProjector, in context: inout GraphicsContext) {
+    private func point(_ projector: Camera.Projector, _ azimuth: Double, _ elevation: Double) -> CGPoint? {
+        projector.pixel(azimuth: azimuth, elevation: elevation).map { CGPoint(x: $0.x, y: $0.y) }
+    }
+
+    private func drawRidges(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double,
+                            in context: inout GraphicsContext) {
         var paths = [Path](repeating: Path(), count: Self.bands.count)
         var skyline = Path()
-        let center = Int(projector.heading.rounded())
-        for offset in -60...60 {
+        let center = Int(heading.rounded())
+        for offset in -70...70 {
             for s in scene.segments[(center + offset + 720) % 360] {
-                guard let a = projector.point(azimuth: Double(s.azimuth0), elevation: Double(s.elevation0)),
-                      let b = projector.point(azimuth: Double(s.azimuth1), elevation: Double(s.elevation1)) else { continue }
+                guard let a = point(projector, Double(s.azimuth0), Double(s.elevation0)),
+                      let b = point(projector, Double(s.azimuth1), Double(s.elevation1)) else { continue }
                 if s.isSkyline {
                     skyline.move(to: a)
                     skyline.addLine(to: b)
@@ -60,14 +69,14 @@ struct OverlayView: View {
     }
 
     /// Labels the biggest visible peaks first, skipping any that would crowd a placed label.
-    private func drawLabels(_ scene: TerrainScene, _ projector: ScreenProjector,
+    private func drawLabels(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, size: CGSize,
                             in context: inout GraphicsContext) -> [(Int64, CGFloat)] {
         let maxLabels = 10
         var placed: [(id: Int64, point: CGPoint)] = []
-        let bounds = CGRect(origin: .zero, size: projector.size).insetBy(dx: 12, dy: 60)
+        let bounds = CGRect(origin: .zero, size: size).insetBy(dx: 12, dy: 60)
         for v in scene.peaks where placed.count < maxLabels {
-            guard abs(azimuthDifference(v.azimuth, projector.heading)) < 60,
-                  let p = projector.point(azimuth: v.azimuth, elevation: v.elevation), bounds.contains(p),
+            guard abs(azimuthDifference(v.azimuth, heading)) < 70,
+                  let p = point(projector, v.azimuth, v.elevation), bounds.contains(p),
                   placed.allSatisfy({ abs($0.point.x - p.x) > 84 || abs($0.point.y - p.y) > 70 }) else { continue }
             placed.append((v.peak.id, p))
 
@@ -89,11 +98,34 @@ struct OverlayView: View {
         return placed.map { ($0.id, $0.point.x) }
     }
 
+    private static let formatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.maximumFractionDigits = 0
+        return f
+    }()
+
     private static func elevation(_ meters: Double) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.maximumFractionDigits = 0
-        return (formatter.string(from: NSNumber(value: meters.rounded())) ?? "\(Int(meters))") + " m"
+        (formatter.string(from: NSNumber(value: meters.rounded())) ?? "\(Int(meters))") + " m"
+    }
+}
+
+/// Eases the compass correction toward each new value instead of jumping.
+final class Smoothing {
+    private var current: Double?
+    private var last = Date()
+
+    func value(toward target: Double, at now: Date) -> Double {
+        guard let value = current else {
+            current = target
+            last = now
+            return target
+        }
+        let dt = max(0, min(0.2, now.timeIntervalSince(last)))
+        last = now
+        let next = value + (target - value) * (1 - exp(-dt / 0.35))
+        current = next
+        return next
     }
 }
 
@@ -103,7 +135,7 @@ final class CenterHaptics {
     private var lastTick = Date.distantPast
     private let generator = UISelectionFeedbackGenerator()
 
-    func update(_ labels: [(Int64, CGFloat)], centerX: CGFloat) {
+    func update(_ labels: [(Int64, CGFloat)], centerX: CGFloat, at now: Date) {
         var sides: [Int64: Bool] = [:]
         var crossed = false
         for (id, x) in labels {
@@ -112,9 +144,9 @@ final class CenterHaptics {
             sides[id] = right
         }
         lastSide = sides
-        if crossed, Date().timeIntervalSince(lastTick) > 0.15 {
+        if crossed, now.timeIntervalSince(lastTick) > 0.15 {
             generator.selectionChanged()
-            lastTick = Date()
+            lastTick = now
         }
     }
 }

@@ -28,6 +28,10 @@ final class TerrainTests: XCTestCase {
         XCTAssertEqual(terrain.height(latitude: 46.5, longitude: 7.5), 0, "inside the box, no tile: sea")
         XCTAssertTrue(terrain.height(latitude: 44.5, longitude: 7.5).isNaN)
         XCTAssertTrue(terrain.height(latitude: 45.5, longitude: 9.5).isNaN)
+        // When missing means not downloaded, it must not pass for sea.
+        let partial = Terrain(tiles: terrain.tiles, missingIsSea: false)
+        XCTAssertTrue(partial.height(latitude: 46.5, longitude: 7.5).isNaN)
+        XCTAssertEqual(partial.height(latitude: 45.5, longitude: 7.5), 800)
     }
 
     func testPkdemRoundTrip() throws {

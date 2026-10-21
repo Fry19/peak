@@ -3,7 +3,20 @@ import PeakCore
 
 /// Downloads terrain and peaks around a point and keeps them on the phone, so a place
 /// visited once works offline afterwards.
+///
+/// Copernicus tiles are cloud-optimized GeoTIFFs with built-in lower-resolution copies, so
+/// a tile can be fetched at 120 m (about 2 MB), 60 m (8 MB) or the full 30 m (31 MB) with
+/// one range request, instead of downloading the whole 40 MB file.
 actor DataStore {
+    /// Pixel size: 0 is the full 30 m, 1 is 60 m, 2 is 120 m.
+    typealias Level = Int
+
+    struct Key: Hashable, Sendable {
+        var south: Int
+        var west: Int
+        var name: String { DataStore.tileName(south, west) }
+    }
+
     enum Failure: LocalizedError {
         case download(String)
 
@@ -28,83 +41,132 @@ actor DataStore {
     }
 
     /// 1° tiles covering `radius` meters around a point.
-    nonisolated static func tiles(latitude: Double, longitude: Double, radius: Double) -> [(south: Int, west: Int)] {
+    nonisolated static func tiles(latitude: Double, longitude: Double, radius: Double) -> [Key] {
         let dlat = radius / 111_000
         let dlon = radius / (111_000 * max(cos(latitude * .pi / 180), 0.05))
-        var tiles: [(Int, Int)] = []
+        var keys: [Key] = []
         for south in Int((latitude - dlat).rounded(.down))...Int((latitude + dlat).rounded(.down)) where south >= -90 && south < 90 {
             for west in Int((longitude - dlon).rounded(.down))...Int((longitude + dlon).rounded(.down)) {
-                tiles.append((south, (west + 540) % 360 - 180))
+                keys.append(Key(south: south, west: (west + 540) % 360 - 180))
             }
         }
-        return tiles
+        return keys
     }
 
     nonisolated static func tileName(_ south: Int, _ west: Int) -> String {
         String(format: "%@%02d%@%03d", south >= 0 ? "N" : "S", abs(south), west >= 0 ? "E" : "W", abs(west))
     }
 
-    /// Copernicus GLO-30 tiles from the public AWS bucket, converted and cached.
-    func terrain(latitude: Double, longitude: Double, radius: Double,
-                 progress: @escaping @Sendable (String) -> Void) async throws -> Terrain {
-        let needed = Self.tiles(latitude: latitude, longitude: longitude, radius: radius)
-        var loaded: [ElevationTile] = []
-        let missing = needed.filter { !FileManager.default.fileExists(atPath: tileURL($0.south, $0.west).path)
-                                      && !FileManager.default.fileExists(atPath: seaURL($0.south, $0.west).path) }
-        for (n, tile) in missing.enumerated() {
-            progress("Downloading terrain \(n + 1) of \(missing.count)…")
-            try await download(tile.south, tile.west)
+    /// Distance in meters from a point to the nearest part of a tile.
+    nonisolated static func distance(from latitude: Double, _ longitude: Double, to key: Key) -> Double {
+        let lat = min(max(latitude, Double(key.south)), Double(key.south + 1))
+        let lon = min(max(longitude, Double(key.west)), Double(key.west + 1))
+        let dy = (lat - latitude) * 111_000
+        let dx = (lon - longitude) * 111_000 * cos(latitude * .pi / 180)
+        return (dx * dx + dy * dy).squareRoot()
+    }
+
+    // MARK: Terrain
+
+    /// The finest level of a tile already on the phone, or nil if none is.
+    func cachedLevel(_ key: Key) -> Level? {
+        (0...2).first { FileManager.default.fileExists(atPath: tileURL(key, $0).path) }
+    }
+
+    func isSea(_ key: Key) -> Bool {
+        FileManager.default.fileExists(atPath: seaURL(key).path)
+    }
+
+    /// A tile at `level` or finer: from the phone if there, otherwise downloaded. Nil for
+    /// open sea, where the bucket has no tile.
+    func tile(_ key: Key, level: Level) async throws -> ElevationTile? {
+        if isSea(key) { return nil }
+        if let have = cachedLevel(key), have <= level {
+            return try ElevationTile(contentsOf: tileURL(key, have))
         }
-        progress("Loading terrain…")
-        for tile in needed where FileManager.default.fileExists(atPath: tileURL(tile.south, tile.west).path) {
-            loaded.append(try ElevationTile(contentsOf: tileURL(tile.south, tile.west)))
+        return try await download(key, level: level)
+    }
+
+    private func tileURL(_ key: Key, _ level: Level) -> URL {
+        // Version 0.1 kept full tiles without a level in the name.
+        if level == 0, FileManager.default.fileExists(atPath: demDirectory.appendingPathComponent(key.name + ".pkdem").path) {
+            return demDirectory.appendingPathComponent(key.name + ".pkdem")
         }
-        return Terrain(tiles: loaded)
+        return demDirectory.appendingPathComponent("\(key.name).L\(level).pkdem")
     }
 
-    private func tileURL(_ south: Int, _ west: Int) -> URL {
-        demDirectory.appendingPathComponent(Self.tileName(south, west) + ".pkdem")
+    private func seaURL(_ key: Key) -> URL {
+        demDirectory.appendingPathComponent(key.name + ".sea")
     }
 
-    /// Marks a tile that doesn't exist in the bucket (open sea).
-    private func seaURL(_ south: Int, _ west: Int) -> URL {
-        demDirectory.appendingPathComponent(Self.tileName(south, west) + ".sea")
-    }
-
-    private func download(_ south: Int, _ west: Int) async throws {
-        let ns = south >= 0 ? "N" : "S", ew = west >= 0 ? "E" : "W"
-        let stem = String(format: "Copernicus_DSM_COG_10_%@%02d_00_%@%03d_00_DEM", ns, abs(south), ew, abs(west))
+    private func download(_ key: Key, level: Level) async throws -> ElevationTile? {
+        let ns = key.south >= 0 ? "N" : "S", ew = key.west >= 0 ? "E" : "W"
+        let stem = String(format: "Copernicus_DSM_COG_10_%@%02d_00_%@%03d_00_DEM", ns, abs(key.south), ew, abs(key.west))
         let url = URL(string: "https://copernicus-dem-30m.s3.amazonaws.com/\(stem)/\(stem).tif")!
-        let (file, response) = try await URLSession.shared.download(from: url)
-        defer { try? FileManager.default.removeItem(at: file) }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+
+        // The image directories sit at the start of the file.
+        let (head, status) = try await fetch(url, range: 0..<16_384)
         if status == 403 || status == 404 {
-            FileManager.default.createFile(atPath: seaURL(south, west).path, contents: nil)
-            return
+            FileManager.default.createFile(atPath: seaURL(key).path, contents: nil)
+            return nil
         }
-        guard status == 200 else { throw Failure.download("terrain (HTTP \(status))") }
-        let tile = try GeoTIFF.elevationTile(try Data(contentsOf: file, options: .alwaysMapped))
-        try tile.write(to: tileURL(south, west))
+        guard status == 200 || status == 206 else { throw Failure.download("terrain (HTTP \(status))") }
+
+        let tile: ElevationTile
+        if status == 206, let layout = try? GeoTIFF.layout([UInt8](head)) {
+            let lvl = min(level, layout.images.count - 1)
+            let range = layout.images[lvl].byteRange
+            let (body, bodyStatus) = try await fetch(url, range: range)
+            switch bodyStatus {
+            case 206: tile = try GeoTIFF.decode(layout, level: lvl, bytes: [UInt8](body), base: range.lowerBound)
+            case 200: tile = try GeoTIFF.decode(layout, level: lvl, bytes: [UInt8](body), base: 0)
+            default: throw Failure.download("terrain (HTTP \(bodyStatus))")
+            }
+            try tile.write(to: tileURL(key, lvl))
+        } else {
+            // Not cloud-optimized, or the server ignored the range: use the whole file.
+            var whole = head
+            if status != 200 {
+                let (data, wholeStatus) = try await fetch(url, range: nil)
+                guard wholeStatus == 200 else { throw Failure.download("terrain (HTTP \(wholeStatus))") }
+                whole = data
+            }
+            tile = try GeoTIFF.elevationTile(whole)
+            try tile.write(to: tileURL(key, 0))
+        }
+        return tile
     }
+
+    private func fetch(_ url: URL, range: Range<Int>?) async throws -> (Data, Int) {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
+        if let range { request.setValue("bytes=\(range.lowerBound)-\(range.upperBound - 1)", forHTTPHeaderField: "Range") }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+    }
+
+    // MARK: Peaks
 
     /// Named peaks from OpenStreetMap, cached for a month. Falls back to an older cache, or
     /// no peaks, when there is no connection.
     func peaks(latitude: Double, longitude: Double, radius: Double) async -> [Peak] {
-        let tiles = Self.tiles(latitude: latitude, longitude: longitude, radius: radius)
-        let south = tiles.map(\.south).min()!, north = tiles.map(\.south).max()! + 1
-        let west = tiles.map(\.west).min()!, east = tiles.map(\.west).max()! + 1
-        let cache = peakDirectory.appendingPathComponent("\(Self.tileName(south, west))-\(Self.tileName(north, east)).json")
+        // Cache by a 0.25° grid cell so nearby spots share one download.
+        let cellLat = (latitude * 4).rounded() / 4, cellLon = (longitude * 4).rounded() / 4
+        let cache = peakDirectory.appendingPathComponent(String(format: "%.2f_%.2f_%d.json", cellLat, cellLon, Int(radius / 1000)))
         let age = (try? cache.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
             .map { Date().timeIntervalSince($0) } ?? .infinity
         if age < 30 * 86_400, let data = try? Data(contentsOf: cache), let peaks = try? Overpass.peaks(fromJSON: data) {
             return peaks
         }
+        // A little beyond the radius, around the cell's center, so the whole circle is covered.
+        let r = radius + 20_000
+        let dlat = r / 111_000, dlon = r / (111_000 * max(cos(cellLat * .pi / 180), 0.05))
         var request = URLRequest(url: Overpass.endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 120
-        request.setValue("Peak/0.1 (iPhone app; github.com/Fry19/peak)", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 60
+        request.setValue("Peak/0.2 (iPhone app; github.com/Fry19/peak)", forHTTPHeaderField: "User-Agent")
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        let query = Overpass.peaksQuery(south: Double(south), west: Double(west), north: Double(north), east: Double(east))
+        let query = Overpass.peaksQuery(south: cellLat - dlat, west: cellLon - dlon, north: cellLat + dlat, east: cellLon + dlon)
         request.httpBody = Data(("data=" + (query.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")).utf8)
         if let (data, response) = try? await URLSession.shared.data(for: request),
            (response as? HTTPURLResponse)?.statusCode == 200,
