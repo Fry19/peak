@@ -11,6 +11,8 @@ final class SkylineCorrector: @unchecked Sendable {
         var delta: Double
         var pitchDelta: Double
         var rollDelta: Double
+        /// The phone was held sideways; pitch and roll belong to that way of holding it.
+        var sideways: Bool
         var accepted: Bool
         var rms: Double
         /// Why a frame was turned away (nil when accepted).
@@ -26,18 +28,21 @@ final class SkylineCorrector: @unchecked Sendable {
     private var busy = false
     private var lastStart = Date.distantPast
     private var horizon: HorizonProfile?
-    private var correction = ViewCorrection()
+    private var upright = ViewCorrection()
+    private var sideways = ViewCorrection()
     private let matcher: SkylineMatcher = {
         var m = SkylineMatcher()
         m.workingWidth = 640
         return m
     }()
 
-    /// What to match against, and the corrections in use. Call on any thread.
-    func update(horizon: HorizonProfile?, correction: ViewCorrection) {
+    /// What to match against, and the corrections in use for the phone held upright and
+    /// sideways. Call on any thread.
+    func update(horizon: HorizonProfile?, upright: ViewCorrection, sideways: ViewCorrection) {
         lock.lock()
         self.horizon = horizon
-        self.correction = correction
+        self.upright = upright
+        self.sideways = sideways
         lock.unlock()
     }
 
@@ -53,7 +58,8 @@ final class SkylineCorrector: @unchecked Sendable {
         busy = true
         lastStart = Date()
         // The correction covers both the compass's north (magnetic or true) and its error.
-        let correction = self.correction
+        let isSideways = CameraGeometry.isSideways(pose)
+        let correction = isSideways ? sideways : upright
         lock.unlock()
 
         // Convert now so the camera gets its buffer back straight away.
@@ -74,7 +80,8 @@ final class SkylineCorrector: @unchecked Sendable {
             let m = self.matcher.match(upright.image, intrinsics: upright.camera.intrinsics, prior: prior, horizon: horizon)
             let a = m.alignment
             self.finish(Outcome(delta: a.headingCorrection, pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
-                                accepted: a.accepted, rms: a.rms, reason: a.rejectionReason, seconds: m.seconds))
+                                sideways: isSideways, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
+                                seconds: m.seconds))
         }
     }
 

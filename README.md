@@ -28,6 +28,10 @@ The **list button** (bottom left) lists every peak around you, those in view fir
 - **Lens.** The field of view and optical center come from each frame's intrinsic matrix when the camera provides one, with focus kept far.
 - **Terrain detail.** See below. The shape of a nearby ridge is only as good as the terrain model, and sharp summits get their tips back from the peaks' surveyed heights (see "DEM accuracy at sharp summits").
 
+**Line up by hand** (the arrows button, bottom right) when the skyline can't be matched, say behind trees and roofs: the picture pauses, and you drag the lines onto the mountains and turn them with two fingers to level them. The pill then shows **Lined up** (cyan). The tilt you set is saved for your phone, separately for holding it upright and sideways, since a camera mounted a little askew tilts the view differently each way; skyline matching keeps refining it when it can.
+
+Labels stand upright in the world whichever way you hold the phone, even with the screen's rotation locked.
+
 **Tap the pill** to pause the view so you can lower the phone and look; tap it again to go live. **Long-press the pill** for diagnostics (sensor rate, heading, corrections, last skyline match, GPS, terrain detail, lens, frame timing); a screenshot of them says a lot when something looks off. A light tick marks a labeled peak crossing the middle of the screen.
 
 **Downloads:** the Copernicus tiles have lower-resolution copies built in, and the full 30 m image is stored in blocks of about 2.5 MB. Peak starts downloading as soon as it has a rough position, fetching tiles at 240 m (about 0.6 MB each) and 120 m within 30 km (2 MB), all at once, and shows the view as soon as the tile you're in arrives. Then it sharpens the terrain block by block: the full 30 m within 10 km, 60 m within 35 km and 120 m everywhere, and 30 m within 15–25 km on Wi-Fi (or on mobile data, unless you turn that off). Peaks and hikes come from OpenStreetMap through the Overpass API, facts from Wikidata and Wikipedia. Everything is cached on the phone; **Save this area for offline use** fetches the sharpest terrain for the whole area.

@@ -19,7 +19,7 @@ struct CameraScreen: UIViewRepresentable {
 /// Shows camera frames itself, rather than through a preview layer, so it knows exactly
 /// which frame is on screen and when it was taken. The overlay is drawn for that moment,
 /// so the lines don't run ahead of the picture when the phone turns.
-final class CameraScreenView: UIView {
+final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     private let video = AVSampleBufferDisplayLayer()
     let overlay = OverlayCanvas()
     weak var model: AppModel?
@@ -37,6 +37,44 @@ final class CameraScreenView: UIView {
         overlay.model = model
         addSubview(overlay)
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
+        // Lining up by hand: drag to move the lines, turn with two fingers to level them.
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
+        let rotation = UIRotationGestureRecognizer(target: self, action: #selector(rotated(_:)))
+        for g in [pan, rotation] as [UIGestureRecognizer] {
+            g.delegate = self
+            addGestureRecognizer(g)
+        }
+    }
+
+    func gestureRecognizerShouldBegin(_ gesture: UIGestureRecognizer) -> Bool {
+        gesture is UITapGestureRecognizer || model?.aligning == true
+    }
+
+    func gestureRecognizer(_ gesture: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        !(gesture is UITapGestureRecognizer) && !(other is UITapGestureRecognizer)
+    }
+
+    @objc private func panned(_ gesture: UIPanGestureRecognizer) {
+        guard let model, model.aligning, let f = overlay.lastFocal, f > 0 else { return }
+        let t = gesture.translation(in: self)
+        gesture.setTranslation(.zero, in: self)
+        // The drag in the world's terms: along the horizon, and down.
+        let a = overlay.upAngle
+        let along = Double(t.x * cos(a) + t.y * sin(a)), down = Double(-t.x * sin(a) + t.y * cos(a))
+        // Lines follow the finger: turning the view left moves them right, tilting it up
+        // moves them down.
+        model.adjust(heading: -along / f * 180 / .pi, pitch: down / f * 180 / .pi, roll: 0)
+        overlay.setNeedsDisplay()
+    }
+
+    @objc private func rotated(_ gesture: UIRotationGestureRecognizer) {
+        guard let model, model.aligning else { return }
+        let r = Double(gesture.rotation)
+        gesture.rotation = 0
+        // Turning the camera clockwise turns the picture's contents the other way.
+        model.adjust(heading: 0, pitch: 0, roll: -r * 180 / .pi)
+        overlay.setNeedsDisplay()
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -85,7 +123,7 @@ final class CameraScreenView: UIView {
     }
 
     @objc private func tapped(_ gesture: UITapGestureRecognizer) {
-        guard let model else { return }
+        guard let model, !model.aligning else { return }
         if let id = overlay.peak(at: gesture.location(in: overlay)) {
             UISelectionFeedbackGenerator().selectionChanged()
             model.select(id)

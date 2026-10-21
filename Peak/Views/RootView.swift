@@ -13,7 +13,9 @@ struct RootView: View {
             CameraScreen(model: model)
                 .ignoresSafeArea()
             VStack(spacing: 10) {
-                if let trail = model.arTrail {
+                if model.aligning {
+                    AlignBanner(model: model)
+                } else if let trail = model.arTrail {
                     TrailChip(model: model, trail: trail)
                 }
                 if model.settings.showDiagnostics {
@@ -22,10 +24,17 @@ struct RootView: View {
                         .padding(.horizontal, 10)
                 }
                 Spacer()
-                HStack(alignment: .center, spacing: 12) {
-                    RoundButton(systemImage: "list.bullet", label: "Peaks") { model.sheet = .list }
+                HStack(alignment: .center, spacing: 10) {
+                    if !model.aligning {
+                        RoundButton(systemImage: "list.bullet", label: "Peaks") { model.sheet = .list }
+                    }
                     StatusPill(model: model)
-                    RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
+                    if !model.aligning {
+                        RoundButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right", label: "Line up by hand") {
+                            model.startAligning()
+                        }
+                        RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
+                    }
                 }
                 Text("Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors")
                     .font(.system(size: 9))
@@ -105,6 +114,31 @@ struct RoundButton: View {
                 .environment(\.colorScheme, .dark)
         }
         .accessibilityLabel(label)
+    }
+}
+
+/// Instructions and buttons while lining the view up by hand.
+private struct AlignBanner: View {
+    let model: AppModel
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Text("Drag the lines onto the mountains. Turn with two fingers to level them.")
+                .font(.system(size: 14, weight: .medium))
+                .multilineTextAlignment(.center)
+            HStack(spacing: 12) {
+                Button("Reset") { model.resetAlignment() }
+                    .buttonStyle(.bordered)
+                Button("Done") { model.finishAligning() }
+                    .buttonStyle(.borderedProminent)
+            }
+            .tint(.white)
+        }
+        .foregroundStyle(.white)
+        .padding(14)
+        .frame(maxWidth: 420)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .environment(\.colorScheme, .dark)
     }
 }
 

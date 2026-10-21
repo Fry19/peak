@@ -14,24 +14,49 @@ final class AppModel {
         case failed(String)
     }
 
-    /// The corrections from skyline matching, smoothed over frames.
+    /// The corrections from skyline matching (smoothed over frames) and from lining the
+    /// view up by hand.
     struct Correction {
-        var view = ViewCorrection()
+        /// Pitch and roll, degrees.
+        struct Level: Codable, Equatable {
+            var pitch = 0.0
+            var roll = 0.0
+        }
+
+        /// The compass error, degrees.
+        var heading = 0.0
+        /// Pitch and roll for the phone held upright and held sideways. A camera mounted a
+        /// little askew tilts the view one way upright and another way sideways, so each
+        /// keeps its own; they're saved, since they belong to the phone.
+        var level = [Level(), Level()]
         var matches = 0
         var lastMatch: Date?
         var lastRMS = 0.0
+        /// When the view was last lined up by hand.
+        var byHand: Date?
 
-        /// Matched recently enough to trust over the compass.
-        var isAligned: Bool { lastMatch.map { Date().timeIntervalSince($0) < 20 } ?? false }
+        enum State { case locked, byHand, compass }
+
+        var state: State {
+            if let lastMatch, Date().timeIntervalSince(lastMatch) < 20 { return .locked }
+            if let byHand, Date().timeIntervalSince(byHand) < 600 { return .byHand }
+            return .compass
+        }
+
+        func view(sideways: Bool) -> ViewCorrection {
+            let l = level[sideways ? 1 : 0]
+            return ViewCorrection(heading: heading, pitch: l.pitch, roll: l.roll)
+        }
 
         mutating func add(_ o: SkylineCorrector.Outcome) {
             // Take the first match half whole; after that, move part of the way each time so
             // a single odd frame can't make the labels jump. The level is steadier than the
             // compass, so it moves more slowly.
             let first = matches == 0
-            view.heading += first ? o.delta : 0.5 * o.delta
-            view.pitch = max(-3, min(3, view.pitch + (first ? 0.5 : 0.3) * o.pitchDelta))
-            view.roll = max(-3, min(3, view.roll + (first ? 0.5 : 0.3) * o.rollDelta))
+            heading += first ? o.delta : 0.5 * o.delta
+            let i = o.sideways ? 1 : 0
+            level[i].pitch = max(-10, min(10, level[i].pitch + (first ? 0.5 : 0.3) * o.pitchDelta))
+            level[i].roll = max(-10, min(10, level[i].roll + (first ? 0.5 : 0.3) * o.rollDelta))
             matches += 1
             lastMatch = Date()
             lastRMS = o.rms
@@ -83,6 +108,8 @@ final class AppModel {
     /// The peak highlighted in the view (tapped, or picked from the list).
     var selectedPeakID: Int64?
     var arTrail: ARTrail?
+    /// Lining the view up by hand: the picture is paused and dragging moves the lines.
+    var aligning = false
     /// The last skyline match, for diagnostics.
     var lastOutcome: SkylineCorrector.Outcome?
     var offlineStatus: String?
@@ -115,18 +142,27 @@ final class AppModel {
     @ObservationIgnored private(set) var bytesDownloaded = 0
     @ObservationIgnored private var details: [Int64: PeakDetails] = [:]
 
-    /// Corrections to apply to the motion sensors: their north (magnetic or true) plus
-    /// what skyline matching found.
-    var viewCorrection: ViewCorrection {
-        var c = correction.view
+    /// Corrections to apply to the motion sensors for a pose: their north (magnetic or
+    /// true) plus what skyline matching or lining up by hand found.
+    func viewCorrection(for pose: MotionTracker.Pose?) -> ViewCorrection {
+        var c = correction.view(sideways: CameraGeometry.isSideways(pose))
         c.heading += motion.northCorrection
         return c
+    }
+
+    private func updateCorrector() {
+        let north = motion.northCorrection
+        var upright = correction.view(sideways: false), sideways = correction.view(sideways: true)
+        upright.heading += north
+        sideways.heading += north
+        corrector.update(horizon: scene?.horizon, upright: upright, sideways: sideways)
     }
 
     func start() {
         guard !started else { return }
         started = true
 
+        loadCalibration()
         locationDelegate.onLocation = { [weak self] in self?.locationChanged($0) }
         locationDelegate.onHeading = { [weak self] heading in
             // True heading minus magnetic heading is the declination here.
@@ -173,7 +209,7 @@ final class AppModel {
             self.lastOutcome = outcome
             guard outcome.accepted, self.frozen == nil else { return }
             self.correction.add(outcome)
-            self.corrector.update(horizon: self.scene?.horizon, correction: self.viewCorrection)
+            self.updateCorrector()
         }
         setActive(true)
     }
@@ -194,6 +230,7 @@ final class AppModel {
                 }
             }
         } else {
+            saveCalibration()
             camera.stop()
             motion.stop()
             locationManager.stopUpdatingHeading()
@@ -204,11 +241,70 @@ final class AppModel {
     // MARK: Freeze frame
 
     func toggleFreeze() {
+        guard !aligning else { return }
         if frozen != nil {
             frozen = nil
-        } else if let shown = screen?.shown, let pose = motion.pose(at: shown.time), scene != nil {
-            frozen = Frozen(shown: shown, pose: pose, correction: viewCorrection)
+        } else {
+            freeze()
         }
+    }
+
+    private func freeze() {
+        if let shown = screen?.shown, let pose = motion.pose(at: shown.time), scene != nil {
+            frozen = Frozen(shown: shown, pose: pose, correction: viewCorrection(for: pose))
+        }
+    }
+
+    // MARK: Lining up by hand
+
+    /// Pauses the picture so the lines can be dragged onto the mountains.
+    func startAligning() {
+        sheet = nil
+        if frozen == nil { freeze() }
+        aligning = true
+    }
+
+    func finishAligning() {
+        aligning = false
+        frozen = nil
+        correction.byHand = Date()
+        saveCalibration()
+        updateCorrector()
+    }
+
+    /// Back to the plain compass and level for the way the phone is held.
+    func resetAlignment() {
+        let sideways = CameraGeometry.isSideways(frozen?.pose ?? motion.pose)
+        let before = correction.view(sideways: sideways)
+        adjust(heading: -before.heading, pitch: -before.pitch, roll: -before.roll)
+        correction.lastMatch = nil
+        correction.byHand = nil
+    }
+
+    /// Moves the lines: heading, pitch and roll changes in degrees.
+    func adjust(heading: Double, pitch: Double, roll: Double) {
+        let i = CameraGeometry.isSideways(frozen?.pose ?? motion.pose) ? 1 : 0
+        correction.heading += heading
+        let level = correction.level[i]
+        correction.level[i].pitch = max(-10, min(10, level.pitch + pitch))
+        correction.level[i].roll = max(-10, min(10, level.roll + roll))
+        if frozen != nil {
+            frozen?.correction.heading += heading
+            frozen?.correction.pitch += correction.level[i].pitch - level.pitch
+            frozen?.correction.roll += correction.level[i].roll - level.roll
+        }
+    }
+
+    private static let calibrationKey = "levelCalibration"
+
+    private func loadCalibration() {
+        guard let data = UserDefaults.standard.data(forKey: Self.calibrationKey),
+              let level = try? JSONDecoder().decode([Correction.Level].self, from: data), level.count == 2 else { return }
+        correction.level = level
+    }
+
+    private func saveCalibration() {
+        if let data = try? JSONEncoder().encode(correction.level) { UserDefaults.standard.set(data, forKey: Self.calibrationKey) }
     }
 
     // MARK: Peaks and trails
@@ -432,7 +528,7 @@ final class AppModel {
             }.value
             lastBuildSeconds = Date().timeIntervalSince(started)
             scene = built
-            corrector.update(horizon: built.horizon, correction: viewCorrection)
+            updateCorrector()
             if arTrail != nil { drapeTrail() }
         } while rebuildAgain
         rebuilding = false
@@ -455,7 +551,7 @@ final class AppModel {
     var debugLines: [String] {
         var lines: [String] = []
         let s = motion.status
-        let c = viewCorrection
+        let c = viewCorrection(for: motion.pose)
         if let pose = motion.pose {
             let a = CameraGeometry.attitude(CameraGeometry.axes(pose, orientation: .portrait), correction: c)
             lines.append(String(format: "heading %.1f°  pitch %.1f°  roll %.1f°", a.heading, a.pitch, a.roll))
@@ -464,8 +560,9 @@ final class AppModel {
         }
         lines.append(String(format: "sensors %.0f/s, %@ north, last %.1f s ago", s.updatesPerSecond,
                             s.trueNorth ? "true" : "magnetic", s.secondsSinceUpdate))
-        lines.append(String(format: "correction: heading %+.2f° (skyline %+.2f°, north %+.2f°), pitch %+.2f°, roll %+.2f°",
-                            c.heading, correction.view.heading, motion.northCorrection, c.pitch, c.roll))
+        lines.append(String(format: "correction: heading %+.2f° (skyline %+.2f°, north %+.2f°), pitch %+.2f°, roll %+.2f° (%@)",
+                            c.heading, correction.heading, motion.northCorrection, c.pitch, c.roll,
+                            CameraGeometry.isSideways(motion.pose) ? "sideways" : "upright"))
         lines.append(String(format: "%ld matches", correction.matches))
         if let o = lastOutcome {
             lines.append(o.accepted ? String(format: "last match: ok %+.2f°, %.2f° rms, %.0f ms", o.delta, o.rms, o.seconds * 1000)

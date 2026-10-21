@@ -22,7 +22,7 @@ struct StatusPill: View {
             .background(.ultraThinMaterial, in: Capsule())
             .environment(\.colorScheme, .dark)
             .contentShape(Capsule())
-            .onTapGesture { model.toggleFreeze() }
+            .onTapGesture { if !model.aligning { model.toggleFreeze() } }
             .onLongPressGesture { model.settings.showDiagnostics.toggle() }
         }
     }
@@ -31,11 +31,14 @@ struct StatusPill: View {
     private var heading: String? {
         let pose = model.frozen?.pose ?? model.motion.pose
         guard let pose else { return nil }
-        return Format.bearing(CameraGeometry.heading(pose, correction: model.frozen?.correction ?? model.viewCorrection))
+        return Format.bearing(CameraGeometry.heading(pose, correction: model.frozen?.correction ?? model.viewCorrection(for: pose)))
     }
 
     @ViewBuilder private var content: some View {
-        if model.frozen != nil {
+        if model.aligning {
+            Image(systemName: "hand.draw.fill").font(.system(size: 11))
+            Text("Lining up" + (heading.map { " · \($0)" } ?? ""))
+        } else if model.frozen != nil {
             Image(systemName: "pause.fill").font(.system(size: 10))
             Text("Paused" + (heading.map { " · \($0)" } ?? ""))
         } else {
@@ -50,10 +53,11 @@ struct StatusPill: View {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
                 Text(text).multilineTextAlignment(.leading).frame(maxWidth: 260)
             case .ready:
+                let state = model.correction.state
                 Circle()
-                    .fill(model.correction.isAligned ? Color.green : Color.orange)
+                    .fill(state == .locked ? Color.green : state == .byHand ? Color.cyan : Color.orange)
                     .frame(width: 7, height: 7)
-                Text((heading.map { "\($0) · " } ?? "") + (model.correction.isAligned ? "Locked" : "Compass"))
+                Text((heading.map { "\($0) · " } ?? "") + (state == .locked ? "Locked" : state == .byHand ? "Lined up" : "Compass"))
             }
         }
     }

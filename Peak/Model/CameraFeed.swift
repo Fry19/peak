@@ -204,6 +204,12 @@ enum CameraGeometry {
         }
     }
 
+    /// The phone held sideways (landscape) rather than upright, from gravity.
+    static func isSideways(_ pose: MotionTracker.Pose?) -> Bool {
+        guard let pose else { return false }
+        return abs(pose.right.z) > abs(pose.up.z)
+    }
+
     /// Quarter turns clockwise from the sensor's landscape orientation to the interface's.
     static func quarterTurns(_ orientation: UIInterfaceOrientation) -> Int {
         switch orientation {
