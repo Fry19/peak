@@ -78,7 +78,8 @@ public struct LabelLayout: Sendable {
         /// The label above the dot; nil for a peak that only gets a dot (far down the
         /// ranking, so its label isn't worth drawing).
         public var box: LabelBox?
-        /// The same label below the dot, for the selected peak when there's no room above.
+        /// The same label below the dot, for the selected peak when there's no room above,
+        /// and for any other peak when `Thresholds.flipsOthers` is on.
         public var flippedBox: LabelBox?
         /// The peak the user picked: always labeled while its dot is on screen.
         public var isSelected: Bool
@@ -119,6 +120,10 @@ public struct LabelLayout: Sendable {
         public var dotClearance = 10.0
         /// The selected peak's label keeps this far inside the edges.
         public var selectedMargin = 8.0
+        /// Other peaks' labels go below their dots, where given, when there's no room above
+        /// (as for summits near the top of a wide view). One shown below stays below while it
+        /// fits there.
+        public var flipsOthers = false
 
         public init() {}
     }
@@ -130,6 +135,8 @@ public struct LabelLayout: Sendable {
     public struct Result: Sendable, Equatable {
         /// Labeled peaks, the selected one first, then by rank.
         public var labels: [Int64]
+        /// Those of the other labeled peaks whose labels go below their dots.
+        public var below: Set<Int64> = []
         /// Where the selected peak's label goes, or nil if its dot isn't on screen (or it
         /// wasn't a candidate): then it needs an arrow at the edge instead.
         public var selected: Placement?
@@ -170,7 +177,7 @@ public struct LabelLayout: Sendable {
 
     /// Labels the selected peak, then the rest by rank (with those shown last frame,
     /// `previous`, ranked up), each only where it fits and doesn't crowd one placed before.
-    public func place(_ candidates: [Candidate], previous: Set<Int64>) -> Result {
+    public func place(_ candidates: [Candidate], previous: Set<Int64>, previousBelow: Set<Int64> = []) -> Result {
         let t = thresholds
         var placed: [(id: Int64, x: Double, y: Double, box: LabelBox)] = []
         var result = Result(labels: [], selected: nil, dots: [])
@@ -204,11 +211,21 @@ public struct LabelLayout: Sendable {
             let c = others[i]
             let shown = previous.contains(c.id)
             let gap = shown ? t.keepGap : t.enterGap
-            if placed.count < limit, let box = c.box,
-               fits(box, x: c.x, y: c.y, margin: shown ? t.keepMargin : t.enterMargin, clear: shown ? t.keepClear : t.enterClear),
-               placed.allSatisfy({ !overlaps(box, c.x, c.y, $0.box, $0.x, $0.y, gap: gap) }) {
-                placed.append((c.id, c.x, c.y, box))
+            var options: [(box: LabelBox, below: Bool)] = c.box.map { [($0, false)] } ?? []
+            if t.flipsOthers, let flipped = c.flippedBox {
+                // Where it was last frame first, so it doesn't hop between the two.
+                if previousBelow.contains(c.id) { options.insert((flipped, true), at: 0) } else { options.append((flipped, true)) }
+            }
+            let fit = placed.count < limit ? options.first(where: { o in
+                // Moving to the other side counts as coming in.
+                let keep = shown && o.below == previousBelow.contains(c.id)
+                return fits(o.box, x: c.x, y: c.y, margin: keep ? t.keepMargin : t.enterMargin, clear: keep ? t.keepClear : t.enterClear)
+                    && placed.allSatisfy { !overlaps(o.box, c.x, c.y, $0.box, $0.x, $0.y, gap: keep ? gap : t.enterGap) }
+            }) : nil
+            if let fit {
+                placed.append((c.id, c.x, c.y, fit.box))
                 result.labels.append(c.id)
+                if fit.below { result.below.insert(c.id) }
             } else {
                 unlabeled.append(c)
             }

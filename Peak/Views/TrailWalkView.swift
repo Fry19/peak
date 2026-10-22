@@ -40,6 +40,8 @@ enum TrailTerrainStyle {
 /// ridge crests glowing faintly, then tilts down behind the start, the crests fading as it
 /// nears the horizon, and walks the trail to its end.
 /// Pause to look around (drag to orbit, pinch to zoom); the slider moves along the trail.
+/// The summit and a few of the most prominent mountains around are named while in sight
+/// (`WalkLabels`).
 /// Drawn from the terrain already on the phone, so it works offline; with satellite as the
 /// map's style and a connection, the imagery is laid over it instead of those colors.
 struct TrailWalkView: View {
@@ -59,6 +61,9 @@ struct TrailWalkView: View {
     @State private var detailImagery: MapImagery?
     @State private var midImagery: MapImagery?
     @State private var draped = false
+    /// Where the chip and the controls are, in window coordinates, for labels to keep clear of.
+    @State private var chipFrame = CGRect.zero
+    @State private var controlsFrame = CGRect.zero
 
     var body: some View {
         ZStack {
@@ -90,12 +95,14 @@ struct TrailWalkView: View {
             }
             VStack(spacing: 0) {
                 WalkChip(model: model, trail: trail, world: world, player: player, onClose: onClose)
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { chipFrame = $0 }
                     .padding(.top, 8)
                     .padding(.horizontal, 12)
                 Spacer()
                 if let world {
                     WalkControls(world: world, player: player, draped: draped,
                                  usgs: model.scene?.terrain.hasGround(under: trail.trail) == true)
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { controlsFrame = $0 }
                         .padding(.horizontal, 16)
                         .padding(.bottom, 12)
                 }
@@ -121,7 +128,20 @@ struct TrailWalkView: View {
         .task(id: [model.covers[trail.trail.id]?.revision ?? -1, world == nil ? 0 : 1]) {
             if let world, let cover = model.covers[trail.trail.id] { await world.tint(with: cover) }
         }
+        // The mountains around, to label: those the camera view knows, as they arrive.
+        .task(id: LabelKey(world: world.map(ObjectIdentifier.init), peaks: model.scene?.allPeaks.count ?? 0)) {
+            guard let world, let peaks = model.scene.map({ Array($0.allPeaks.values.map(\.peak)) }) else { return }
+            let pool = await Task.detached(priority: .userInitiated) { world.peaksToLabel(from: peaks) }.value
+            guard !Task.isCancelled else { return }
+            world.labelPeaks = pool
+        }
+        .onChange(of: [chipFrame, controlsFrame], initial: true) { _, frames in player.keepClear = frames }
         .onDisappear { player.stop() }
+    }
+
+    private struct LabelKey: Equatable {
+        var world: ObjectIdentifier?
+        var peaks: Int
     }
 
     private struct BuildKey: Equatable {
@@ -238,7 +258,11 @@ final class WalkWorld: @unchecked Sendable {
     let walker: SCNNode
     /// You, where the phone puts you, in blue; hidden when not known or off the terrain.
     let you: SCNNode
-    let label: SCNNode?
+    /// The hike's summit, labeled over the view (`WalkLabels`), and the mountains around that
+    /// may be, best first (set on the main thread only).
+    let summit: WalkPeak?
+    var labelPeaks: [WalkPeak] = []
+    let units: AppSettings.Units
     /// The ridge crest lines, faded by how steeply the camera looks down.
     let crests: SCNNode
     let walk: TrailWalk
@@ -257,6 +281,10 @@ final class WalkWorld: @unchecked Sendable {
     /// The coarser terrain around it, out to the haze.
     private let ring: SCNNode
     private let far: ReliefMap
+    /// Where the ring leaves the ground to the sharp terrain (map meters, lowest and highest corner).
+    private let hole: (low: SIMD2<Double>, high: SIMD2<Double>)
+    /// The steepest slope of the terrain drawn, rise over run.
+    let steepestSlope: Double
     /// Satellite imagery laid over the sharp terrain, and over the ring around it, instead of
     /// their colors (changed on the main thread only). Each is laid once its imagery loads.
     private(set) var draped = false
@@ -264,14 +292,17 @@ final class WalkWorld: @unchecked Sendable {
     /// How strongly the crest lines show: fainter over imagery, which shows the ridges itself.
     private(set) var crestStrength: CGFloat = 1
 
-    private init(scene: SCNScene, camera: SCNNode, walker: SCNNode, you: SCNNode, label: SCNNode?, crests: SCNNode, walk: TrailWalk,
+    private init(scene: SCNScene, camera: SCNNode, walker: SCNNode, you: SCNNode, summit: WalkPeak?, units: AppSettings.Units,
+                 crests: SCNNode, walk: TrailWalk,
                  relief: ReliefMap, profile: TrailProfile?, overhead: (eye: SIMD3<Double>, target: SIMD3<Double>), range: Double,
-                 ground: SCNNode, shades: GroundShades, coverRevision: Int?, ring: SCNNode, far: ReliefMap) {
+                 ground: SCNNode, shades: GroundShades, coverRevision: Int?, ring: SCNNode, far: ReliefMap,
+                 hole: (low: SIMD2<Double>, high: SIMD2<Double>)) {
         self.scene = scene
         self.camera = camera
         self.walker = walker
         self.you = you
-        self.label = label
+        self.summit = summit
+        self.units = units
         self.crests = crests
         self.walk = walk
         self.relief = relief
@@ -283,6 +314,8 @@ final class WalkWorld: @unchecked Sendable {
         self.coverRevision = coverRevision
         self.ring = ring
         self.far = far
+        self.hole = hole
+        steepestSlope = max(relief.steepestSlope, far.steepestSlope)
     }
 
     static let background = UIColor(red: 0.035, green: 0.043, blue: 0.058, alpha: 1)
@@ -319,6 +352,8 @@ final class WalkWorld: @unchecked Sendable {
         }
     }()
     static let trailColor = UIColor(Color.amber)
+    /// How far below its terrain the ring around the sharp terrain is drawn, meters.
+    static let ringSink: Float = 15
     /// Vertical field of view, degrees.
     static let fieldOfView = 62.0
 
@@ -350,6 +385,45 @@ final class WalkWorld: @unchecked Sendable {
         guard eye.z >= lowestEye(at: SIMD2(eye.x, eye.y)) else { return false }
         let clearance = min(40, simd_distance(eye, subject) / 10)
         return TrailWalk.raised(eye, toSee: subject, clearance: clearance, ground: groundOrRing).z <= eye.z + 0.01
+    }
+
+    /// How far the line from `eye` to a summit at `top` (map meters) passes over the terrain
+    /// as drawn, at its lowest, meters; negative where a ridge hides the summit. Exact on the
+    /// triangles drawn, the sharp terrain's and the lowered ring's outside the sharp square,
+    /// along the whole line. The line ends on the summit's ground, so there, and only there,
+    /// it may touch it: by 5 cm, for rounding, tapering to none a grid square out.
+    func clearance(from eye: SIMD3<Double>, to top: SIMD3<Double>) -> Double {
+        let half = relief.size / 2
+        let sharp = abs(top.x) <= half.x && abs(top.y) <= half.y
+        let contact = sharp ? relief.cellSize : far.cellSize
+        return min(relief.clearance(from: eye, to: top, contact: contact, contactDepth: 0.05),
+                   far.clearance(from: eye, to: top, contact: contact, contactDepth: 0.05, sink: Double(Self.ringSink), hole: hole))
+    }
+
+    /// Where a peak's summit is labeled, map meters: at its elevation, or on the terrain as
+    /// drawn there if that's higher (the sharp terrain's, or the lowered ring's where it
+    /// shows). Nil off the terrain.
+    static func summitTop(_ peak: Peak, relief: ReliefMap, far: ReliefMap,
+                          hole: (low: SIMD2<Double>, high: SIMD2<Double>)) -> SIMD3<Double>? {
+        let xy = relief.projection.point(peak.position)
+        let inHole = xy.x >= hole.low.x && xy.y >= hole.low.y && xy.x <= hole.high.x && xy.y <= hole.high.y
+        let near = relief.surfaceHeight(at: xy)
+        let ring = inHole ? .nan : far.surfaceHeight(at: xy) - Double(ringSink)
+        let ground = [near, ring].filter(\.isFinite).max()
+        return ground.map { SIMD3(xy.x, xy.y, max(peak.elevation, $0)) }
+    }
+
+    /// The mountains the walk may label, best first: those of `peaks` on its terrain, the
+    /// sharp square or the ring around it, but the hike's own summit.
+    func peaksToLabel(from peaks: [Peak]) -> [WalkPeak] {
+        let center = SIMD2(0.0, 0.0)
+        return peaks.compactMap { peak -> WalkPeak? in
+            guard peak.id != summit?.peak.id, !peak.name.isEmpty else { return nil }
+            guard let top = Self.summitTop(peak, relief: relief, far: far, hole: hole) else { return nil }
+            let distance = simd_distance(SIMD2(top.x, top.y), center)
+            return WalkPeak(peak: peak, top: top, score: PeakRanking.score(peak, rise: 0, distance: distance))
+        }
+        .sorted { $0.score != $1.score ? $0.score > $1.score : $0.peak.id < $1.peak.id }
     }
 
     /// Following the walker low, near the horizon, so the slopes and the ranges ahead stand
@@ -422,7 +496,7 @@ final class WalkWorld: @unchecked Sendable {
         let hole = (low: SIMD2(-edge, -edge), high: SIMD2(edge, edge))
         let ground = terrainNode(relief, low: low, high: high, cover: cover.flatMap { landCover($0, on: relief) })
         scene.rootNode.addChildNode(ground.node)
-        let ring = terrainNode(wide, low: low, high: high, hole: hole, sink: 15).node
+        let ring = terrainNode(wide, low: low, high: high, hole: hole, sink: ringSink).node
         scene.rootNode.addChildNode(ring)
         let crests = SCNNode()
         for node in crestNodes(relief) + crestNodes(wide, outside: hole) { crests.addChildNode(node) }
@@ -468,17 +542,15 @@ final class WalkWorld: @unchecked Sendable {
         you.isHidden = true
         scene.rootNode.addChildNode(you)
 
-        var label: SCNNode?
+        var summit: WalkPeak?
         if let peak {
             let xy = projection.point(peak.position)
-            let ground = relief.height(at: xy)
-            let top = SIMD3(xy.x, xy.y, max(peak.elevation, ground.isFinite ? ground : peak.elevation))
+            let top = summitTop(peak, relief: relief, far: wide, hole: hole) ?? SIMD3(xy.x, xy.y, peak.elevation)
             let dot = SCNNode(geometry: SCNSphere(radius: 6))
             dot.geometry!.firstMaterial = glow
             dot.position = scn(top)
             scene.rootNode.addChildNode(dot)
-            label = labelNode(peak, at: top, units: units)
-            if let label { scene.rootNode.addChildNode(label) }
+            summit = WalkPeak(peak: peak, top: top, score: .infinity)
         }
 
         let camera = SCNNode()
@@ -505,9 +577,10 @@ final class WalkWorld: @unchecked Sendable {
         let floor = relief.height(at: center)
         let overhead = (eye: SIMD3(center.x, center.y, (floor.isFinite ? floor : Double(high)) + altitude),
                         target: SIMD3(center.x, center.y, floor.isFinite ? floor : Double(low)))
-        return WalkWorld(scene: scene, camera: camera, walker: walker, you: you, label: label, crests: crests, walk: walk, relief: relief,
+        return WalkWorld(scene: scene, camera: camera, walker: walker, you: you, summit: summit, units: units, crests: crests,
+                         walk: walk, relief: relief,
                          profile: profile, overhead: overhead, range: range, ground: ground.node, shades: ground.shades,
-                         coverRevision: cover?.revision, ring: ring, far: wide)
+                         coverRevision: cover?.revision, ring: ring, far: wide, hole: hole)
     }
 
     /// Land cover on the sharp terrain's grid. It fades out toward the terrain's edge, where
@@ -925,39 +998,6 @@ final class WalkWorld: @unchecked Sendable {
         behind.renderingOrder = 10
         return [SCNNode(geometry: seen), behind]
     }
-
-    /// The summit's name and elevation on a card that always faces the camera.
-    private static func labelNode(_ peak: Peak, at top: SIMD3<Double>, units: AppSettings.Units) -> SCNNode? {
-        let name = peak.name as NSString, elevation = Format.elevation(of: peak, units) as NSString
-        let shadow = NSShadow()
-        shadow.shadowColor = UIColor.black.withAlphaComponent(0.8)
-        shadow.shadowBlurRadius = 6
-        let big: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 44, weight: .semibold),
-                                                  .foregroundColor: UIColor.white, .shadow: shadow]
-        let small: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 32),
-                                                    .foregroundColor: UIColor.white.withAlphaComponent(0.75), .shadow: shadow]
-        let w = max(name.size(withAttributes: big).width, elevation.size(withAttributes: small).width) + 24
-        let size = CGSize(width: ceil(w), height: 104)
-        let image = UIGraphicsImageRenderer(size: size).image { _ in
-            name.draw(at: CGPoint(x: 12, y: 4), withAttributes: big)
-            elevation.draw(at: CGPoint(x: 12, y: 58), withAttributes: small)
-        }
-        let plane = SCNPlane(width: size.width / size.height, height: 1)
-        let material = SCNMaterial()
-        material.lightingModel = .constant
-        material.diffuse.contents = image
-        material.isDoubleSided = true
-        material.readsFromDepthBuffer = false
-        material.writesToDepthBuffer = false
-        plane.firstMaterial = material
-        let card = SCNNode(geometry: plane)
-        // Its left edge just right of the summit, and a little above it.
-        card.pivot = SCNMatrix4MakeTranslation(Float(-size.width / size.height / 2) - 0.25, -0.7, 0)
-        card.position = scn(top)
-        card.constraints = [SCNBillboardConstraint()]
-        card.renderingOrder = 20
-        return card
-    }
 }
 
 // MARK: - Playback
@@ -996,6 +1036,11 @@ final class WalkPlayer {
     @ObservationIgnored private var orbit = (azimuth: 0.0, elevation: 20.0, distance: 600.0)
     @ObservationIgnored private var spin = SIMD2<Double>(0, 0)
     @ObservationIgnored private var gestures: Gestures?
+    @ObservationIgnored private var labels: WalkLabels?
+    /// The controls over the view, in window coordinates, which labels keep clear of.
+    @ObservationIgnored var keepClear: [CGRect] = [] {
+        didSet { labels?.keepClear = keepClear }
+    }
 
     static let introSeconds = 2.8
     /// How far a drag of one point turns the camera, degrees.
@@ -1027,6 +1072,12 @@ final class WalkPlayer {
             view.addGestureRecognizer(pan)
             view.addGestureRecognizer(UIPinchGestureRecognizer(target: gestures, action: #selector(Gestures.pinch(_:))))
             self.gestures = gestures
+        }
+        if labels == nil {
+            let labels = WalkLabels(frame: view.bounds)
+            labels.keepClear = keepClear
+            view.addSubview(labels)
+            self.labels = labels
         }
         link?.invalidate()
         let link = CADisplayLink(target: Ticker(self), selector: #selector(Ticker.tick(_:)))
@@ -1224,12 +1275,6 @@ final class WalkPlayer {
         }
         moveWalker()
         if let pov = view?.pointOfView?.presentation {
-            // Keep the summit's card the same size on screen.
-            if let label = world.label {
-                let d = Double(simd_distance(label.simdWorldPosition, pov.simdWorldPosition))
-                let s = Float(d * 0.05)
-                if abs(label.scale.x - s) > s * 1e-4 { label.scale = SCNVector3(s, s, s) }
-            }
             // The crest lines show the ridges on ground seen from above. Looking along it,
             // toward the horizon, the light and the skyline show them already, and the lines
             // only crowd the trail; they fade out between 55° and 30° down.
@@ -1240,6 +1285,8 @@ final class WalkPlayer {
             if abs(world.crests.opacity - opacity) > 1e-3 { world.crests.opacity = opacity }
             if world.crests.isHidden != (opacity < 0.01) { world.crests.isHidden = opacity < 0.01 }
         }
+        let p = world.camera.simdWorldPosition
+        labels?.update(world: world, eye: SIMD3(Double(p.x), Double(-p.z), Double(p.y)), now: now)
         if now - lastShown > 0.08 || !playing {
             lastShown = now
             if abs(shownDistance - distance) > 0.5 { shownDistance = distance }
