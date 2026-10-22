@@ -33,6 +33,8 @@ final class AppModel {
         /// What lining up by hand added to the level, for now only: a guess made against a
         /// misread mountain, or to make up for the compass, mustn't stay with the phone.
         var byHandLevel = [Level(), Level()]
+        /// How far lining up by hand can tilt the view, degrees.
+        static let maxByHandLevel = 10.0
         var matches = 0
         /// Which matches move the heading: two must agree before the first lock, and a lone
         /// jump waits for the next match to repeat it.
@@ -227,6 +229,15 @@ final class AppModel {
     var aligning = false {
         didSet { if aligning { land() } }
     }
+    /// Summits pinned where they really are while lining up by hand, in the screen camera's
+    /// terms, and whether they fit one view and set its tilt.
+    private(set) var pins = SummitPins()
+    private(set) var pinsMisfit = false
+    private(set) var pinsTilt = false
+    /// How the screen was turned when they were placed.
+    @ObservationIgnored private(set) var pinsOrientation: UIInterfaceOrientation?
+    /// A spot tapped while lining up, to name its peak.
+    var summitPick: SummitPick?
     /// Seeing over the ridges while the rise button is held (`AppModel+Rise`).
     var rise = Rise()
     @ObservationIgnored var riseWork = RiseWork()
@@ -687,8 +698,72 @@ final class AppModel {
 
     func finishAligning() {
         aligning = false
+        clearPins()
         linedUpByHand()
         frozen = nil
+    }
+
+    // MARK: Pinning summits
+
+    /// The paused screen's camera, as last drawn.
+    private var pausedCamera: Camera? {
+        frozen == nil ? nil : screen?.overlay.lastCamera
+    }
+
+    /// Lines up the paused view by a peak: its summit belongs at `point` (screen points). A
+    /// drag on a label in the paused view starts lining up by hand.
+    func pin(_ peakID: Int64, at point: CGPoint) {
+        guard let camera = pausedCamera, let v = scene?.allPeaks[peakID], v.isVisible else { return }
+        if !aligning { startAligning() }
+        if pins.isEmpty { pinsOrientation = screen?.interfaceOrientation }
+        pins.pin(SummitPins.Pin(id: peakID, name: v.peak.name, azimuth: v.azimuth, elevation: v.elevation,
+                                u: (point.x - camera.intrinsics.cx) / camera.intrinsics.fx,
+                                v: (point.y - camera.intrinsics.cy) / camera.intrinsics.fy),
+                 current: camera.attitude)
+        applyPins(camera)
+    }
+
+    /// Takes a pin away; the rest line the view up again, and with none left it's back where
+    /// it was before the first.
+    func unpin(_ peakID: Int64) {
+        guard let camera = pausedCamera else { return }
+        pins.remove(peakID)
+        applyPins(camera)
+        if pins.isEmpty { clearPins() }
+    }
+
+    /// Forgets the pins, leaving the lines where they are.
+    func clearPins() {
+        pins.removeAll()
+        pinsMisfit = false
+        pinsTilt = false
+        summitPick = nil
+    }
+
+    /// The peaks that could be at `point` on the paused screen, to choose from.
+    func pickSummit(at point: CGPoint) {
+        guard aligning, let camera = pausedCamera, let scene else { return }
+        summitPick = SummitPick(point: point, camera: camera, peaks: scene.peaks)
+    }
+
+    /// Turns the lines by what the pins solve for, as dragging them would.
+    private func applyPins(_ camera: Camera) {
+        guard var solved = pins.solve(intrinsics: camera.intrinsics) else { return }
+        let a = camera.attitude
+        // Lining up by hand can tilt the view only so far (`adjust`): past that, the pins
+        // set the heading alone rather than a tilt that wouldn't be taken in full.
+        let i = CameraGeometry.isSideways(frozen?.pose ?? motion.pose) ? 1 : 0
+        let level = correction.byHandLevel[i]
+        if solved.tilt, max(abs(level.pitch + solved.attitude.pitch - a.pitch), abs(level.roll + solved.attitude.roll - a.roll))
+            > Correction.maxByHandLevel,
+           let flat = pins.solve(intrinsics: camera.intrinsics, allowTilt: false) {
+            solved = flat
+        }
+        pinsMisfit = solved.misfit
+        pinsTilt = solved.tilt
+        adjust(heading: azimuthDifference(solved.attitude.heading, a.heading), pitch: solved.attitude.pitch - a.pitch,
+               roll: solved.attitude.roll - a.roll)
+        screen?.overlay.update()
     }
 
     /// Slides the paused view's lines along the horizon, degrees. They stay where they're
@@ -740,6 +815,7 @@ final class AppModel {
             frozen?.correction.pitch -= before.pitch
             frozen?.correction.roll -= before.roll
         }
+        clearPins()
         correction.lastMatch = nil
         correction.byHand = nil
         correction.remembered = nil
@@ -756,8 +832,9 @@ final class AppModel {
         let i = CameraGeometry.isSideways(frozen?.pose ?? motion.pose) ? 1 : 0
         correction.heading += heading
         let before = correction.byHandLevel[i]
-        correction.byHandLevel[i].pitch = max(-10, min(10, before.pitch + pitch))
-        correction.byHandLevel[i].roll = max(-10, min(10, before.roll + roll))
+        let most = Correction.maxByHandLevel
+        correction.byHandLevel[i].pitch = max(-most, min(most, before.pitch + pitch))
+        correction.byHandLevel[i].roll = max(-most, min(most, before.roll + roll))
         if frozen != nil {
             frozen?.correction.heading += heading
             frozen?.correction.pitch += correction.byHandLevel[i].pitch - before.pitch

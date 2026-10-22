@@ -234,9 +234,7 @@ private struct AlignBanner: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            Text("Drag the lines onto the mountains. Turn with two fingers to level them.")
-                .font(.system(size: 14, weight: .medium))
-                .multilineTextAlignment(.center)
+            SummitPinsBanner(pins: model.pins.pins, misfit: model.pinsMisfit, tilt: model.pinsTilt) { model.unpin($0) }
             HStack(spacing: 12) {
                 Button("Reset") { model.resetAlignment() }
                     .buttonStyle(.bordered)
@@ -251,6 +249,12 @@ private struct AlignBanner: View {
         .frame(maxWidth: 420)
         .glassBackground(in: RoundedRectangle(cornerRadius: 18))
         .environment(\.colorScheme, .dark)
+        .sheet(item: Bindable(model).summitPick, onDismiss: { model.screen?.overlay.update() }) { pick in
+            SummitPicker(pick: pick, units: model.settings.units) { model.pin($0.id, at: pick.point) }
+                .presentationDetents([.medium, .large])
+                .presentationBackground(.sheetBackground)
+                .tint(.amber)
+        }
     }
 }
 

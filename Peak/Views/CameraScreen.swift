@@ -34,6 +34,8 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     private(set) var lastFrameDate = Date.distantPast
     /// A second finger joined the drag on the paused view.
     private var pinching = false
+    /// A peak's label being dragged onto its summit, and where the summit is from the finger.
+    private var pinDrag: (id: Int64, offset: CGVector)?
 
     init(model: AppModel) {
         self.model = model
@@ -57,18 +59,35 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
             g.delegate = self
             addGestureRecognizer(g)
         }
-        // Without dragging (VoiceOver, Voice Control), the paused lines move by actions.
-        accessibilityLabel = "Paused view"
+        // Without dragging (VoiceOver, Voice Control), the paused lines move by actions, and
+        // lining up, the peak in the middle can be named.
         accessibilityCustomActions = [
             UIAccessibilityCustomAction(name: "Move lines left") { [weak self] _ in self?.moveLines(heading: 0.5) ?? false },
             UIAccessibilityCustomAction(name: "Move lines right") { [weak self] _ in self?.moveLines(heading: -0.5) ?? false },
         ]
     }
 
-    /// The paused view is one element, for its actions to move the lines.
+    /// The paused view is one element, for its actions.
     override var isAccessibilityElement: Bool {
-        get { model?.frozen != nil && model?.aligning == false }
+        get { model?.frozen != nil }
         set {}
+    }
+
+    override var accessibilityLabel: String? {
+        get { model?.aligning == true ? "Picture being lined up" : "Paused view" }
+        set {}
+    }
+
+    override var accessibilityCustomActions: [UIAccessibilityCustomAction]? {
+        get {
+            guard model?.aligning == true else { return super.accessibilityCustomActions }
+            return [UIAccessibilityCustomAction(name: "Name the peak in the middle") { [weak self] _ in
+                guard let self, let model = self.model else { return false }
+                model.pickSummit(at: CGPoint(x: self.bounds.midX, y: self.bounds.midY))
+                return model.summitPick != nil
+            }]
+        }
+        set { super.accessibilityCustomActions = newValue }
     }
 
     private func moveLines(heading: Double) -> Bool {
@@ -112,10 +131,33 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         guard let model, model.aligning || model.frozen != nil, let f = overlay.lastFocal, f > 0 else { return }
         let t = gesture.translation(in: self)
         gesture.setTranslation(.zero, in: self)
+        if gesture.state == .began {
+            pinching = false
+            // A drag that starts on a peak's label (or dot) puts that summit where it's dropped.
+            let start = CGPoint(x: gesture.location(in: overlay).x - t.x, y: gesture.location(in: overlay).y - t.y)
+            pinDrag = overlay.peak(at: start).flatMap { id in
+                overlay.summitPoints[id].map { (id, CGVector(dx: $0.x - start.x, dy: $0.y - start.y)) }
+            }
+        }
+        if let drag = pinDrag {
+            // A second finger pinches; the rest of this drag does nothing.
+            if gesture.numberOfTouches > 1 {
+                pinDrag = nil
+                pinching = true
+                return
+            }
+            guard gesture.state == .began || gesture.state == .changed else {
+                pinDrag = nil
+                return
+            }
+            let p = gesture.location(in: overlay)
+            model.pin(drag.id, at: CGPoint(x: p.x + drag.offset.dx, y: p.y + drag.offset.dy))
+            return
+        }
         // Paused, two fingers are pinching: that zooms, it doesn't turn the view, nor does
         // the finger left once the other lifts.
+        if pinching { return }
         if !model.aligning {
-            if gesture.state == .began { pinching = false }
             if gesture.numberOfTouches > 1 { pinching = true }
             guard !pinching, gesture.state == .began || gesture.state == .changed else { return }
         }
@@ -125,6 +167,8 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         // Lines follow the finger: turning the view left moves them right, tilting it up
         // moves them down.
         if model.aligning {
+            // Pinned summits hold the lines; a drag that misses a label mustn't undo them.
+            guard model.pins.isEmpty else { return }
             model.adjust(heading: -along / f * 180 / .pi, pitch: down / f * 180 / .pi, roll: 0)
         } else {
             model.nudge(heading: -along / f * 180 / .pi)
@@ -136,6 +180,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         guard let model, model.aligning else { return }
         let r = Double(gesture.rotation)
         gesture.rotation = 0
+        guard r != 0, model.pins.isEmpty else { return }
         // Turning the camera clockwise turns the picture's contents the other way.
         model.adjust(heading: 0, pitch: 0, roll: -r * 180 / .pi)
         overlay.update()
@@ -149,6 +194,9 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        // Pins hold spots on the screen as it was turned: turned another way, they no longer
+        // mark where the summits are, so they're let go (the lines stay where they are).
+        if let model, !model.pins.isEmpty, model.pinsOrientation != interfaceOrientation { model.clearPins() }
         overlay.frame = bounds
         layoutVideo()
         overlay.setNeedsUpdate()
@@ -203,7 +251,13 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     }
 
     @objc private func tapped(_ gesture: UITapGestureRecognizer) {
-        guard let model, !model.aligning else { return }
+        guard let model else { return }
+        // Lining up, a tap marks a summit to name.
+        if model.aligning {
+            model.pickSummit(at: gesture.location(in: overlay))
+            overlay.update()
+            return
+        }
         if let id = overlay.peak(at: gesture.location(in: overlay)) {
             UISelectionFeedbackGenerator().selectionChanged()
             model.select(id, fromLabel: true)

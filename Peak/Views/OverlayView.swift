@@ -45,6 +45,28 @@ final class OverlayCanvas: UIView {
     /// screen (radians clockwise from the screen's up), for lining up by hand.
     private(set) var lastFocal: Double?
     private(set) var upAngle: CGFloat = 0
+    /// The last layout's camera, zoom included, and where it put each peak's summit on screen.
+    private(set) var lastCamera: Camera?
+    private(set) var summitPoints: [Int64: CGPoint] = [:]
+    /// Summits pinned while lining up by hand: an amber ring each, and a dashed white one on
+    /// a spot waiting to be named.
+    private let pinLayer: CAShapeLayer = {
+        let l = OverlayCanvas.stroke(UIColor(Color.amber), width: 2)
+        l.shadowColor = UIColor.black.cgColor
+        l.shadowOpacity = 0.7
+        l.shadowRadius = 2
+        l.shadowOffset = .zero
+        return l
+    }()
+    private let pickLayer: CAShapeLayer = {
+        let l = OverlayCanvas.stroke(UIColor.white, width: 2)
+        l.lineDashPattern = [4, 3]
+        l.shadowColor = UIColor.black.cgColor
+        l.shadowOpacity = 0.7
+        l.shadowRadius = 2
+        l.shadowOffset = .zero
+        return l
+    }()
 
     /// Distance bands: (farthest distance in meters, opacity).
     private static let bands: [(Float, CGFloat)] = [(3_000, 0.95), (10_000, 0.75), (30_000, 0.55), (.infinity, 0.35)]
@@ -215,6 +237,8 @@ final class OverlayCanvas: UIView {
         layer.addSublayer(labelContainer)
         layer.addSublayer(arrowLayer)
         layer.addSublayer(arrowHead)
+        layer.addSublayer(pinLayer)
+        layer.addSublayer(pickLayer)
         arrowHead.isHidden = true
     }
 
@@ -316,6 +340,7 @@ final class OverlayCanvas: UIView {
         let axes = camera.attitude.axes
         upAngle = CGFloat(atan2(axes.right.z, -axes.down.z))
         lastFocal = camera.intrinsics.fx
+        lastCamera = camera
 
         // How far around the view direction anything can be on screen, in azimuth: the
         // view's half-diagonal, widened toward the zenith where azimuths crowd together.
@@ -354,6 +379,22 @@ final class OverlayCanvas: UIView {
         crossing.reach = 60 * max(1, model.zoom).squareRoot()
         crossing.prepareReach = 2 * crossing.reach
         tickIfCrossing(placed, correctionShift: shift, haptics: frozen == nil && settings.haptics, at: now)
+        layoutPins(model, camera.intrinsics)
+    }
+
+    private func layoutPins(_ model: AppModel?, _ k: CameraIntrinsics) {
+        let rings = CGMutablePath()
+        for pin in model?.pins.pins ?? [] {
+            let p = pin.pixel(k)
+            rings.addEllipse(in: CGRect(x: p.x - 9, y: p.y - 9, width: 18, height: 18))
+            rings.addEllipse(in: CGRect(x: p.x - 1.5, y: p.y - 1.5, width: 3, height: 3))
+        }
+        pinLayer.path = rings
+        if let pick = model?.summitPick?.point {
+            pickLayer.path = CGPath(ellipseIn: CGRect(x: pick.x - 11, y: pick.y - 11, width: 22, height: 22), transform: nil)
+        } else {
+            pickLayer.path = nil
+        }
     }
 
     private func clear() {
@@ -366,6 +407,9 @@ final class OverlayCanvas: UIView {
         arrowLayer.isHidden = true
         arrowHead.isHidden = true
         dots = []
+        summitPoints = [:]
+        pinLayer.path = nil
+        pickLayer.path = nil
     }
 
     /// Before the first frame: the latest lens, or a typical one.
@@ -822,6 +866,7 @@ final class OverlayCanvas: UIView {
         let limit = LabelLayout.limit(base: model.settings.labels.maxLabels, zoom: model.zoom)
         let range = Double(min(reach, 90))
         let selectedID = model.selectedPeakID
+        let pinned = Set(model.pins.pins.map(\.id))
         var candidates: [LabelLayout.Candidate] = []
         var points: [Int64: CGPoint] = [:]
         var peaks: [Int64: Peak] = [:]
@@ -850,7 +895,7 @@ final class OverlayCanvas: UIView {
             guard abs(azimuthDifference(v.azimuth, heading)) < range,
                   let p = point(projector, v.azimuth, v.elevation), view.contains(p) else { continue }
             // Peaks whose line of sight the coarse base layer can't settle get a dot only.
-            let canLabel = (labelable < limit * 3 || labeled.contains(v.id)) && !scene.uncertain.contains(v.id)
+            let canLabel = (labelable < limit * 3 || labeled.contains(v.id) || pinned.contains(v.id)) && !scene.uncertain.contains(v.id)
             guard canLabel || candidates.count < 200 else { continue }
             var box: LabelBox?
             if canLabel {
@@ -860,10 +905,12 @@ final class OverlayCanvas: UIView {
             }
             points[v.id] = p
             peaks[v.id] = v.peak
+            // Pinned summits keep their labels, to show they're on their pins.
             candidates.append(LabelLayout.Candidate(id: v.id, x: Double(p.x), y: Double(p.y),
-                                                    score: scene.scores[v.id] ?? 0, box: box))
+                                                    score: pinned.contains(v.id) ? 1e9 : scene.scores[v.id] ?? 0, box: box))
         }
 
+        summitPoints = points
         let layout = LabelLayout(bounds: Self.screenRect(bounds), keepClear: clearRects.map(Self.screenRect),
                                  upX: Double(worldUp.x), upY: Double(worldUp.y), limit: limit,
                                  thresholds: LabelLayout.Thresholds().scaled(forZoom: model.zoom))
