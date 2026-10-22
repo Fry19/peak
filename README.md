@@ -68,7 +68,13 @@ The first time, also turn on **Settings → Privacy & Security → Developer Mod
 
 ### Option 2: Build it in Xcode
 
-On a Mac with Xcode 16 or later: open `Peak.xcodeproj`, select the **Peak** target, set **Signing & Capabilities → Team** to your Apple ID (change the bundle identifier `com.fry19.peak` if Xcode says it's taken), pick your iPhone and press **Run**.
+On a Mac with Xcode 16 or later, first fetch the worldwide base layer once (47 MB, from a GitHub Release; checked against a pinned SHA-256, and again whenever `Tools/fetch_base_layer.sh` changes):
+
+```bash
+sh Tools/fetch_base_layer.sh
+```
+
+The app builds without it, but then has no view on first launch without a signal. Then open `Peak.xcodeproj`, select the **Peak** target, set **Signing & Capabilities → Team** to your Apple ID (change the bundle identifier `com.fry19.peak` if Xcode says it's taken), pick your iPhone and press **Run**.
 
 When Peak starts, allow the camera and your location.
 
@@ -219,6 +225,7 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
   Sources/peakbench/       The desk harness
   Tests/PeakCoreTests/     Unit tests on procedural terrain with known geometry
 Tools/fetch_dem.py         Downloads Copernicus tiles and writes .pkdem files
+Tools/fetch_base_layer.sh  Downloads World.pkbase from its GitHub Release (checksum pinned)
 Tools/fetch_world_peaks.py Every named OpenStreetMap peak and volcano, for the base layer
 Tools/build_base_layer.py  Builds the worldwide base layer (World.pkbase) from ETOPO 2022 and those peaks
 Tools/make_icon.py         Renders the app icon, the Matterhorn from Gornergrat, from the DEM tiles
@@ -239,14 +246,14 @@ GitHub Actions runs on every push:
 
 ## The worldwide base layer
 
-`Peak/Resources/World.pkbase` is built reproducibly from two public sources (about 5.4 GB of downloads, 20 minutes; the build itself takes a minute on a laptop):
+`Peak/Resources/World.pkbase` isn't in git: `Tools/fetch_base_layer.sh` downloads it from the GitHub Release named in the script (`base-layer-2026-10`) and checks its SHA-256, and CI does the same (cached) before building the app. It is built reproducibly from two public sources (about 5.4 GB of downloads, 20 minutes; the build itself takes a minute on a laptop):
 
 ```bash
 python3 Tools/fetch_world_peaks.py --out build/world_peaks.tsv
 python3 Tools/build_base_layer.py --etopo build/etopo15 --download --peaks build/world_peaks.tsv --out Peak/Resources/World.pkbase
 ```
 
-(`build_base_layer.py` needs numpy and h5py.) **Terrain** comes from NOAA's ETOPO 2022 at 15″ (public domain), whose land is mostly Copernicus GLO-30, on the same EGM2008 heights as the tiles the app downloads. Each 1° cell keeps the coarsest of 30″ (about 0.9 km), 1′, 2′ or 4′ that stays within a height error, chosen so the terrain fits 36 MB: 3,375 cells of high relief get 30″, 19,505 cells of plains and ice get 4′, and open sea gets none. A pixel holds the highest point of its block rather than the mean: at Gornergrat that halves the skyline's error (the mean sinks every ridge). Heights are in 4 m steps, coded as differences from a planar prediction and deflated. **Peaks**: every named `natural=peak|volcano` node (699,289 in October 2026) from QLever's OpenStreetMap SPARQL endpoint, in 5° blocks of columns: id, position to 1e-5°, elevation, prominence, Wikidata item and name; 10.2 MB. The file layout is in the builder's docstring; PeakCore's `BaseLayer` reads it.
+(`build_base_layer.py` needs numpy and h5py.) To publish a new one, upload it to a new release (`gh release create base-layer-YYYY-MM Peak/Resources/World.pkbase --latest=false`) and update `TAG` and `SHA256` in `Tools/fetch_base_layer.sh`. **Terrain** comes from NOAA's ETOPO 2022 at 15″ (public domain), whose land is mostly Copernicus GLO-30, on the same EGM2008 heights as the tiles the app downloads. Each 1° cell keeps the coarsest of 30″ (about 0.9 km), 1′, 2′ or 4′ that stays within a height error, chosen so the terrain fits 36 MB: 3,375 cells of high relief get 30″, 19,505 cells of plains and ice get 4′, and open sea gets none. A pixel holds the highest point of its block rather than the mean: at Gornergrat that halves the skyline's error (the mean sinks every ridge). Heights are in 4 m steps, coded as differences from a planar prediction and deflated. **Peaks**: every named `natural=peak|volcano` node (699,289 in October 2026) from QLever's OpenStreetMap SPARQL endpoint, in 5° blocks of columns: id, position to 1e-5°, elevation, prominence, Wikidata item and name; 10.2 MB. The file layout is in the builder's docstring; PeakCore's `BaseLayer` reads it.
 
 How far its skyline is from the full Copernicus DEM's at Gornergrat (`peakbench base --base Peak/Resources/World.pkbase --dem DEM --lat 45.9837 --lon 7.7856`), per 0.1° ray, by how far the real skyline is, with the eye at the right height:
 

@@ -38,6 +38,15 @@ jobs:
       - uses: actions/checkout@v5
       - name: Show Xcode version
         run: xcodebuild -version
+      - name: Cache the worldwide base layer
+        uses: actions/cache@v4
+        with:
+          path: Peak/Resources/World.pkbase
+          key: base-layer-${{ hashFiles('Tools/fetch_base_layer.sh') }}
+      - name: Fetch the worldwide base layer
+        # The app builds without it (no view on first launch without a signal), so a
+        # missing release only warns here; the release workflow requires it.
+        run: sh Tools/fetch_base_layer.sh || echo "::warning::World.pkbase not fetched; the app is built without the base layer"
       - name: Archive for iPhone
         run: |
           set -o pipefail
@@ -69,6 +78,9 @@ jobs:
           done
           # The overlay's lines are drawn by the Metal shaders compiled into this library.
           test -s "$APP/default.metallib" || { echo "missing from the bundle: default.metallib"; exit 1; }
+          if [ -s Peak/Resources/World.pkbase ]; then
+            cmp -s Peak/Resources/World.pkbase "$APP/World.pkbase" || { echo "World.pkbase fetched but not in the bundle"; exit 1; }
+          fi
           plutil -p "$APP/Info.plist" | grep -E "CFBundleIdentifier|CFBundleShortVersionString|NSCameraUsageDescription|NSLocationWhenInUseUsageDescription"
       - name: Upload IPA
         uses: actions/upload-artifact@v7
@@ -160,6 +172,22 @@ jobs:
           $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --mode photo --seed 2 --markdown photo.md
           $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --aim any --seed 3 --markdown any.md
           cat arkit.md photo.md any.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache the worldwide base layer (benchmark)
+        uses: actions/cache@v4
+        with:
+          path: Peak/Resources/World.pkbase
+          key: base-layer-${{ hashFiles('Tools/fetch_base_layer.sh') }}
+      - name: Base layer vs full DEM
+        run: |
+          if sh Tools/fetch_base_layer.sh; then
+            B=PeakCore/.build/release/peakbench
+            $B base --base Peak/Resources/World.pkbase --dem DEM --lat "$LAT" --lon "$LON" --markdown base.md
+            $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --match base --base Peak/Resources/World.pkbase --markdown base-match.md
+            { cat base.md; echo; echo "Matching against the base layer alone:"; echo; cat base-match.md; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::World.pkbase not fetched; skipping the base layer comparison"
+          fi
 
       - name: Run harder benchmark
         run: |

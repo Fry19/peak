@@ -24,6 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Cache the worldwide base layer
+        uses: actions/cache@v4
+        with:
+          path: Peak/Resources/World.pkbase
+          key: base-layer-${{ hashFiles('Tools/fetch_base_layer.sh') }}
+      - name: Fetch the worldwide base layer
+        run: sh Tools/fetch_base_layer.sh
+
       - name: Build
         run: |
           set -o pipefail
