@@ -183,64 +183,104 @@ public final class HorizonRenderer: @unchecked Sendable {
         return profile
     }
 
-    /// A sharp tip can fall between both rays and distance samples. March its exact
-    /// bearing with an extra sample at the apex, then keep that complete depth envelope
-    /// in the nearest ray (at most half a ray sideways). Checking the whole ray ensures
-    /// hidden summits and tips past missing data never get added to the skyline.
+    /// A sharp tip can fall between both rays and distance samples. Each raised summit that
+    /// rises above the regular skyline gets its exact bearing marched, with a sample on the
+    /// apex, and that depth envelope goes in the nearest ray (at most half a ray sideways).
+    /// A summit hidden on its own bearing, or past missing data, is never added. The tips
+    /// are worked out in parallel against the regular rays, and each ray then keeps the
+    /// highest skyline any of them gives it, so the order doesn't matter.
     private func refineSummitTips(from observer: GeoPoint, march: March,
                                   elevations: inout [Float], distances: inout [Float],
                                   perRay: inout [[HorizonProfile.EnvelopePoint]]) {
+        let tips = terrain.summitTips
+        guard !tips.isEmpty else { return }
         let frame = LocalFrame(origin: observer)
-        for var tip in terrain.summitTips {
-            let distance = groundDistance(from: observer, to: tip)
-            guard distance >= march.settings.minDistance, distance <= march.settings.maxDistance else { continue }
-            tip.height = terrain.height(latitude: tip.latitude, longitude: tip.longitude)
-            guard tip.height.isFinite else { continue }
-            // Invert the same conformal sphere as the march, so the extra sample lands
-            // on the grid node itself, even on a very steep tip.
-            let chi = ConformalSphere.conformalLatitude(tip.latitude * .pi / 180)
-            let dl = (tip.longitude - observer.longitude) * .pi / 180
-            let east = cos(chi) * sin(dl)
-            let north = cos(march.sphere.chi0) * sin(chi) - sin(march.sphere.chi0) * cos(chi) * cos(dl)
-            let azimuth = normalizedAzimuth(atan2(east, north) * 180 / .pi)
-            let i = Int((azimuth / march.settings.azimuthStep).rounded()) % elevations.count
-            // Usually only a handful of tips can raise the existing skyline.
-            guard frame.look(at: tip, refraction: march.settings.refraction).elevation > Double(elevations[i]) else { continue }
-            var points: [HorizonProfile.EnvelopePoint] = []
-            march.includingSample(at: distance).run(terrain: terrain, azimuth: azimuth,
-                                                    upTo: march.settings.maxDistance, envelope: &points)
-            guard let top = points.last, top.distance == Float(distance), top.elevation > elevations[i] else { continue }
-            perRay[i] = points
-            elevations[i] = top.elevation
-            distances[i] = top.distance
-            // Ease the half-ray rounding back to the original grid over four neighbors,
-            // so snapping the apex does not leave a kink on either flank. Each sample
-            // still moves by less than half a ray, and existing higher terrain is kept.
-            let reach = min(4, elevations.count / 2)
-            let rounding = azimuthDifference(azimuth, Double(i) * march.settings.azimuthStep)
-            for offset in -reach...reach where offset != 0 {
-                let j = (i + offset + elevations.count) % elevations.count
-                let shift = rounding * (1 - Double(abs(offset)) / Double(reach))
-                let flankAzimuth = normalizedAzimuth(Double(j) * march.settings.azimuthStep + shift)
-                let delta = distance * march.sphere.radiansPerMeter
-                let angle = azimuthDifference(flankAzimuth, azimuth) * .pi / 180
-                let closest = atan2(sin(delta) * cos(angle), cos(delta)) / march.sphere.radiansPerMeter
-                guard closest >= march.settings.minDistance, closest <= march.settings.maxDistance else { continue }
-                // On a bilinear grid the flank's highest point need not be at closest
-                // approach. Refine just one regular distance step around it.
-                let span = max(march.settings.nearStep, march.settings.relativeStep * closest)
-                let samples = Array(stride(from: max(march.settings.minDistance, closest - span),
-                                           through: min(march.settings.maxDistance, closest + span), by: 0.5))
-                var flank: [HorizonProfile.EnvelopePoint] = []
-                march.includingSamples(at: samples).run(terrain: terrain, azimuth: flankAzimuth,
-                                                       upTo: march.settings.maxDistance, envelope: &flank)
-                if let top = flank.last, top.elevation > elevations[j] {
-                    perRay[j] = flank
-                    elevations[j] = top.elevation
-                    distances[j] = top.distance
+        var found = [[(ray: Int, points: [HorizonProfile.EnvelopePoint])]](repeating: [], count: tips.count)
+        elevations.withUnsafeBufferPointer { elev in
+            perRay.withUnsafeBufferPointer { env in
+                found.withUnsafeMutableBufferPointer { out in
+                    let chunk = 16
+                    DispatchQueue.concurrentPerform(iterations: (tips.count + chunk - 1) / chunk) { block in
+                        for t in block * chunk..<min(tips.count, (block + 1) * chunk) {
+                            out[t] = rays(through: tips[t], from: observer, frame: frame, march: march,
+                                          elevations: elev, envelopes: env)
+                        }
+                    }
                 }
             }
         }
+        for (ray, points) in found.joined() {
+            guard let top = points.last, top.elevation > elevations[ray] else { continue }
+            perRay[ray] = points
+            elevations[ray] = top.elevation
+            distances[ray] = top.distance
+        }
+    }
+
+    /// How far in front of a tip its flanks are marched again, meters: past where any raised
+    /// tip ends (within its reach plus three pixels of the summit, 720 m on 120 m tiles).
+    static let flankDepth = 1_000.0
+
+    /// The rays one summit tip raises above the regular `elevations`: its apex in the nearest
+    /// ray, then that ray's neighbors eased onto its flanks. Empty when it raises none.
+    private func rays(through tip: GeoPoint, from observer: GeoPoint, frame: LocalFrame, march: March,
+                      elevations: UnsafeBufferPointer<Float>,
+                      envelopes: UnsafeBufferPointer<[HorizonProfile.EnvelopePoint]>)
+        -> [(ray: Int, points: [HorizonProfile.EnvelopePoint])] {
+        let settings = march.settings
+        var tip = tip
+        let distance = groundDistance(from: observer, to: tip)
+        guard distance >= settings.minDistance, distance <= settings.maxDistance else { return [] }
+        tip.height = terrain.height(latitude: tip.latitude, longitude: tip.longitude)
+        guard tip.height.isFinite else { return [] }
+        // Invert the same conformal sphere as the march, so the extra sample lands
+        // on the grid node itself, even on a very steep tip.
+        let chi = ConformalSphere.conformalLatitude(tip.latitude * .pi / 180)
+        let dl = (tip.longitude - observer.longitude) * .pi / 180
+        let east = cos(chi) * sin(dl)
+        let north = cos(march.sphere.chi0) * sin(chi) - sin(march.sphere.chi0) * cos(chi) * cos(dl)
+        let azimuth = normalizedAzimuth(atan2(east, north) * 180 / .pi)
+        let i = Int((azimuth / settings.azimuthStep).rounded()) % elevations.count
+        // Usually only a handful of tips can raise the existing skyline.
+        guard frame.look(at: tip, refraction: settings.refraction).elevation > Double(elevations[i]) else { return [] }
+        // The tip's rays end at it: everything the regular rays saw is below the tip, so
+        // whatever lies beyond is out of sight.
+        var apex: [HorizonProfile.EnvelopePoint] = []
+        march.sampling(from: 0, nearerThan: distance, then: [distance])
+            .run(terrain: terrain, azimuth: azimuth, upTo: distance, envelope: &apex)
+        guard let top = apex.last, top.distance == Float(distance), top.elevation > elevations[i] else { return [] }
+        var raised = [(ray: i, points: apex)]
+
+        // Ease the half-ray rounding back to the original grid over four neighbors,
+        // so snapping the apex does not leave a kink on either flank. Each sample
+        // still moves by less than half a ray, and existing higher terrain is kept.
+        let reach = min(4, elevations.count / 2)
+        let rounding = azimuthDifference(azimuth, Double(i) * settings.azimuthStep)
+        for offset in -reach...reach where offset != 0 {
+            let j = (i + offset + elevations.count) % elevations.count
+            let shift = rounding * (1 - Double(abs(offset)) / Double(reach))
+            let flankAzimuth = normalizedAzimuth(Double(j) * settings.azimuthStep + shift)
+            let delta = distance * march.sphere.radiansPerMeter
+            let angle = azimuthDifference(flankAzimuth, azimuth) * .pi / 180
+            let closest = atan2(sin(delta) * cos(angle), cos(delta)) / march.sphere.radiansPerMeter
+            guard closest >= settings.minDistance, closest <= settings.maxDistance else { continue }
+            // On a bilinear grid the flank's highest point need not be at closest
+            // approach. Refine just one regular distance step around it.
+            let span = max(settings.nearStep, settings.relativeStep * closest)
+            let window = Array(stride(from: max(settings.minDistance, closest - span),
+                                      through: min(settings.maxDistance, closest + span), by: span / 30))
+            // Only the tip's part of the ray is marched again, carrying on from what ray j
+            // sees nearer: in sight right up to it, or behind a ridge.
+            let start = window[0] - Self.flankDepth
+            let nearer = envelopes[j].prefix { Double($0.distance) < start }
+            let inSight = envelopes[j].dropFirst(nearer.count).first.map { !$0.startsSegment } ?? false
+            var flank = Array(nearer)
+            march.sampling(from: start, nearerThan: window[0], then: window)
+                .run(terrain: terrain, azimuth: flankAzimuth, upTo: window[window.count - 1],
+                     envelope: &flank, inSight: inSight)
+            if let top = flank.last, top.elevation > elevations[j] { raised.append((j, flank)) }
+        }
+        return raised
     }
 
     /// Highest apparent elevation angle of the terrain along one azimuth, out to `distance`.
@@ -306,47 +346,27 @@ struct March {
         sinDelta = samples.map { sin($0 * radiansPerMeter) }
     }
 
-    /// Reuses the regular sample grid and its trigonometry; only this rare exact ray
-    /// needs new arrays. The hot loop for every other ray stays unchanged.
-    func includingSample(at distance: Double) -> March {
-        includingSamples(at: [distance])
-    }
-
-    func includingSamples(at distances: [Double]) -> March {
-        var refined = self
-        var samples: [Double] = [], cosines: [Double] = [], sines: [Double] = []
-        samples.reserveCapacity(self.samples.count + distances.count)
-        cosines.reserveCapacity(samples.capacity)
-        sines.reserveCapacity(samples.capacity)
-        var i = 0
-        for distance in distances.sorted() {
-            while i < self.samples.count, self.samples[i] < distance {
-                samples.append(self.samples[i])
-                cosines.append(cosDelta[i])
-                sines.append(sinDelta[i])
-                i += 1
-            }
-            if i < self.samples.count, self.samples[i] == distance { continue }
-            if samples.last == distance { continue }
-            samples.append(distance)
-            let delta = distance * sphere.radiansPerMeter
-            cosines.append(cos(delta))
-            sines.append(sin(delta))
-        }
-        samples.append(contentsOf: self.samples[i...])
-        cosines.append(contentsOf: cosDelta[i...])
-        sines.append(contentsOf: sinDelta[i...])
-        refined.samples = samples
-        refined.cosDelta = cosines
-        refined.sinDelta = sines
-        return refined
+    /// The regular samples from `start` to `end`, then `extra` (sorted, from `end` on): a ray
+    /// ending on an exact summit, or a fine window. The regular trigonometry is reused, so
+    /// only the extra samples cost anything.
+    func sampling(from start: Double, nearerThan end: Double, then extra: [Double]) -> March {
+        var m = self
+        let a = samples.firstIndex { $0 >= start } ?? samples.count
+        let b = max(a, samples.firstIndex { $0 >= end } ?? samples.count)
+        m.samples = Array(samples[a..<b]) + extra
+        m.cosDelta = Array(cosDelta[a..<b]) + extra.map { cos($0 * sphere.radiansPerMeter) }
+        m.sinDelta = Array(sinDelta[a..<b]) + extra.map { sin($0 * sphere.radiansPerMeter) }
+        return m
     }
 
     /// Marches one ray, appending every sample that rises above everything nearer.
     /// Consecutive visible samples are thinned to steps of `elevationResolution` degrees,
     /// but the last one of each visible stretch (a crest) is always kept.
+    ///
+    /// A non-empty `envelope` is what's been seen nearer, and the march carries on from it;
+    /// `inSight` says whether the terrain just before the first sample was in sight.
     func run(terrain: Terrain, azimuth: Double, upTo maxDistance: Double,
-             envelope: inout [HorizonProfile.EnvelopePoint]) {
+             envelope: inout [HorizonProfile.EnvelopePoint], inSight: Bool = false) {
         let ray = GreatCircleRay(sphere: sphere, longitude: observer.longitude, azimuth: azimuth)
         // Refraction as a larger effective Earth: R' = R / (1 − k).
         let radius = WGS84.radius(latitude: observer.latitude * .pi / 180, azimuth: azimuth * .pi / 180)
@@ -357,7 +377,11 @@ struct March {
         var best = -Double.infinity            // tan of the highest elevation angle so far
         var lastKept = -Double.infinity        // elevation (degrees) of the last kept point
         var pending: (Double, Double)? = nil   // newest visible sample not yet kept
-        var visible = false
+        var visible = inSight
+        if let last = envelope.last {
+            lastKept = Double(last.elevation)
+            best = tan(lastKept * .pi / 180)
+        }
         var newSegment = false
 
         for (k, d) in samples.enumerated() {

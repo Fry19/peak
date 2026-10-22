@@ -60,6 +60,59 @@ final class HorizonTipTests: XCTestCase {
         }
     }
 
+    /// Two needles a third of a degree apart, neither on a ray. The farther one's eased flank
+    /// passes just by the nearer one's tip, higher than the regular ray there but lower than
+    /// that tip, and each ray keeps the higher skyline whichever tip comes first. Every ray's
+    /// depth envelope stays in order, including flanks marched again just in front of a tip.
+    func testNeighboringTipsBothKeepTheirHeight() {
+        let observer = GeoPoint(latitude: 45.5, longitude: 8.2, height: 1_001.6)
+        // The farther one is to the south, so it comes later in the tile.
+        let summits = [(115.047, 10_002.3), (115.33, 10_481.7)].map { destination(from: observer, azimuth: $0.0, distance: $0.1) }
+        let step = 1.0 / 3600, rows = 401, cols = 601
+        let north = summits[0].latitude + 200 * step, west = summits[0].longitude - 450 * step
+        var heights = [Int16](repeating: 1_000, count: rows * cols)
+        for r in 0..<rows {
+            for c in 0..<cols {
+                let lat = north - Double(r) * step, lon = west + Double(c) * step
+                let cones = summits.map { s in
+                    1_000 + max(0, 400 - hypot((lat - s.latitude) * 111_320, (lon - s.longitude) * 111_320 * cos(lat * .pi / 180)))
+                }
+                heights[r * cols + c] = Int16(cones.max()!.rounded())
+            }
+        }
+        let terrain = Terrain(tiles: [ElevationTile(south: 45, west: 8, rows: rows, cols: cols,
+                                                    originLatitude: north, originLongitude: west,
+                                                    stepLatitude: step, stepLongitude: step, heights: heights)],
+                              missingIsSea: false)
+        let peaks = summits.enumerated().map {
+            Peak(id: Int64($0.offset), name: "Needle", latitude: $0.element.latitude, longitude: $0.element.longitude, elevation: 1_600)
+        }
+        XCTAssertEqual(terrain.raiseSummits(peaks), 2)
+        let profile = HorizonRenderer(terrain: terrain).render(from: observer, settings: settings)
+
+        var apexRays: [Int] = []
+        for s in summits {
+            // The tip's point is on the grid node nearest the summit.
+            let apex = GeoPoint(latitude: north - ((north - s.latitude) / step).rounded() * step,
+                                longitude: west + ((s.longitude - west) / step).rounded() * step, height: 1_600)
+            let look = LocalFrame(origin: observer).look(at: apex, refraction: settings.refraction)
+            let i = Int((look.azimuth / settings.azimuthStep).rounded()) % profile.count
+            let distance = groundDistance(from: observer, to: apex)
+            let errorMeters = distance * (tan(look.elevation * .pi / 180) - tan(Double(profile.elevations[i]) * .pi / 180))
+            XCTAssertEqual(errorMeters, 0, accuracy: 3)
+            XCTAssertEqual(Double(profile.distances[i]), distance, accuracy: 1)
+            apexRays.append(i)
+        }
+        XCTAssertEqual(apexRays[1] - apexRays[0], 3, "each one's flanks reach the other's apex ray")
+        for i in 0..<profile.count {
+            let envelope = Array(profile.envelope(ofRay: i))
+            for j in envelope.indices.dropFirst() {
+                XCTAssertGreaterThan(envelope[j].elevation, envelope[j - 1].elevation, "ray \(i)")
+                XCTAssertGreaterThan(envelope[j].distance, envelope[j - 1].distance, "ray \(i)")
+            }
+        }
+    }
+
     func testTipSurvivesRebuildingTerrainFromTheSameTiles() {
         let (terrain, peak, observer) = scene()
         XCTAssertEqual(terrain.raiseSummits([peak]), 1)
