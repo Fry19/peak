@@ -653,19 +653,28 @@ final class WalkWorld: @unchecked Sendable {
                     // Pale haze shows more than the dark one: keep the middle distance clear.
                     scene.fogDensityExponent = 1.8
                 }
+                // Further out in daylight, also when the camera is still.
+                haze(range: hazeRange)
             }
         }
     }
 
     /// The haze starts a few kilometers out, and further while looking down from high up;
-    /// `range` is how far the camera is from what it looks at.
+    /// `range` is how far the camera is from what it looks at. Over the imagery, in daylight,
+    /// the nearer ridges stay clear further out, as they do looking at a summit from a few
+    /// kilometers off.
     func haze(range: Double) {
-        let start = max(3_000, range * 1.2)
+        hazeRange = range
+        let start = max(draped ? 7_000 : 3_000, range * 1.2)
         // Only when it changes, so a still scene isn't drawn again.
         guard abs(scene.fogStartDistance - start) > 1 else { return }
         scene.fogStartDistance = start
         scene.fogEndDistance = start + 21_000
     }
+
+    /// How far the camera was from what it looked at when the haze was last set, for setting
+    /// it again when the imagery is laid (main thread only).
+    private var hazeRange = 0.0
 
     // MARK: Sharper imagery near the walker
 
