@@ -30,6 +30,8 @@ final class SkylineCorrector: @unchecked Sendable {
         var runnerUp: AlignmentResult.Rival?
         var nearRunnerUp: AlignmentResult.Rival?
         var seconds: Double
+        /// Frames matched together (`SkylineStrip`): 1 for a frame matched alone.
+        var frames = 1
     }
 
     /// Called on the main thread with each finished match.
@@ -64,7 +66,13 @@ final class SkylineCorrector: @unchecked Sendable {
     private var sideways = ViewCorrection()
     private var lensOffsets = LensOffsets()
     private var positionUncertainty = LocationQuality.matchingAccuracy
+    /// Where the phone is (the latest fix), for keeping a pan's frames to one place.
+    private var position: GeoPoint?
+    /// Counts pauses: work started before one leaves the strip alone.
+    private var generation = 0
     private let matcher = SkylineMatcher()
+    /// Frames turned away alone, matched together as the phone pans. Only touched on `work`.
+    private var strip = SkylineStrip()
     /// The long side frames are matched at. What counts is pixels per degree: a far ridge in
     /// haze may stand only half a degree over a nearer one in front, a few pixels at this size.
     private static let workingSide = 960
@@ -73,13 +81,14 @@ final class SkylineCorrector: @unchecked Sendable {
     /// sideways and each lens's offset on top, and how far you may be from where the horizon was rendered, meters
     /// (`LocationQuality.positionUncertainty`). Call on any thread.
     func update(horizon: HorizonProfile?, upright: ViewCorrection, sideways: ViewCorrection, lensOffsets: LensOffsets,
-                positionUncertainty: Double) {
+                positionUncertainty: Double, position: GeoPoint?) {
         lock.lock()
         self.horizon = horizon
         self.upright = upright
         self.sideways = sideways
         self.lensOffsets = lensOffsets
         self.positionUncertainty = positionUncertainty
+        self.position = position
         lock.unlock()
     }
 
@@ -89,13 +98,21 @@ final class SkylineCorrector: @unchecked Sendable {
     /// thrown away). Call on any thread.
     var paused: Bool {
         get { lock.lock(); defer { lock.unlock() }; return isPaused }
-        set { lock.lock(); isPaused = newValue; lock.unlock() }
+        set {
+            lock.lock()
+            isPaused = newValue
+            // A pan doesn't carry on across a pause.
+            if newValue { generation += 1 }
+            lock.unlock()
+            if newValue { work.async { self.strip.removeAll() } }
+        }
     }
 
-    /// Offers a camera frame (on the camera queue) with the phone's pose when it was taken.
+    /// Offers a camera frame (on the camera queue) with the phone's pose when it was taken,
+    /// and the camera's heading by the gyroscope then (`MotionTracker.gyroHeading(at:)`).
     /// Most are skipped: one is taken at a time, at most about once a second, only while
     /// the phone is steady, and none while paused.
-    func offer(_ frame: CameraFeed.Frame, pose: MotionTracker.Pose, steady: Bool) {
+    func offer(_ frame: CameraFeed.Frame, pose: MotionTracker.Pose, gyro: (heading: Double, epoch: Int)?, steady: Bool) {
         lock.lock()
         guard !busy, !isPaused, steady, let horizon, Date().timeIntervalSince(lastStart) > 0.8 else {
             lock.unlock()
@@ -108,12 +125,15 @@ final class SkylineCorrector: @unchecked Sendable {
         let base = isSideways ? sideways : upright
         let correction = base + lensOffsets.offset(lens: frame.lens.name, sideways: isSideways)
         let uncertainty = positionUncertainty
+        let position = self.position ?? horizon.observer
+        let generation = self.generation
         let capture = self.capture
         self.capture = nil
         lock.unlock()
 
         let pixels = frame.pixels
         let lens = frame.lens
+        let time = frame.time
         let axes = CameraGeometry.axes(pose, portrait: frame.portrait)
 
         // Everything, the conversion included, happens off the camera's queue so frames keep
@@ -138,12 +158,30 @@ final class SkylineCorrector: @unchecked Sendable {
             let (w, h) = (upright.image.width, upright.image.height)
             matcher.workingWidth = w >= h ? Self.workingSide : Self.workingSide * w / h
             let m = matcher.match(upright.image, intrinsics: upright.camera.intrinsics, prior: prior, horizon: horizon)
-            let a = m.alignment
-            let outcome = Outcome(delta: a.headingCorrection, from: base.heading,
+            var a = m.alignment
+            var frames = 1
+            let stitching = Date()
+            // A frame turned away alone joins the frames before it, matched together. Every
+            // frame counts once: after any accepted match the strip starts over, so the next
+            // match HeadingLock may take as confirmation comes from frames of its own.
+            if a.accepted {
+                self.strip.removeAll()
+            } else if let gyro, self.isCurrent(generation) {
+                self.strip.add(SkylineStrip.Frame(skyline: m.skyline, camera: m.camera, time: time, gyroHeading: gyro.heading,
+                                                  position: position,
+                                                  lens: "\(lens.name)|\(isSideways)|\(gyro.epoch)"))
+                if let stitched = self.strip.match(horizon: horizon, settings: matcher.settings), stitched.accepted {
+                    a = stitched
+                    frames = self.strip.frames.count
+                    self.strip.removeAll()
+                }
+            }
+            var outcome = Outcome(delta: a.headingCorrection, from: base.heading,
                                   pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
                                   sideways: isSideways, lens: lens.name, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
                                   ambiguity: a.ambiguity, nearAmbiguity: a.nearAmbiguity, runnerUp: a.runnerUp,
-                                  nearRunnerUp: a.nearRunnerUp, seconds: m.seconds)
+                                  nearRunnerUp: a.nearRunnerUp, seconds: m.seconds + Date().timeIntervalSince(stitching))
+            outcome.frames = frames
             if let capture, let frame = Self.testFrame(upright, correction: correction, horizon: horizon,
                                                        measuredLens: lens.measured, outcome: outcome) {
                 DispatchQueue.main.async { capture(frame) }
@@ -184,7 +222,7 @@ final class SkylineCorrector: @unchecked Sendable {
                      "heading": String(format: "%+.3f", outcome.delta), "pitch": String(format: "%+.3f", outcome.pitchDelta),
                      "roll": String(format: "%+.3f", outcome.rollDelta), "rms": String(format: "%.3f", outcome.rms),
                      "ambiguity": String(format: "%.2f", outcome.ambiguity),
-                     "nearAmbiguity": String(format: "%.2f", outcome.nearAmbiguity)]
+                     "nearAmbiguity": String(format: "%.2f", outcome.nearAmbiguity), "frames": String(outcome.frames)]
         // The closest other fits, as corrections like the match's own.
         for (key, rival) in [("runnerUp", outcome.runnerUp), ("nearRunnerUp", outcome.nearRunnerUp)] {
             guard let rival else { continue }
@@ -207,6 +245,13 @@ final class SkylineCorrector: @unchecked Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(file) else { return nil }
         return TestFrame(image: frame.image, caseFile: data, imageName: name)
+    }
+
+    /// No pause since `generation` was taken.
+    private func isCurrent(_ generation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation == self.generation
     }
 
     private func finish(_ outcome: Outcome?) {

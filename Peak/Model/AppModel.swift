@@ -297,7 +297,8 @@ final class AppModel {
             uncertainty = LocationQuality.positionUncertainty(accuracy: location.horizontalAccuracy, moved: location.distance(from: built))
         }
         corrector.update(horizon: horizon, upright: upright, sideways: sideways, lensOffsets: lensOffsets,
-                         positionUncertainty: uncertainty)
+                         positionUncertainty: uncertainty,
+                         position: location.map { GeoPoint(latitude: $0.coordinate.latitude, longitude: $0.coordinate.longitude, height: 0) })
     }
 
     func start() {
@@ -340,7 +341,7 @@ final class AppModel {
         camera.onFrame = { [weak self] frame in
             guard let self else { return }
             if !self.corrector.paused, let pose = self.motion.pose(at: frame.time) {
-                self.corrector.offer(frame, pose: pose, steady: self.motion.isSteady)
+                self.corrector.offer(frame, pose: pose, gyro: self.motion.gyroHeading(at: frame.time), steady: self.motion.isSteady)
             }
             self.mailbox.post(frame) { [weak self] in self?.screen?.show($0) }
         }
@@ -1499,6 +1500,7 @@ final class AppModel {
         lines.append(String(format: "%ld matches", correction.matches))
         if let o = lastOutcome {
             lines.append(o.accepted ? String(format: "last match: ok %+.2f°, %.2f° rms, %.0f ms", o.delta, o.rms, o.seconds * 1000)
+                                        + (o.frames > 1 ? ", \(o.frames) frames of a pan" : "")
                                     : "last match: \(o.reason ?? "rejected")")
         }
         if let l = location {

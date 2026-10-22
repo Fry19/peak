@@ -37,6 +37,7 @@ The **list button** (bottom left) lists every peak around you, those in view fir
 ### Staying lined up
 
 - **Skyline matching.** About once a second, while you hold the phone steady, Peak matches the skyline in the camera picture against the terrain and corrects the compass heading, pitch and roll. The pill at the bottom shows which way you're facing and **Locked** (green, matched within 20 seconds) or **Compass** (orange: point the phone at mountains with a clear skyline and hold it still for a moment).
+- **Panning.** A frame with too little skyline to match alone, say through a window or between roofs, is kept for a few seconds and matched together with the next ones as you turn the phone, placed by the gyroscope alone (the compass is often pulled off indoors). See [docs/skyline-stitching.md](docs/skyline-stitching.md).
 - **Frame timing.** The app shows the camera frames itself and draws the lines for each frame with the phone's orientation at the moment that frame was taken (motion readings arrive 100 times a second and are interpolated). A camera picture reaches the screen a few hundredths of a second late, so drawing with the latest orientation made the lines run ahead of the picture while turning.
 - **Lens.** The field of view and optical center come from each frame's intrinsic matrix when the camera provides one, with focus kept far.
 - **Terrain detail.** See below. The shape of a nearby ridge is only as good as the terrain model, and sharp summits get their tips back from the peaks' surveyed heights (see "DEM accuracy at sharp summits").
@@ -140,6 +141,7 @@ swift build -c release
 .build/release/peakbench align matterhorn.json --dem ../DEM --debug aligned.png
 .build/release/peakbench bench --dem ../DEM --lat 45.9837 --lon 7.7856 --runs 30
 .build/release/peakbench bench --dem ../DEM --lat 45.9837 --lon 7.7856 --runs 30 --harder --peaks peaks.json
+.build/release/peakbench pan --dem ../DEM --lat 45.9837 --lon 7.7856 --runs 30 --gap 4
 .build/release/peakbench sun --dem ../DEM --lat 45.9837 --lon 7.7856 --date 2026-10-21 --tz Europe/Zurich \
     --peak-lat 45.9763 --peak-lon 7.6586 --peak-ele 4478
 ```
@@ -217,6 +219,7 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
     SkylineDetector.swift  Sky/terrain boundary per image column
     Aligner.swift          Heading, pitch and roll from skyline vs horizon, with gates
     SkylineMatcher.swift   Detection and alignment for one frame
+    SkylineStrip.swift     Frames of a pan matched together; gyroscope-only heading
     Anchors.swift          True attitude of a real photo from marked summits; proposed anchors
     TerrainVariants.swift  Coarser (overview) and perturbed terrain, the app's mixed-detail terrain
     Scene.swift            Ridge segments to draw, visible peaks, trails laid on the terrain
@@ -242,7 +245,7 @@ Tools/fetch_base_layer.sh  Downloads World.pkbase from its GitHub Release (check
 Tools/fetch_world_peaks.py Every named OpenStreetMap peak and volcano, for the base layer
 Tools/build_base_layer.py  Builds the worldwide base layer (World.pkbase) from ETOPO 2022 and those peaks
 Tools/make_icon.py         Renders the app icon, the Matterhorn from Gornergrat, from the DEM tiles
-docs/                      Images for this README
+docs/                      Images for this README, notes (skyline-stitching.md)
 ```
 
 A `.pkdem` file is a 64-byte header (magic `PKDM`, version, south and west edge in whole degrees, rows, columns, then the first pixel's latitude and longitude and the pixel spacing as doubles) followed by heights in meters as little-endian Int16, rows from north to south.

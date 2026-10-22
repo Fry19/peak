@@ -134,6 +134,52 @@ public enum SyntheticPhoto {
         return image
     }
 
+    /// Paints buildings over a rendered photo. They stand still in the world as the camera
+    /// turns, so frames of one pan see the same roofs, and the skyline only in the gaps.
+    public static func occlude(_ image: inout RGBImage, camera: Camera, buildings: [Building],
+                               realism: CameraRealism = CameraRealism()) {
+        guard !buildings.isEmpty else { return }
+        let k = camera.intrinsics
+        let pinhole = camera.projector
+        for y in 0..<k.height {
+            var a = camera.attitude
+            a.heading = realism.heading(row: Double(y) + 0.5, camera)
+            let projector = realism.rollingShutter == 0 ? pinhole : Camera(intrinsics: k, attitude: a).projector
+            for x in 0..<k.width {
+                let p = realism.isPinhole ? (x: Double(x) + 0.5, y: Double(y) + 0.5)
+                    : realism.undistort(x: Double(x) + 0.5, y: Double(y) + 0.5, k)
+                let look = projector.look(x: p.x, y: p.y)
+                for b in buildings {
+                    let t = azimuthDifference(look.azimuth, b.from) / b.width
+                    guard t >= 0, t <= 1, look.elevation < b.roof.left + t * (b.roof.right - b.roof.left) else { continue }
+                    // Plain walls with a little texture, darker toward the bottom.
+                    let n = fractalNoise(look.azimuth * 4, look.elevation * 4, seed: 23)
+                    let v = Double(b.shade) * (0.8 + 0.2 * max(0, min(1, (look.elevation + 20) / 30))) + 20 * (n - 0.5)
+                    image.set(x, y, (clampByte(v), clampByte(v * 0.96), clampByte(v * 0.9)))
+                    break
+                }
+            }
+        }
+    }
+
+    /// A building in front of the view: it hides everything below its roofline.
+    public struct Building: Sendable {
+        /// Its left edge's azimuth and how far clockwise it reaches, degrees.
+        public var from: Double
+        public var width: Double
+        /// The roofline's elevation at its left and right edges, degrees.
+        public var roof: (left: Double, right: Double)
+        /// Wall brightness.
+        public var shade: UInt8
+
+        public init(from: Double, width: Double, roof: (left: Double, right: Double), shade: UInt8 = 120) {
+            self.from = from
+            self.width = width
+            self.roof = roof
+            self.shade = shade
+        }
+    }
+
     /// Top edge (y) of a band of conifers along the bottom of the image, per column.
     static func treeProfile(width w: Int, height h: Int, coverage: Double, rng: inout SplitMix64) -> [Double] {
         var tops = [Double](repeating: .infinity, count: w)

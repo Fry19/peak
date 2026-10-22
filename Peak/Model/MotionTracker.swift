@@ -1,5 +1,6 @@
 import CoreMotion
 import Foundation
+import PeakCore
 
 /// Which way the phone points, from the gyroscope, accelerometer and compass. The mountains
 /// are kilometers away, so only the phone's rotation matters; this works instantly and
@@ -43,8 +44,14 @@ final class MotionTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var latest: Pose?
     /// Recent poses with their sensor timestamps (seconds since boot, the same clock as
-    /// camera frames), oldest first.
-    private var history: [(time: TimeInterval, pose: Pose)] = []
+    /// camera frames), oldest first, and the back camera's heading by the gyroscope alone.
+    private var history: [(time: TimeInterval, pose: Pose, gyroHeading: Double)] = []
+    /// The phone's attitude by the gyroscope, kept level by gravity: its heading doesn't
+    /// follow the magnetometer, so frames of a pan can be placed relative to each other
+    /// even where the compass is pulled off (`SkylineStrip`).
+    private var gyro: GyroAttitude?
+    /// Counts restarts: gyroscope headings from different runs don't share a zero.
+    private var gyroEpoch = 0
     private var rotationRate = 0.0
     private var lastUpdate = Date.distantPast
     private var recentUpdates: [Date] = []
@@ -68,6 +75,8 @@ final class MotionTracker: @unchecked Sendable {
         lastUpdate = Date()
         // Readings in the old reference frame would mix two norths.
         history.removeAll()
+        gyro = nil
+        gyroEpoch += 1
         lock.unlock()
         running = true
         manager.deviceMotionUpdateInterval = 1.0 / 100
@@ -142,6 +151,23 @@ final class MotionTracker: @unchecked Sendable {
         return Pose.blend(a.pose, b.pose, max(0, min(1, f)))
     }
 
+    /// The back camera's heading by the gyroscope alone at `time` (seconds since boot),
+    /// from a zero that holds until the sensors restart (`epoch`); nil outside the readings.
+    func gyroHeading(at time: TimeInterval) -> (heading: Double, epoch: Int)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let first = history.first, let last = history.last, time >= first.time, time <= last.time + 0.05 else { return nil }
+        if time >= last.time { return (last.gyroHeading, gyroEpoch) }
+        var lo = 0, hi = history.count - 1
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2
+            if history[mid].time <= time { lo = mid } else { hi = mid }
+        }
+        let a = history[lo], b = history[hi]
+        let f = b.time > a.time ? max(0, min(1, (time - a.time) / (b.time - a.time))) : 0
+        return (normalizedAzimuth(a.gyroHeading + f * azimuthDifference(b.gyroHeading, a.gyroHeading)), gyroEpoch)
+    }
+
     /// Timestamp of the latest reading (seconds since boot).
     var latestTime: TimeInterval? {
         lock.lock()
@@ -182,7 +208,15 @@ final class MotionTracker: @unchecked Sendable {
         let now = Date()
         lock.lock()
         latest = pose
-        history.append((motion.timestamp, pose))
+        if var g = gyro, let previous = history.last {
+            g.rotate(rate: SIMD3(r.x, r.y, r.z), dt: motion.timestamp - previous.time)
+            g.level(up: up, keeping: SIMD3(0, 0, -1))
+            gyro = g
+        } else {
+            gyro = GyroAttitude(x: pose.right, y: pose.up, z: pose.out)
+        }
+        // The back camera looks along the phone's −z.
+        history.append((motion.timestamp, pose, gyro?.heading(of: SIMD3(0, 0, -1)) ?? 0))
         if history.count > 150 { history.removeFirst(history.count - 150) }
         rotationRate = (r.x * r.x + r.y * r.y + r.z * r.z).squareRoot()
         lastUpdate = now

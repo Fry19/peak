@@ -33,6 +33,16 @@ peakbench: desk test harness for skyline matching.
       --camera real adds lens distortion (|k1| up to 0.005) and rolling shutter (up to 0.3°).
       --scene smokies renders forest to the top and thick haze.
 
+  peakbench pan --dem DIR --lat L --lon L [--runs N] [--frames F] [--pan D] [--interval S] [--fov F]
+                [--occlusion walls|roofs|none] [--gap D] [--roof D] [--wander D] [--drift D] [--seed S] [--markdown FILE]
+                [and bench's --harder, --world, --match app, --peaks, --camera, --scene options]
+      Panning sequences between buildings: F frames (default 5) over D degrees (default 40),
+      S seconds apart (1.5), the skyline seen only in gaps of about --gap degrees (8 between
+      walls, 5 between roofs) between buildings about --roof degrees wide (14). Walls reach
+      far above the skyline, as a window's frame; roofs stand just over it, sky above them. The compass wanders σ --wander degrees (3) from
+      frame to frame, as indoors, and the gyroscope drifts σ --drift °/s (0.02). Each frame is
+      matched alone, then with the frames before it (SkylineStrip); reports both.
+
   peakbench realbench DIR [--dem DIR] [--match full|app] [--peaks OVERPASS.json] [--prior sensors|saved]
                   [--max-fit D] [--working-width W] [--markdown FILE] [--debug DIR] [--label TEXT]
       Run every case in a directory: photos (peakbench case) and frames saved by the app.
@@ -991,6 +1001,7 @@ do {
     case "synth": try synthCommand(args)
     case "align": try alignCommand(args)
     case "bench": try benchCommand(args)
+    case "pan": try panCommand(args)
     case "realbench": try realbenchCommand(args)
     case "suggest-anchors": try suggestAnchorsCommand(args)
     case "detect": try detectCommand(args)
