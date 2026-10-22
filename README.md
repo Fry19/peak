@@ -75,20 +75,26 @@ When Peak starts, allow the camera and your location.
 | **Skyline detection** | A simple, model-free heuristic for now: it models the sky as a smooth color gradient and the terrain as a mix of colors, then finds the best boundary across the image by dynamic programming. It handles clouds and trees in front of the skyline. It's meant to be replaced by a small Core ML model. |
 | **Alignment** | Searches ±20° of heading plus small pitch and roll corrections, then refines with robust least squares. Each skyline point counts according to how far away that part of the skyline is: a 15 m GPS error moves a ridge 500 m away by 1.7°, but a ridge 20 km away by only 0.04°. |
 | **Gating** | A frame's correction is only used if most of its skyline matches, enough of it is far away, and no other heading fits nearly as well. Otherwise the frame is skipped. |
-| **Desk harness** | `peakbench` renders horizons, makes synthetic photos with a known camera, aligns a photo case (your own iPhone photos included) and runs Monte Carlo benchmarks. |
+| **Desk harness** | `peakbench` renders horizons, makes synthetic photos with a known camera, aligns a photo case (your own iPhone photos included), runs Monte Carlo benchmarks (same-DEM and harder), and benchmarks real photos with summits marked in them. |
 
 ### Results so far
 
-Synthetic photos of the real terrain within 3 km of Gornergrat above Zermatt, using the Copernicus DEM. Each photo is taken from the true position. The matcher only gets the GPS position (up to 15 m off), a compass heading with ~8° of error, and pitch and roll as ARKit gives them (±0.4°). About half the frames have clouds and some have trees in front. Photos are aimed where the skyline is at least 5 km away, as when someone points the phone at the peaks:
+Heading error after skyline matching, on frames the gates accepted. Each row is 30 photos aimed where the skyline is at least 5 km away, as when someone points the phone at the peaks. The matcher only gets the GPS position (up to 15 m off), a compass heading with ~8° of error (σ), and pitch and roll as ARKit gives them (±0.4°). About half the frames have clouds and some have trees in front.
 
-| Heading error | median | 90th percentile | worst |
-| --- | --- | --- | --- |
-| Compass (before) | 7.20° | 12.82° | 13.62° |
-| Skyline matched (after) | 0.035° | 0.081° | 0.115° |
+| Benchmark | Site | median | 90th percentile | worst | accepted |
+| --- | --- | --- | --- | --- | --- |
+| Compass alone (before matching) | Gornergrat | 7.20° | 12.82° | 13.62° | |
+| **Same-DEM synthetic** | Gornergrat | 0.043° | 0.082° | 0.115° | 30 of 30 |
+| **Harder synthetic** | Gornergrat | 0.063° | 0.196° | 0.205° | 28 of 30 |
+| Harder synthetic, no pitch/roll (photo mode) | Gornergrat | 0.062° | 0.127° | 0.228° | 29 of 30 |
+| Harder synthetic | Great Smoky Mountains | 0.058° | 0.216° | 2.665° | 21 of 30 |
+| **Real photos** | | *not yet measured* | | | |
 
-29 of 30 frames were accepted and none was accepted with an error over 0.5°. Without pitch and roll from the phone (as with a photo's EXIF), 30 of 30 were accepted with a median error of 0.027°. Aiming in random directions, often at a slope a few hundred meters away, only 18 of 30 were accepted, all within 0.1°: nearby ridges can't pin the heading down under GPS error, and the gates turn those frames away. CI runs these benchmarks on every push and posts the tables in the job summary.
+- **Same-DEM synthetic** photos are rendered from the very terrain they are matched against, with a perfect pinhole camera. They test the geometry and the matcher, and are the best case. CI's history of this row goes back furthest.
+- **Harder synthetic** photos are rendered from a perturbed copy of the terrain (blurred by 0.8 px, height noise within ±5 m, shifted 15 m), and matched against the terrain the app actually holds: 30 m within 10 km, 60 m within 35 km and 120 m beyond, with summits raised to their OpenStreetMap elevations (matching side only, as in the app). The camera has radial lens distortion (|k1| up to 0.005) and rolling shutter (up to 0.3° across the frame). Each condition on its own costs about as much: the different DEM 0.055° median, lens and shutter 0.058°, the app's terrain 0.036–0.046°.
+- **Great Smoky Mountains** (Mount Le Conte): rounded, forested ridges to the top, thick haze, much of the skyline far off across low country. More frames are turned away for lack of distant skyline structure, and one frame was accepted 2.7° off: a flat skyline 100 km away, with clouds and trees in front. So the gates can still be fooled there.
 
-These photos are synthetic, so they test the geometry and the matching but not how well detection copes with real cameras, real haze and real DEM errors. Real photos are the next test (see below).
+The real-photo row stays empty until there are real photos with marked summits (see [Testing with your own photos](#testing-with-your-own-photos)). No competitor publishes a number like it. CI runs all the synthetic rows on every push and posts the tables in the job summary.
 
 ### DEM accuracy at sharp summits
 
@@ -118,9 +124,12 @@ swift build -c release
 .build/release/peakbench synth --dem ../DEM --lat 45.9837 --lon 7.7856 --heading 262 --compass-error 8 --out matterhorn
 .build/release/peakbench align matterhorn.json --dem ../DEM --debug aligned.png
 .build/release/peakbench bench --dem ../DEM --lat 45.9837 --lon 7.7856 --runs 30
+.build/release/peakbench bench --dem ../DEM --lat 45.9837 --lon 7.7856 --runs 30 --harder --peaks peaks.json
 .build/release/peakbench sun --dem ../DEM --lat 45.9837 --lon 7.7856 --date 2026-10-21 --tz Europe/Zurich \
     --peak-lat 45.9763 --peak-lon 7.6586 --peak-ele 4478
 ```
+
+`--harder` renders the photos from perturbed terrain, matches against the app's mixed 30/60/120 m terrain (with summits raised to the peaks in `--peaks`, an Overpass answer) and adds lens distortion and rolling shutter; `--world`, `--match` and `--camera` turn these on one at a time. For the second site, fetch `--lat 35.654 --lon -83.444` into another directory and add `--scene smokies`.
 
 `fetch_dem.py` downloads Copernicus GLO-30 tiles from the public AWS bucket (about 40 MB per 1° tile; 8 tiles for 100 km in the Alps) and converts them to `.pkdem` files. Use a release build of `peakbench`: debug builds are 10–35× slower. On Linux, images are read and written as `.ppm`.
 
@@ -128,22 +137,36 @@ swift build -c release
 
 ### Testing with your own photos
 
-iPhone photos record where they were taken and which way the camera faced (the compass heading), and the lens data gives the field of view. On a Mac:
+Real photos are how the accuracy claim gets measured: `peakbench realbench` runs a directory of them and reports the heading error before and after matching, how many frames were accepted, and why the others were turned away, in the same table format as `bench`.
 
-1. Take photos of mountains with a clear skyline. Leave Location on for the Camera.
-2. Download DEM tiles for the area (above).
-3. Make a case file from each photo, then align it:
-   ```
-   .build/release/peakbench case IMG_1234.jpg
-   .build/release/peakbench align IMG_1234.json --dem ../DEM --debug IMG_1234-aligned.png
-   ```
-4. To measure the error, `align` needs the true heading. Add one or two summits you can see to the case file as `anchors`, with the pixel where each summit is in the photo:
-   ```json
-   "anchors": [
-     { "name": "Matterhorn", "latitude": 45.97639, "longitude": 7.65861, "elevation": 4478, "x": 2210, "y": 1480 }
-   ]
-   ```
-   `align` then works out the true attitude from them and reports the compass error before and after correction.
+**Collecting photos.** Either source works, and both can go in the same directory:
+
+- **iPhone Camera photos.** These record where they were taken, which way the camera faced (the compass heading) and the lens. Leave Location on for the Camera. `peakbench case IMG_1234.jpg` (on a Mac) makes the case file `IMG_1234.json`.
+- **Frames saved by Peak.** In the diagnostics (long-press the pill), tap **Save frame for testing** and share the PNG and JSON. They carry the raw sensor attitude and the measured lens. `realbench` matches them from the raw sensors, a cold start, unless `--prior saved`.
+
+Good test photos have a clear skyline with peaks you can name, and point in a few different directions from each spot. Some with haze, cloud or trees in front are useful too: they show whether the gates turn bad frames away.
+
+**Marking summits.** The error can only be measured against a true heading, and that comes from summits marked in the photo (`anchors`). `AnchorSolver` works out the camera's true attitude from them: one fixes heading and pitch, two or more fix roll as well. To mark them quickly:
+
+```
+.build/release/peakbench suggest-anchors IMG_1234.json --dem ../DEM --peaks peaks.json --debug IMG_1234-anchors.png
+.build/release/peakbench suggest-anchors IMG_1234.json --confirm 2,5
+.build/release/peakbench realbench photos/ --dem ../DEM --markdown real.md --debug photos/aligned
+```
+
+`suggest-anchors` aligns the photo and writes the pixel of each visible named peak into the case as an *unconfirmed* anchor. `--peaks` takes an Overpass JSON answer, the same format as the app's cached peak files. Get one for a box around the photos with `Overpass.peaksQuery` (on [overpass-turbo.eu](https://overpass-turbo.eu), or `curl --data-urlencode "data=…" https://overpass-api.de/api/interpreter`).
+
+The debug image shows numbered crosshairs on the photo, and below it a close-up of each one at full size, magnified 3×. Check each close-up. If the crosshair sits on the summit's tip, confirm it with `--confirm`. If it's a few pixels off, edit its `x`/`y` in the case file to the tip, then confirm. Remove wrong ones with `--drop`. **Never confirm without looking.** The proposals come from the very match being measured, so accepting them blindly measures nothing (the error comes out as zero). Unconfirmed anchors never count as truth. A distant, sharp summit pins the heading best. Anchors can also be typed by hand:
+
+```json
+"anchors": [
+  { "name": "Matterhorn", "latitude": 45.97639, "longitude": 7.65861, "elevation": 4478, "x": 2210, "y": 1480 }
+]
+```
+
+`align` uses the same anchors for a single photo. `realbench` leaves out cases whose anchors don't agree with each other (over 0.25° RMS, usually one on the wrong summit) and counts cases without anchors for acceptance only.
+
+**Contributing photos.** Open an issue or pull request with the photos (the original files, so the EXIF survives, or Peak's PNG + JSON pairs), their case files with confirmed anchors, and a line on where they were taken. Photos from anywhere help, especially outside the Alps. Once there are 20 or more, the real-photo row above gets its numbers.
 
 ## Project layout
 
@@ -163,7 +186,8 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
     SkylineDetector.swift  Sky/terrain boundary per image column
     Aligner.swift          Heading, pitch and roll from skyline vs horizon, with gates
     SkylineMatcher.swift   Detection and alignment for one frame
-    Anchors.swift          True attitude of a real photo from marked summits
+    Anchors.swift          True attitude of a real photo from marked summits; proposed anchors
+    TerrainVariants.swift  Coarser (overview) and perturbed terrain, the app's mixed-detail terrain
     Scene.swift            Ridge segments to draw, visible peaks, trails laid on the terrain
     GeoTIFF.swift          Reads Copernicus tiles, their built-in lower resolutions and single
                            blocks (with Inflate.swift)
@@ -174,7 +198,8 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
     SunTimes.swift         When the sun crosses the terrain: real sunrise and sunset, summit light,
                            DIN 33466 walking times
     UprightFrame.swift     Turns sideways camera frames so the sky is up
-    SyntheticPhoto.swift   Fake photos with a known camera, for testing
+    SyntheticPhoto.swift   Fake photos with a known camera (lens distortion and rolling shutter
+                           optional), for testing
     Image.swift            RGB images, PPM files, drawing
   Sources/peakbench/       The desk harness
   Tests/PeakCoreTests/     Unit tests on procedural terrain with known geometry

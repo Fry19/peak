@@ -83,6 +83,8 @@ jobs:
     env:
       LAT: "45.9837"
       LON: "7.7856"
+      SMOKIES_LAT: "35.654"
+      SMOKIES_LON: "-83.444"
     steps:
       - uses: actions/checkout@v5
 
@@ -92,11 +94,52 @@ jobs:
           path: DEM
           key: dem-gornergrat-100km-${{ hashFiles('Tools/fetch_dem.py') }}
 
+      # The second site: forested, hazy, lower relief. Its own cache, so the first one's
+      # key (and the tiles already saved under it) stay as they are.
+      - name: Cache Smokies DEM tiles
+        uses: actions/cache@v4
+        with:
+          path: DEM-smokies
+          key: dem-smokies-100km-${{ hashFiles('Tools/fetch_dem.py') }}
+
+      # OpenStreetMap peaks for raising summits as the app does. Kept once fetched, so the
+      # harder benchmark matches against the same summits on every run. Saved under a new
+      # key each run, so a site missing from one run's cache is added once it's fetched.
+      - name: Cache peaks
+        uses: actions/cache@v4
+        with:
+          path: peaks
+          key: bench-peaks-v1-${{ github.run_id }}
+          restore-keys: bench-peaks-v1-
+
       - name: Fetch Copernicus GLO-30 tiles
         run: |
           python3 -m venv .venv
           .venv/bin/pip install -q -r Tools/requirements.txt
           .venv/bin/python Tools/fetch_dem.py --lat "$LAT" --lon "$LON" --radius-km 100 --out DEM
+          .venv/bin/python Tools/fetch_dem.py --lat "$SMOKIES_LAT" --lon "$SMOKIES_LON" --radius-km 100 --out DEM-smokies
+
+      - name: Fetch peaks
+        run: |
+          mkdir -p peaks
+          UA="Peak/0.8 CI (github.com/Fry19/peak)"
+          # Named peaks within about 80 km (the app's range), from the first server that answers.
+          fetch() {
+            [ -s "peaks/$1.json" ] && grep -q '"elements"' "peaks/$1.json" && return 0
+            q="[out:json][timeout:120];node[\"natural\"~\"^(peak|volcano)\$\"][\"name\"]($2);out body;"
+            for server in https://overpass-api.de https://overpass.kumi.systems https://overpass.private.coffee https://maps.mail.ru/osm/tools/overpass; do
+              if curl -sSf -m 150 -A "$UA" --data-urlencode "data=$q" "$server/api/interpreter" -o "peaks/$1.part" \
+                 && grep -q '"elements"' "peaks/$1.part" && ! grep -q '"remark": *"[^"]*[Ee]rror' "peaks/$1.part"; then
+                mv "peaks/$1.part" "peaks/$1.json"
+                return 0
+              fi
+            done
+            rm -f "peaks/$1.part"
+            echo "::warning title=Peaks::couldn't fetch peaks for $1; its harder benchmark runs without summit cones"
+          }
+          fetch gornergrat 45.26,6.75,46.70,8.82
+          fetch smokies 34.93,-84.33,36.37,-82.56
+          ls -la peaks
 
       - name: Build peakbench
         working-directory: PeakCore
@@ -117,6 +160,21 @@ jobs:
           $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --mode photo --seed 2 --markdown photo.md
           $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --aim any --seed 3 --markdown any.md
           cat arkit.md photo.md any.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run harder benchmark
+        run: |
+          B=PeakCore/.build/release/peakbench
+          peaks() { [ -s "peaks/$1.json" ] && echo "--peaks peaks/$1.json"; }
+          {
+            echo "## Harder synthetic benchmark"
+            echo "The same runs, but the photo is rendered from perturbed terrain (blurred, ±5 m noise, shifted 15 m) and matched against the app's 30/60/120 m terrain with summit cones; the camera has lens distortion and rolling shutter. Then the Great Smoky Mountains: forested, hazy, lower relief."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --harder $(peaks gornergrat) --markdown hard-arkit.md
+          $B bench --dem DEM --lat "$LAT" --lon "$LON" --runs 30 --harder $(peaks gornergrat) --mode photo --seed 2 --markdown hard-photo.md
+          $B bench --dem DEM-smokies --lat "$SMOKIES_LAT" --lon "$SMOKIES_LON" --runs 30 --scene smokies --markdown smokies.md
+          $B bench --dem DEM-smokies --lat "$SMOKIES_LAT" --lon "$SMOKIES_LON" --runs 30 --scene smokies --harder $(peaks smokies) --markdown smokies-hard.md
+          for f in hard-arkit hard-photo smokies smokies-hard; do cat $f.md; echo; done >> "$GITHUB_STEP_SUMMARY"
 
       - name: Matterhorn example
         run: |

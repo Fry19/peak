@@ -81,4 +81,6 @@ Prototype skyline matching **before any UI**, since it decides whether the app b
 - DEM tiles: `python3 Tools/fetch_dem.py --lat … --lon … --radius-km 100 --out DEM` (needs `pip install -r Tools/requirements.txt`). `DEM/` is git-ignored.
 - After changing detection or alignment, run the benchmark before and after and compare. CI runs it on every push and puts the table in the job summary:
   `peakbench bench --dem DEM --lat 45.9837 --lon 7.7856 --runs 30` (ARKit mode) and `--mode photo`.
+  CI also runs `--harder` (perturbed world DEM, the app's 30/60/120 m terrain with summit cones, lens distortion and
+  rolling shutter) and a second site (the Smokies, `--scene smokies`). Real photos: `peakbench realbench DIR`.
 - Angles are degrees, distances meters, azimuths clockwise from true north. Image coordinates have y down, and a row's top edge is at y = row.

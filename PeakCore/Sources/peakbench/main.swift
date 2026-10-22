@@ -19,10 +19,32 @@ peakbench: desk test harness for skyline matching.
   peakbench bench --dem DIR --lat L --lon L [--runs N] [--spread-km K] [--gps-error M]
                   [--mode arkit|photo] [--aim far|any] [--seed S] [--markdown FILE] [--save DIR]
                   [--compass-sigma D] [--compass-max D] [--heading-range D]
+                  [--harder] [--world same|perturbed] [--dem-smooth PX] [--dem-noise M] [--dem-shift M]
+                  [--match full|app] [--peaks OVERPASS.json] [--camera pinhole|real]
+                  [--lens-k1 K] [--rolling-shutter D] [--scene alps|smokies]
       Monte Carlo test on synthetic photos of the real terrain around a point. By default
       the camera aims where the skyline is at least 5 km away, as when pointing at peaks.
       Compass errors are Gaussian (default σ 8°, at most 18°); --heading-range overrides
       the matcher's heading search (± degrees).
+      Harder conditions (--harder turns on all three): --world perturbed renders the photo
+      from blurred, noisy, shifted tiles (default σ 0.8 px, ±5 m, 15 m); --match app matches
+      against the app's 30/60/120 m terrain, with summits raised to --peaks as the app does;
+      --camera real adds lens distortion (|k1| up to 0.005) and rolling shutter (up to 0.3°).
+      --scene smokies renders forest to the top and thick haze.
+
+  peakbench realbench DIR [--dem DIR] [--match full|app] [--peaks OVERPASS.json] [--prior sensors|saved]
+                  [--max-fit D] [--working-width W] [--markdown FILE] [--debug DIR] [--label TEXT]
+      Run every case in a directory: photos (peakbench case) and frames saved by the app.
+      The truth comes from `truth` or checked anchors (AnchorSolver). Reports heading error
+      before and after matching, acceptance and why frames were turned away. Frames from
+      the app are matched from the raw sensors (a cold start) unless --prior saved. Cases
+      whose anchors fit worse than --max-fit (default 0.25° RMS) are left out.
+
+  peakbench suggest-anchors CASE.json --peaks OVERPASS.json [--dem DIR] [--debug FILE] [--max N] [--force]
+  peakbench suggest-anchors CASE.json --confirm 1,2,… | --drop 3,…
+      Align the photo and propose the pixel of each visible named peak as an unconfirmed
+      anchor in the case. --debug draws numbered crosshairs with close-ups to check them
+      by; --confirm marks the numbered anchors as checked, --drop removes them.
 
   peakbench detect IMAGE [--width W] [--debug FILE]
       Run only the skyline detector and draw what it found.
@@ -73,6 +95,8 @@ struct PhotoCase: Codable {
     /// DEM directory, relative to this file.
     var dem: String?
     var note: String?
+    /// What the app saved with a frame of its own (absent for photos).
+    var app: AppFrameInfo? = nil
 }
 
 struct Arguments {
@@ -237,26 +261,17 @@ func writeCase(_ photo: PhotoCase, to path: String) throws {
 
 func alignCommand(_ args: Arguments) throws {
     guard let casePath = args.positional.first else { throw HarnessError("which case file?") }
-    let caseURL = URL(fileURLWithPath: casePath)
-    var photo = try JSONDecoder().decode(PhotoCase.self, from: Data(contentsOf: caseURL))
-    let base = caseURL.deletingLastPathComponent()
-    let demPath = args.string("dem") ?? photo.dem.map { base.appendingPathComponent($0).path }
-    let terrain = try loadTerrain(demPath)
-    let renderer = HorizonRenderer(terrain: terrain)
-    let observer = photo.altitude.map { GeoPoint(latitude: photo.latitude, longitude: photo.longitude, height: $0) }
-        ?? renderer.observer(latitude: photo.latitude, longitude: photo.longitude)
-    let image = try loadImage(base.appendingPathComponent(photo.image).path)
-    let intrinsics = CameraIntrinsics(width: image.width, height: image.height, horizontalFOV: photo.horizontalFOV)
-    let horizon = timed("Horizon") { renderer.render(from: observer) }
+    let c = try LoadedCase(URL(fileURLWithPath: casePath), demOverride: args.string("dem")) { path, _, _ in try loadTerrain(path) }
+    var photo = c.photo
+    let image = c.image, intrinsics = c.intrinsics, horizon = c.horizon
 
-    if photo.truth == nil, let anchors = photo.anchors, !anchors.isEmpty {
-        let initial = Attitude(heading: photo.heading, pitch: photo.pitch ?? 0, roll: photo.roll ?? 0)
-        if let solved = AnchorSolver.attitude(anchors: anchors, observer: observer, intrinsics: intrinsics, initial: initial) {
-            photo.truth = solved.attitude
-            print("Truth from \(anchors.count) marked summit(s): heading \(f(solved.attitude.heading))°, " +
-                  "pitch \(f(solved.attitude.pitch))°, roll \(f(solved.attitude.roll))° (fit \(f(solved.rmsPixels, 1)) px)")
-        }
+    if photo.truth == nil, let t = c.truth() {
+        photo.truth = t.attitude
+        print("Truth from \(t.source): heading \(f(t.attitude.heading))°, pitch \(f(t.attitude.pitch))°, " +
+              "roll \(f(t.attitude.roll))° (fit \(f(t.fit ?? 0, 3))° RMS)")
     }
+    let unconfirmed = (photo.anchors ?? []).filter { !$0.isChecked }.count
+    if unconfirmed > 0 { print("\(unconfirmed) proposed anchor(s) not yet confirmed; left out of the truth") }
 
     var matcher = SkylineMatcher()
     if photo.pitch == nil || photo.roll == nil { matcher.settings = .photo }
@@ -546,12 +561,105 @@ struct BenchRun {
     /// Pitch and roll errors before (the sensors) and after matching, degrees.
     var pitch: (before: Double, after: Double) = (0, 0)
     var roll: (before: Double, after: Double) = (0, 0)
+    var rejection: String?
+}
+
+/// What makes a bench harder than the default: the photo's world differs from the terrain
+/// matched against, the camera isn't a perfect pinhole, the scenery is another kind.
+struct BenchConditions {
+    /// Render the photo from perturbed tiles rather than those matched against.
+    var perturbation: DEMPerturbation?
+    /// Match against the app's mixed 30/60/120 m terrain (summits raised if peaks are given).
+    var appTerrain = false
+    var peaks: [Peak]?
+    /// Largest |k1| and |rolling shutter| (degrees); each run draws its own within them.
+    var maxK1 = 0.0
+    var maxRollingShutter = 0.0
+    var scene = "alps"
+
+    var isDefault: Bool { perturbation == nil && !appTerrain && maxK1 == 0 && maxRollingShutter == 0 && scene == "alps" }
+
+    init(_ args: Arguments) throws {
+        let harder = args.options["harder"] != nil
+        if harder || args.string("world") == "perturbed" {
+            var p = DEMPerturbation()
+            if let v = args.double("dem-smooth") { p.smoothing = v }
+            if let v = args.double("dem-noise") { p.noise = v }
+            if let v = args.double("dem-shift") { p.shiftEast = v * 0.8; p.shiftNorth = -v * 0.6 }
+            p.seed = UInt64(args.int("seed") ?? 1) &+ 77
+            perturbation = p
+        }
+        appTerrain = harder || args.string("match") == "app"
+        if harder || args.string("camera") == "real" {
+            maxK1 = 0.005
+            maxRollingShutter = 0.3
+        }
+        if let v = args.double("lens-k1") { maxK1 = v }
+        if let v = args.double("rolling-shutter") { maxRollingShutter = v }
+        scene = args.string("scene") ?? "alps"
+        guard ["alps", "smokies"].contains(scene) else { throw HarnessError("--scene is alps or smokies") }
+        if let path = args.string("peaks") { peaks = try Overpass.peaks(fromJSON: Data(contentsOf: URL(fileURLWithPath: path))) }
+    }
+
+    /// Short, for the table's header.
+    var label: String {
+        var parts: [String] = []
+        if scene != "alps" { parts.append(scene) }
+        if perturbation != nil { parts.append("different DEM") }
+        if appTerrain { parts.append(peaks == nil ? "app terrain" : "app terrain + summit cones") }
+        if maxK1 > 0 || maxRollingShutter > 0 { parts.append("lens + rolling shutter") }
+        return parts.joined(separator: ", ")
+    }
+
+    /// One line on each condition, for under the table.
+    var details: String {
+        var lines: [String] = []
+        if let p = perturbation {
+            lines.append("Photo rendered from perturbed tiles: blurred (σ \(f(p.smoothing, 1)) px), height noise within ±\(f(p.noise, 0)) m " +
+                         "over ~\(f(p.noiseScale, 0)) m, shifted \(f((p.shiftEast * p.shiftEast + p.shiftNorth * p.shiftNorth).squareRoot(), 0)) m.")
+        }
+        if appTerrain {
+            lines.append("Matched against the app's terrain: 30 m within 10 km, 60 m within 35 km, 120 m beyond" +
+                         (peaks.map { ", summits raised to \($0.count) OpenStreetMap peaks (matching side only)." }
+                          ?? "; summits not raised (no --peaks file)."))
+        }
+        if maxK1 > 0 || maxRollingShutter > 0 {
+            lines.append("Camera: radial distortion k1 within ±\(f(maxK1, 4)), rolling shutter within ±\(f(maxRollingShutter, 2))° across the frame.")
+        }
+        if scene == "smokies" { lines.append("Scene: forested to the top, thick haze, no snow.") }
+        return lines.joined(separator: " ")
+    }
+
+    func syntheticScene() -> SyntheticScene {
+        var s = SyntheticScene()
+        if scene == "smokies" {
+            s.snowLine = nil
+            s.treeLine = 10_000
+            s.hazeDistance = 18_000
+        }
+        return s
+    }
 }
 
 func benchCommand(_ args: Arguments) throws {
     let terrain = try loadTerrain(args.string("dem"))
-    let renderer = HorizonRenderer(terrain: terrain)
     let lat = try args.required("lat"), lon = try args.required("lon")
+    let conditions = try BenchConditions(args)
+    // The photo is rendered from `world`, and matched against `renderer`'s terrain.
+    var worldTerrain = terrain, matchTerrain = terrain
+    if let p = conditions.perturbation {
+        worldTerrain = timed("Perturbed world") { Terrain(tiles: terrain.tiles.map { $0.perturbed(p) }) }
+    }
+    if conditions.appTerrain {
+        matchTerrain = timed("App terrain") { Terrain.appDetail(from: terrain.tiles, latitude: lat, longitude: lon) }
+        if let peaks = conditions.peaks {
+            // As the app does: fill in missing elevations, then raise blunted summits.
+            let raised = matchTerrain.raiseSummits(matchTerrain.fillElevations(peaks))
+            log("Raised \(raised) of \(peaks.count) summits")
+        }
+    }
+    let renderer = HorizonRenderer(terrain: matchTerrain)
+    let worldRenderer = HorizonRenderer(terrain: worldTerrain)
     let runs = args.int("runs") ?? 30
     let spread = (args.double("spread-km") ?? 3) * 1000
     let gpsError = args.double("gps-error") ?? 15
@@ -559,16 +667,20 @@ func benchCommand(_ args: Arguments) throws {
     let aim = args.string("aim") ?? "far"
     let compassSigma = args.double("compass-sigma") ?? 8, compassMax = args.double("compass-max") ?? 18
     var rng = SplitMix64(seed: UInt64(args.int("seed") ?? 1))
+    // Draws for the harder conditions come from their own generator, so the runs (where,
+    // which way, the compass error) are the same as without them.
+    var extra = SplitMix64(seed: UInt64(args.int("seed") ?? 1) &+ 0x5EED)
     var results: [BenchRun] = []
 
     print("Mode: \(mode), aim: \(aim), \(runs) runs within \(f(spread / 1000, 1)) km of \(f(lat, 4)), \(f(lon, 4)); " +
           "GPS error up to \(f(gpsError, 0)) m")
+    if !conditions.isDefault { print(conditions.details) }
     print(" run  heading   fov clouds trees  skyline   before     after  ok    time")
     for run in 0..<runs {
         // The real spot, and where the GPS thinks it is.
         let spot = destination(from: GeoPoint(latitude: lat, longitude: lon), azimuth: 360 * rng.uniform(),
                                distance: spread * rng.uniform().squareRoot())
-        let truePosition = renderer.observer(latitude: spot.latitude, longitude: spot.longitude)
+        let truePosition = worldRenderer.observer(latitude: spot.latitude, longitude: spot.longitude)
         let gps = destination(from: truePosition, azimuth: 360 * rng.uniform(), distance: gpsError * rng.uniform())
         let believed = renderer.observer(latitude: gps.latitude, longitude: gps.longitude)
 
@@ -576,7 +688,7 @@ func benchCommand(_ args: Arguments) throws {
         // The photo comes from a finer render at the true spot than the one we match against.
         var fine = HorizonSettings()
         fine.azimuthStep = 0.05
-        let world = renderer.render(from: truePosition, settings: fine)
+        let world = worldRenderer.render(from: truePosition, settings: fine)
         if aim == "far" {
             let far = world.distances.indices.filter { world.distances[$0] >= 5_000 }
             if !far.isEmpty { heading = world.azimuth(ofRay: far[Int(rng.next() % UInt64(far.count))]) }
@@ -584,12 +696,15 @@ func benchCommand(_ args: Arguments) throws {
         let truth = Attitude(heading: heading, pitch: -2 + 8 * rng.uniform(), roll: -4 + 8 * rng.uniform())
         let fov = 55 + 20 * rng.uniform()
         let k = CameraIntrinsics(width: 1280, height: 960, horizontalFOV: fov)
-        var scene = SyntheticScene()
+        var scene = conditions.syntheticScene()
         scene.seed = rng.next()
         scene.clouds = rng.uniform() < 0.5 ? 0.5 * rng.uniform() : 0
         scene.trees = rng.uniform() < 0.4 ? 0.3 * rng.uniform() : 0
+        var realism = CameraRealism()
+        if conditions.maxK1 > 0 { realism.k1 = conditions.maxK1 * (2 * extra.uniform() - 1) }
+        if conditions.maxRollingShutter > 0 { realism.rollingShutter = conditions.maxRollingShutter * (2 * extra.uniform() - 1) }
 
-        let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth), scene: scene)
+        let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth), scene: scene, realism: realism)
         let horizon = renderer.render(from: believed)
 
         let compassError = max(-compassMax, min(compassMax, compassSigma * rng.gaussian()))
@@ -616,35 +731,57 @@ func benchCommand(_ args: Arguments) throws {
         var r = BenchRun(before: compassError, after: after, accepted: m.alignment.accepted, seconds: m.seconds)
         r.pitch = (prior.pitch - truth.pitch, m.alignment.attitude.pitch - truth.pitch)
         r.roll = (prior.roll - truth.roll, m.alignment.attitude.roll - truth.roll)
+        r.rejection = m.alignment.rejectionReason
         results.append(r)
         print(String(format: "%4d  %6.1f°  %3.0f°  %4.2f  %4.2f  %5.1f km  %+6.2f°  %+7.3f°  %@  %4.0f ms",
                      run + 1, truth.heading, fov, scene.clouds, scene.trees, skylineKm, r.before, r.after,
                      r.accepted ? "yes" : " no", r.seconds * 1000)
               + String(format: "  near %.2f", m.alignment.nearAmbiguity)
+              + (realism.isPinhole ? "" : String(format: "  k1 %+.4f rs %+.2f°", realism.k1, realism.rollingShutter))
               + (m.alignment.rejectionReason.map { "  (\($0))" } ?? ""))
         if let dir = args.string("save") {
             try saveImage(debugOverlay(m, horizon: horizon), to: "\(dir)/run\(run + 1).\(defaultImageExtension)")
         }
     }
 
-    let summary = benchSummary(results, mode: mode, aim: aim)
+    var summary = benchSummary(results, mode: mode, aim: aim, label: conditions.isDefault ? nil : conditions.label)
+    if !conditions.isDefault {
+        summary += rejectionSummary(results.compactMap(\.rejection))
+        summary += conditions.details + "\n"
+    }
     print("\n" + summary)
     if let path = args.string("markdown") {
         try summary.write(toFile: path, atomically: true, encoding: .utf8)
     }
 }
 
-func benchSummary(_ results: [BenchRun], mode: String, aim: String) -> String {
-    func stats(_ v: [Double]) -> (median: Double, p90: Double, max: Double) {
-        let s = v.map(abs).sorted()
-        guard !s.isEmpty else { return (.nan, .nan, .nan) }
-        return (s[s.count / 2], s[min(s.count - 1, Int(Double(s.count) * 0.9))], s.last!)
+/// "Rejected: 2 not enough distant skyline, 1 ambiguous: …" or nothing. Reasons count
+/// together without the numbers in their closing parentheses.
+func rejectionSummary(_ reasons: [String]) -> String {
+    guard !reasons.isEmpty else { return "" }
+    var counts: [String: Int] = [:]
+    for r in reasons {
+        var kind = r
+        if kind.hasSuffix(")"), let open = kind.range(of: " (", options: .backwards) { kind = String(kind[..<open.lowerBound]) }
+        counts[kind, default: 0] += 1
     }
+    let list = counts.sorted { ($1.value, $0.key) < ($0.value, $1.key) }.map { "\($0.value) \($0.key)" }
+    return "Rejected: " + list.joined(separator: ", ") + ".\n"
+}
+
+func errorStats(_ v: [Double]) -> (median: Double, p90: Double, max: Double) {
+    let s = v.map(abs).sorted()
+    guard !s.isEmpty else { return (.nan, .nan, .nan) }
+    return (s[s.count / 2], s[min(s.count - 1, Int(Double(s.count) * 0.9))], s.last!)
+}
+
+func benchSummary(_ results: [BenchRun], mode: String, aim: String, label: String? = nil) -> String {
+    let stats = errorStats
     let accepted = results.filter(\.accepted)
     let before = stats(results.map(\.before))
     let after = stats(accepted.map(\.after))
     let bad = accepted.filter { abs($0.after) > 0.5 }.count
-    var md = "| Error (\(mode) mode, aim \(aim)) | median | 90th percentile | worst |\n|---|---|---|---|\n"
+    var md = "| Error (\(mode) mode, aim \(aim)\(label.map { "; " + $0 } ?? "")) | median | 90th percentile | worst |\n|---|---|---|---|\n"
     md += "| Compass (before) | \(f(before.median))° | \(f(before.p90))° | \(f(before.max))° |\n"
     md += "| Skyline matched (after) | \(f(after.median, 3))° | \(f(after.p90, 3))° | \(f(after.max, 3))° |\n"
     // The level as the motion sensors give it, and after matching (accepted frames).
@@ -713,6 +850,8 @@ do {
     case "synth": try synthCommand(args)
     case "align": try alignCommand(args)
     case "bench": try benchCommand(args)
+    case "realbench": try realbenchCommand(args)
+    case "suggest-anchors": try suggestAnchorsCommand(args)
     case "detect": try detectCommand(args)
     case "geotiff": try geotiffCommand(args)
     case "scene": try sceneCommand(args)
