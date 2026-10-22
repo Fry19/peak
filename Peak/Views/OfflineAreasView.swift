@@ -32,6 +32,7 @@ struct OfflineAreasView: View {
             }
         }
         .scrollContentBackground(.hidden)
+        .background(.sheetBackground)
         .navigationTitle("Offline areas")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog(confirmDelete.map { "Delete \($0.name)?" } ?? "",

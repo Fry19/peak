@@ -65,7 +65,7 @@ struct PeakDetailView: View {
                         case .failure:
                             EmptyView()
                         default:
-                            RoundedRectangle(cornerRadius: 14).fill(.white.opacity(0.06))
+                            RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground))
                                 .frame(height: 180)
                         }
                     }
@@ -124,6 +124,7 @@ struct PeakDetailView: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
+        .background(.sheetBackground)
     }
 
     private func subtitle(_ view: TerrainScene.PeakView?) -> String {
@@ -282,7 +283,7 @@ struct StatGrid: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(10)
-                .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
             }
         }
     }

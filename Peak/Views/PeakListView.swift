@@ -37,6 +37,7 @@ struct PeakListView: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
+        .background(.sheetBackground)
         .overlay {
             if model.scene != nil, !query.isEmpty, matching.isEmpty {
                 ContentUnavailableView.search(text: query)
