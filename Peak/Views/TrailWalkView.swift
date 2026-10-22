@@ -3,6 +3,37 @@ import SceneKit
 import SwiftUI
 import UIKit
 
+/// The map and walking tour share elevation, slope, land-cover and local-relief colors.
+/// Values are linear RGB, as used by SceneKit's lighting.
+enum TrailTerrainStyle {
+    static func shade(height: Float, normalUp: Float, fine: Float, broad: Float,
+                      range: ClosedRange<Float>) -> (light: Float, form: Float) {
+        let t = pow(min(1, max(0, (height - range.lowerBound) / max(1, range.upperBound - range.lowerBound))), 1.3)
+        var light = 0.016 + 0.10 * t
+        let steep = min(1, max(0, (0.82 - normalUp) / 0.22))
+        light *= 1 + 0.7 * steep
+        let f = fine.isFinite ? fine : 0, b = broad.isFinite ? broad : 0
+        let form = max(0.3, 1 + 0.4 * min(1, max(-1, f / 25)) + 0.3 * min(1, max(-1, b / 120)))
+        return (light * form, form)
+    }
+
+    static func color(light: Float, form: Float, rock: Float = 0, ice: Float = 0, water: Float = 0) -> SIMD3<Float> {
+        var color = SIMD3(light, light * 1.12, light * 1.45)
+        if rock > 0 { color += (light * SIMD3(1.1, 1.35, 1.9) - color) * rock }
+        if ice > 0 { color += ((0.13 * form + 1.3 * light) * SIMD3(0.5, 0.7, 1.12) - color) * ice }
+        if water > 0 { color += (SIMD3(0.004, 0.011, 0.03) - color) * water }
+        return color
+    }
+
+    static func extent(trail: Trail, peak: Peak?) -> MapExtent? {
+        guard let frame = OverheadMap.frame(trail: trail, around: peak.map { [$0.position] } ?? [], aspect: 0.46) else { return nil }
+        let side = min(26_000, max(10_000, max(frame.width, frame.height) + 6_000))
+        return MapExtent(center: frame.center, width: side, height: side)
+    }
+
+    static func cellSize(for extent: MapExtent) -> Double { max(15, extent.width / 1_024) }
+}
+
 /// The trail in 3D: the terrain around it lit from the north-west, far ridges fading into
 /// haze, glaciers, water and bare rock tinted where OpenStreetMap has them, and the trail in
 /// orange. It opens looking straight down, as the map does, with the
@@ -47,7 +78,9 @@ struct TrailWalkView: View {
                 }
             }
         }
-        .task(id: trail.trail.id) { await build() }
+        .task(id: BuildKey(trail: trail.trail.id, terrain: model.scene.map { ObjectIdentifier($0.terrain) })) {
+            await build()
+        }
         .task(id: CoverKey(trail: trail.trail.id, online: model.online)) {
             await model.fetchCover(trail.trail, peak: model.peak(trail.peakID))
         }
@@ -56,6 +89,11 @@ struct TrailWalkView: View {
             if let world, let cover = model.covers[trail.trail.id] { await world.tint(with: cover) }
         }
         .onDisappear { player.stop() }
+    }
+
+    private struct BuildKey: Equatable {
+        var trail: String
+        var terrain: ObjectIdentifier?
     }
 
     private func build() async {
@@ -161,12 +199,12 @@ final class WalkWorld: @unchecked Sendable {
     static func build(trail: Trail, peak: Peak?, terrain: Terrain, cover: AppModel.TrailCover?,
                       units: AppSettings.Units) -> WalkWorld? {
         guard let frame = OverheadMap.frame(trail: trail, around: peak.map { [$0.position] } ?? [], aspect: 0.46) else { return nil }
-        // The trail with a few kilometers around it at the terrain's own 30 m where it can,
-        // and around that a wide, coarser ring out to where the haze swallows it, so a view
-        // toward the horizon shows the ranges beyond instead of the terrain's edge.
-        let side = min(26_000, max(10_000, max(frame.width, frame.height) + 6_000))
-        let relief = ReliefMap(terrain: terrain, extent: MapExtent(center: frame.center, width: side, height: side),
-                               cellSize: max(30, side / 640))
+        // Sample the interpolated DEM at 15–25 m so projecting its geographic grid onto
+        // the mesh preserves the source's narrow ridges and gullies. Bound the mesh to
+        // about a million vertices; the horizon uses a separate, coarser ring.
+        guard let extent = TrailTerrainStyle.extent(trail: trail, peak: peak) else { return nil }
+        let side = extent.width
+        let relief = ReliefMap(terrain: terrain, extent: extent, cellSize: TrailTerrainStyle.cellSize(for: extent))
         let wide = ReliefMap(terrain: terrain, extent: MapExtent(center: frame.center, width: 70_000, height: 70_000),
                              cellSize: 150)
         let projection = relief.projection
@@ -352,21 +390,14 @@ final class WalkWorld: @unchecked Sendable {
         normals.reserveCapacity(mesh.positions.count * 3)
         shades.light.reserveCapacity(mesh.positions.count)
         shades.form.reserveCapacity(mesh.positions.count)
-        let range = max(1, high - low)
         for i in mesh.positions.indices {
             let p = mesh.positions[i], n = mesh.normals[i]
             positions.append(p.x); positions.append(p.z - sink); positions.append(-p.y)
             normals.append(n.x); normals.append(n.z); normals.append(-n.y)
-            // Linear values (SceneKit lights in linear color): dark slate low down.
-            let t = pow(min(1, max(0, (mesh.heights[i] - low) / range)), 1.3)
-            var v = 0.016 + 0.10 * t
-            // Steeper than about 35°: bare rock, which catches more light.
-            let steep = min(1, max(0, (0.82 - n.z) / 0.22))
-            v *= 1 + 0.7 * steep
-            let f = fine[i].isFinite ? fine[i] : 0, b = broad[i].isFinite ? broad[i] : 0
-            let form = max(0.3, 1 + 0.4 * min(1, max(-1, f / 25)) + 0.3 * min(1, max(-1, b / 120)))
-            shades.light.append(v * form)
-            shades.form.append(form)
+            let shade = TrailTerrainStyle.shade(height: mesh.heights[i], normalUp: n.z,
+                                                 fine: fine[i], broad: broad[i], range: low...high)
+            shades.light.append(shade.light)
+            shades.form.append(shade.form)
         }
         let count = mesh.positions.count
         func source(_ values: [Float], _ semantic: SCNGeometrySource.Semantic) -> SCNGeometrySource {
@@ -393,16 +424,8 @@ final class WalkWorld: @unchecked Sendable {
         var colors = [Float]()
         colors.reserveCapacity(shades.light.count * 3)
         for i in shades.light.indices {
-            let v = shades.light[i]
-            var c = SIMD3<Float>(v, v * 1.12, v * 1.45)
-            if let cover {
-                let rock = cover.rock[i], ice = cover.glacier[i], water = cover.water[i]
-                if rock > 0 { c += (v * SIMD3(1.1, 1.35, 1.9) - c) * rock }
-                // Lighter than the ground around it, high up as low down; bluer than looks
-                // right on its own, since the sun is warm.
-                if ice > 0 { c += ((0.13 * shades.form[i] + 1.3 * v) * SIMD3(0.5, 0.7, 1.12) - c) * ice }
-                if water > 0 { c += (SIMD3(0.004, 0.011, 0.03) - c) * water }
-            }
+            let c = TrailTerrainStyle.color(light: shades.light[i], form: shades.form[i],
+                                             rock: cover?.rock[i] ?? 0, ice: cover?.glacier[i] ?? 0, water: cover?.water[i] ?? 0)
             colors.append(c.x); colors.append(c.y); colors.append(c.z)
         }
         return colors
@@ -596,6 +619,21 @@ final class WalkPlayer {
         link = nil
     }
 
+    /// Sharper downloads replace the ground without restarting the walk or an orbit.
+    func replaceWorld(_ world: WalkWorld, in view: SCNView) {
+        guard let previous = self.world, previous !== world else { return }
+        let fraction = distance / max(1, previous.walk.length)
+        let pose = view.pointOfView?.presentation.simdWorldTransform
+        self.world = world
+        distance = min(world.walk.length, fraction * world.walk.length)
+        shownDistance = distance
+        view.scene = world.scene
+        view.pointOfView = world.camera
+        if let pose { world.camera.simdWorldTransform = pose }
+        if case .free = mode { pointOrbit() }
+        moveWalker()
+    }
+
     func togglePlay() {
         guard let world else { return }
         if playing {
@@ -775,6 +813,7 @@ private struct WalkSceneView: UIViewRepresentable {
     }
 
     func updateUIView(_ view: SCNView, context: Context) {
+        player.replaceWorld(world, in: view)
         world.place(you: you)
     }
 
