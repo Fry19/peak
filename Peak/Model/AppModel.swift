@@ -153,29 +153,49 @@ final class AppModel {
                           coarseTerrain: scene?.isCoarse ?? false)
     }
     private(set) var peaksState: PeaksState = .loading
-    var scene: TerrainScene?
+    var scene: TerrainScene? {
+        didSet { riseSceneChanged() }
+    }
+    /// Counts up as `scene` changes, for its views from above.
+    @ObservationIgnored var sceneGeneration = 0
     var correction = Correction()
     var frozen: Frozen? {
         // A frozen view throws matches away, so don't make them.
-        didSet { corrector.paused = frozen != nil || showsFromAbove }
+        didSet {
+            corrector.paused = frozen != nil || showsFromAbove
+            if frozen != nil { land() }
+        }
     }
     var settings = AppSettings.load()
-    var sheet: Sheet?
+    var sheet: Sheet? {
+        didSet { if sheet != nil { land() } }
+    }
     /// The peak highlighted in the view (tapped, or picked from the list).
     var selectedPeakID: Int64?
     var arTrail: ARTrail?
     /// A still picture being labeled: the paused view, or a photo from the library. It
     /// covers the camera, which rests meanwhile.
     var photo: LabeledPhoto? {
-        didSet { if (photo == nil) != (oldValue == nil) { cameraCovered(photo != nil || showsFromAbove) } }
+        didSet {
+            if photo != nil { land() }
+            if (photo == nil) != (oldValue == nil) { cameraCovered(photo != nil || showsFromAbove) }
+        }
     }
     /// That trail seen from straight above, over the ridgelines, instead of the camera (or
     /// walked in 3D from there). It covers the camera, which rests meanwhile.
     var showsFromAbove = false {
-        didSet { if showsFromAbove != oldValue { cameraCovered(showsFromAbove || photo != nil) } }
+        didSet {
+            if showsFromAbove { land() }
+            if showsFromAbove != oldValue { cameraCovered(showsFromAbove || photo != nil) }
+        }
     }
     /// Lining the view up by hand: the picture is paused and dragging moves the lines.
-    var aligning = false
+    var aligning = false {
+        didSet { if aligning { land() } }
+    }
+    /// Seeing over the ridges while the rise button is held (`AppModel+Rise`).
+    var rise = Rise()
+    @ObservationIgnored var riseWork = RiseWork()
     /// How far the picture and the lines are zoomed in, 1 to `maxZoom`.
     var zoom: Double = 1
     /// The back lenses: with a telephoto, zooming in moves to it (see AppModel+Lenses).
@@ -377,6 +397,8 @@ final class AppModel {
             resumeAreas()
         } else {
             askedForPrecision = false
+            land()
+            dropRisenViews()
             saveCalibration()
             camera.stop()
             motion.stop()
@@ -1517,6 +1539,7 @@ final class AppModel {
             lines.append(String(format: "view: built in %.2f s, %ld peaks, %ld visible, eye at %.0f m", lastBuildSeconds,
                                 peaks.count, scene.peaks.count, scene.observer.height))
         }
+        if let rise = riseDiagnostics { lines.append(rise) }
         switch peaksState {
         case .loading:
             lines.append("peaks: downloading…")

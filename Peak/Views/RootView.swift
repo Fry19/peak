@@ -7,9 +7,12 @@ import SwiftUI
 struct RootView: View {
     @Bindable var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Where the chips at the top and the controls at the bottom are, for labels to keep clear of.
     @State private var topControls = CGRect.zero
     @State private var bottomControls = CGRect.zero
+    /// A tap on the rise button: say to hold it.
+    @State private var riseHint = false
 
     /// The telephoto behind the picture, by its own zoom ("5×"), or nil on the wide lens.
     private var lensZoom: Double? {
@@ -30,6 +33,10 @@ struct RootView: View {
                 .ignoresSafeArea()
             VStack(spacing: 10) {
                 VStack(spacing: 10) {
+                    if RiseChip.isShown(model, hint: riseHint) {
+                        RiseChip(model: model, hint: riseHint)
+                            .transition(.opacity)
+                    }
                     if model.aligning {
                         AlignBanner(model: model)
                     } else if let trail = model.arTrail {
@@ -57,25 +64,33 @@ struct RootView: View {
                             .padding(.horizontal, 10)
                     }
                 }
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: RiseChip.isShown(model, hint: riseHint))
                 .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { topControls = $0 }
                 Spacer()
                 VStack(spacing: 10) {
-                    HStack(alignment: .center, spacing: 10) {
-                        if showsBarButtons {
-                            RoundButton(systemImage: "list.bullet", label: "Peaks") { model.sheet = .list }
+                    // Hold to see over the ridges: above the end of the bar, under the thumb, so
+                    // the pill keeps its room.
+                    VStack(alignment: .trailing, spacing: 10) {
+                        if showsBarButtons, model.frozen == nil, model.offersRise {
+                            RiseButton(model: model, hint: $riseHint)
                         }
-                        StatusPill(model: model)
-                        if model.frozen?.pixels != nil, !model.aligning {
-                            // Paused: save or share the view, labeled.
-                            RoundButton(systemImage: "square.and.arrow.up", label: "Save or share this view") {
-                                model.capturePausedView()
+                        HStack(alignment: .center, spacing: 10) {
+                            if showsBarButtons {
+                                RoundButton(systemImage: "list.bullet", label: "Peaks") { model.sheet = .list }
                             }
-                            RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
-                        } else if showsBarButtons {
-                            RoundButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right", label: "Line up by hand") {
-                                model.startAligning()
+                            StatusPill(model: model)
+                            if model.frozen?.pixels != nil, !model.aligning {
+                                // Paused: save or share the view, labeled.
+                                RoundButton(systemImage: "square.and.arrow.up", label: "Save or share this view") {
+                                    model.capturePausedView()
+                                }
+                                RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
+                            } else if showsBarButtons {
+                                RoundButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right", label: "Line up by hand") {
+                                    model.startAligning()
+                                }
+                                RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
                             }
-                            RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
                         }
                     }
                     Text("Terrain © Copernicus DEM (DLR, Airbus), NOAA ETOPO · Map data © OpenStreetMap contributors")

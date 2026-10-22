@@ -44,7 +44,10 @@ struct TerrainScene: @unchecked Sendable {
         // Peaks OpenStreetMap has no elevation for take the terrain's. Then give blunted
         // summits their real tips before drawing skylines from them.
         let peaks = terrain.fillElevations(peaks)
+        // Tiles are shared between scenes: no view from above may read them meanwhile.
+        terrainWrites.lock()
         terrain.raiseSummits(peaks)
+        terrainWrites.unlock()
         let renderer = HorizonRenderer(terrain: terrain)
         var observer = renderer.observer(latitude: latitude, longitude: longitude, accuracy: accuracy)
         let isCoarse = terrain.isCoarse(latitude: latitude, longitude: longitude)
@@ -52,6 +55,31 @@ struct TerrainScene: @unchecked Sendable {
         var settings = isCoarse ? HorizonSettings.coarse : HorizonSettings()
         settings.maxDistance = radius
         if isCoarse, let altitude { observer.height = altitude }
+        return view(from: observer, terrain: terrain, peaks: peaks, settings: settings, isCoarse: isCoarse)
+    }
+
+    /// The view from `lift` meters above this one's eye, for seeing over the ridges in front
+    /// (`AppModel+Rise`): the same terrain, peaks and horizon settings. It is only drawn, so
+    /// its horizon keeps no depth map, and nothing is matched or draped against it.
+    func risen(by lift: Double) -> TerrainScene {
+        var eye = observer
+        eye.height += lift
+        Self.terrainWrites.lock()
+        defer { Self.terrainWrites.unlock() }
+        let view = Self.view(from: eye, terrain: terrain, peaks: allPeaks.values.map(\.peak), settings: horizon.settings,
+                             isCoarse: isCoarse)
+        return TerrainScene(observer: eye, terrain: terrain, horizon: view.horizon.withoutDepth(), segments: view.segments,
+                            peaks: view.peaks, scores: view.scores, allPeaks: view.allPeaks, uncertain: view.uncertain,
+                            isCoarse: isCoarse)
+    }
+
+    /// Held while summits are raised in the shared tiles (`build`) and while a view from above
+    /// reads them (`risen`): the live view's rebuild may raise new ones as tiles arrive.
+    private static let terrainWrites = NSLock()
+
+    private static func view(from observer: GeoPoint, terrain: Terrain, peaks: [Peak], settings: HorizonSettings,
+                             isCoarse: Bool) -> TerrainScene {
+        let renderer = HorizonRenderer(terrain: terrain)
         let horizon = renderer.render(from: observer, settings: settings)
         var buckets = [[RidgeSegment]](repeating: [], count: 360)
         for s in horizon.ridgeSegments() {
@@ -62,7 +90,7 @@ struct TerrainScene: @unchecked Sendable {
         var found: [VisiblePeak] = []
         var uncertain = Set<Int64>()
         if terrain.hasCoarse {
-            let here = LatLon(latitude, longitude)
+            let here = LatLon(observer.latitude, observer.longitude)
             for (p, v) in renderer.sightlines(peaks, from: observer, maxDistance: radius, settings: settings) {
                 let unsure = terrain.isCoarse(between: here, and: p.position) &&
                     CoarseSight.isUncertain(distance: v.distance, clearance: v.clearance)

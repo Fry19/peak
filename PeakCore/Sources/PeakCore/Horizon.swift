@@ -85,6 +85,18 @@ public struct HorizonProfile: Sendable {
         return Double(points[lo].distance)
     }
 
+    /// The skyline alone, without the depth map below it: for a view that is only drawn,
+    /// once its ridges are taken (`ridgeSegments`), never matched or draped against. Seen
+    /// from high above, nearly every sample is in sight and the depth map grows to tens of
+    /// megabytes; this keeps a few. Depth lookups on it find nothing (`distance` is nil,
+    /// `ridges` has no crests).
+    public func withoutDepth() -> HorizonProfile {
+        var profile = HorizonProfile(observer: observer, settings: settings, elevations: elevations, distances: distances,
+                                     envelopeStart: [Int](repeating: 0, count: count + 1), envelope: [])
+        profile.coarseRays = coarseRays
+        return profile
+    }
+
     /// Ridge crests along ray i: points with farther terrain showing above them, plus the
     /// skyline itself. `minDepthRatio` is how much farther the terrain behind must be
     /// (0.15 means at least 15% farther) for a crest to count.

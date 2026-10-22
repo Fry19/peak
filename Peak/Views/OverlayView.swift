@@ -78,6 +78,33 @@ final class OverlayCanvas: UIView {
         l.strokeColor = nil
         return l
     }()
+    /// Risen above the ridges (`AppModel+Rise`), the camera picture can't come too: a plain
+    /// night sky covers it, with the land below the skyline darker.
+    private let backdrop: CALayer = {
+        let l = CALayer()
+        l.backgroundColor = OverlayCanvas.sky.cgColor
+        l.opacity = 0
+        return l
+    }()
+    private let landLayer: CAShapeLayer = {
+        let l = CAShapeLayer()
+        l.fillColor = OverlayCanvas.land.cgColor
+        l.strokeColor = nil
+        return l
+    }()
+    private var backdropShown = false
+    /// The backdrop is still fading out until then, so the land is still drawn.
+    private var backdropFading = Date.distantPast
+    private static let sky = UIColor(red: 0.075, green: 0.09, blue: 0.12, alpha: 1)
+    private static let land = UIColor(red: 0.02, green: 0.025, blue: 0.035, alpha: 1)
+    /// Peaks in sight only from above, without Metal: open rings.
+    private let revealedDotLayer: CAShapeLayer = {
+        let l = CAShapeLayer()
+        l.fillColor = nil
+        l.strokeColor = UIColor.white.withAlphaComponent(0.55).cgColor
+        l.lineWidth = 1
+        return l
+    }()
     /// Draws the lines on the GPU; nil if Metal isn't available, and the shape layers do.
     private let renderer = LineRenderer()
     /// Ridgelines (and the trail's glow), drawn brightest-of, and the trail and dots laid
@@ -140,6 +167,8 @@ final class OverlayCanvas: UIView {
         var selected: Bool
         var hidden: Bool
         var below: Bool
+        /// In sight only from above: its leader is dashed, as a hidden peak's.
+        var revealed = false
     }
     private var images: [LabelKey: (image: LabelImage, used: Int)] = [:]
     private var imageClock = 0
@@ -161,11 +190,14 @@ final class OverlayCanvas: UIView {
         isOpaque = false
         backgroundColor = .clear
         isUserInteractionEnabled = false
-        // Ridges first, the skyline over them, then the trail, dots and labels on top.
+        // The backdrop when risen, ridges, the skyline over them, then the trail, dots and
+        // labels on top.
+        backdrop.addSublayer(landLayer)
+        layer.addSublayer(backdrop)
         if let renderer {
             layer.addSublayer(renderer.layer)
         } else {
-            for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, walkedTrailLine, trailGlow, trailLine, youLayer, sunLayer, dotLayer] { layer.addSublayer(l) }
+            for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, walkedTrailLine, trailGlow, trailLine, youLayer, sunLayer, dotLayer, revealedDotLayer] { layer.addSublayer(l) }
         }
         layer.addSublayer(hourContainer)
         layer.addSublayer(labelContainer)
@@ -183,6 +215,7 @@ final class OverlayCanvas: UIView {
         // The edge arrow is sized and placed by `update`; giving it the view's frame would
         // stretch its picture across the whole screen.
         for l in layer.sublayers ?? [] where l !== arrowLayer && l !== arrowHead { l.frame = bounds }
+        landLayer.frame = backdrop.bounds
         renderer?.resize(to: bounds.size, scale: displayScale)
         CATransaction.commit()
         needsUpdate = true
@@ -229,10 +262,12 @@ final class OverlayCanvas: UIView {
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         labelHits = []
-        guard let model, let scene = model.scene, bounds.width > 0 else {
+        // From above while the rise button is held, else the live view.
+        guard let model, let scene = model.shownScene, bounds.width > 0 else {
             clear()
             return
         }
+        let risen = model.risenView
         let frozen = model.frozen
         let now = Date()
         let shown = frozen?.shown ?? screen?.shown ?? fallbackShown(model)
@@ -266,17 +301,24 @@ final class OverlayCanvas: UIView {
 
         lineSegments.removeAll(keepingCapacity: true)
         overlaySegments.removeAll(keepingCapacity: true)
+        showBackdrop(risen != nil, at: now)
+        layoutLand(risen != nil || now < backdropFading ? scene.horizon : nil, projector, heading: camera.attitude.heading,
+                   reach: reach)
         // Increase Contrast: brighter lines over a darker halo.
         let contrast = UIAccessibility.isDarkerSystemColorsEnabled
+        // Seen from above, the skyline can reach the edge of the terrain on the phone, which
+        // isn't a skyline: it's drawn as faintly as the farthest ridges.
         layoutRidges(scene, projector, heading: camera.attitude.heading, reach: reach, ridges: settings.showRidges,
-                     contrast: contrast)
+                     contrast: contrast, edge: risen != nil ? Float(TerrainScene.radius) * 0.97 : nil)
         // Dashes keep their size on the mountain while zooming, halving at each doubling,
         // so they're 9 to 18 points apart on screen.
         let dashScale = camera.intrinsics.fx / model.zoom * pow(2, floor(log2(max(1, model.zoom)))) * .pi / 180
-        layoutTrail(model.arTrail, progress: model.tracker.progress, terrain: scene.terrain, projector,
+        // The trail and the sun path are seen from the ground; risen, they wait.
+        layoutTrail(risen == nil ? model.arTrail : nil, progress: model.tracker.progress, terrain: scene.terrain, projector,
                     xRay: settings.trailXRay, pointsPerDegree: dashScale)
-        layoutSunPath(settings.showSunPath ? model.sun.path(scene: scene) : nil, projector)
-        let placed = layoutLabels(scene, projector, heading: camera.attitude.heading, reach: reach, model: model, at: now)
+        layoutSunPath(risen == nil && settings.showSunPath ? model.sun.path(scene: scene) : nil, projector)
+        let placed = layoutLabels(scene, projector, heading: camera.attitude.heading, reach: reach, model: model,
+                                  revealed: risen?.revealed ?? [], at: now)
         renderer?.draw(lines: lineSegments, overlay: overlaySegments, halo: contrast ? 0.5 : 0.28,
                        size: bounds.size, scale: displayScale)
         // A heading correction turning the view by δ slides everything the other way.
@@ -288,7 +330,8 @@ final class OverlayCanvas: UIView {
     }
 
     private func clear() {
-        for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, walkedTrailLine, trailGlow, trailLine, youLayer, sunLayer, dotLayer] { l.path = nil }
+        for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, walkedTrailLine, trailGlow, trailLine, youLayer, sunLayer, dotLayer, revealedDotLayer, landLayer] { l.path = nil }
+        showBackdrop(false, at: Date())
         layoutSunPath(nil, nil)
         renderer?.draw(lines: [], size: bounds.size, scale: displayScale)
         for id in Array(slots.keys) { fade(id, in: false) }
@@ -362,6 +405,7 @@ final class OverlayCanvas: UIView {
     private static let dashPeriod: CGFloat = 9
     private static let dashOn: CGFloat = 3.5
     private static let dotStyle = Style(color: SIMD4(1, 1, 1, 0.55), width: 4, glow: 0, glowAlpha: 0)
+    private static let revealedDotStyle = Style(color: SIMD4(1, 1, 1, 0.55), width: 1, glow: 0, glowAlpha: 0)
 
     /// Ridges this close are mostly the ground in front of you, houses and trees in
     /// reality; only the skyline is drawn there.
@@ -384,8 +428,9 @@ final class OverlayCanvas: UIView {
         }
     }
 
+    /// Skyline pieces at least `edge` meters away are drawn as the farthest ridges.
     private func layoutRidges(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, reach: Int, ridges: Bool,
-                              contrast: Bool) {
+                              contrast: Bool, edge: Float? = nil) {
         let gpu = renderer != nil
         // For the GPU, consecutive pieces of a line are merged into segments a few points
         // long: the panorama's 0.1° steps are only about a point apart on screen.
@@ -412,7 +457,8 @@ final class OverlayCanvas: UIView {
                 guard let a = point(projector, Double(s.azimuth0), Double(s.elevation0)),
                       let b = point(projector, Double(s.azimuth1), Double(s.elevation1)),
                       bounds.contains(a) || bounds.contains(b) else { continue }
-                let band = s.isSkyline ? -1 : (Self.bands.firstIndex { s.distance < $0.0 } ?? Self.bands.count - 1)
+                let atEdge = s.isSkyline && edge.map { s.distance >= $0 } == true
+                let band = s.isSkyline && !atEdge ? -1 : (Self.bands.firstIndex { s.distance < $0.0 } ?? Self.bands.count - 1)
                 if gpu {
                     emit(a, b, band < 0 ? Self.bands.count : band)
                 } else if band < 0 {
@@ -434,6 +480,52 @@ final class OverlayCanvas: UIView {
         }
         skyGlow.path = skyline.path
         skyLine.path = skyline.path
+    }
+
+    /// Fades the backdrop in when the view rises, and out when it comes down.
+    private func showBackdrop(_ shown: Bool, at now: Date) {
+        guard shown != backdropShown else { return }
+        backdropShown = shown
+        let duration = 0.2
+        if !shown { backdropFading = now.addingTimeInterval(duration) }
+        let from = backdrop.presentation()?.opacity ?? backdrop.opacity
+        let to: Float = shown ? 1 : 0
+        backdrop.opacity = to
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = from
+        animation.toValue = to
+        animation.duration = duration * CFTimeInterval(abs(to - from))
+        backdrop.add(animation, forKey: "fade")
+    }
+
+    /// The land below the skyline, filled, across the view: from each stretch of skyline in
+    /// front of the camera down past the bottom of the screen (the world's down).
+    private func layoutLand(_ horizon: HorizonProfile?, _ projector: Camera.Projector, heading: Double, reach: Int) {
+        guard let horizon else {
+            landLayer.path = nil
+            return
+        }
+        let path = CGMutablePath()
+        let far = hypot(bounds.width, bounds.height) * 2
+        let down = worldDown
+        var run: [CGPoint] = []
+        func close() {
+            defer { run.removeAll(keepingCapacity: true) }
+            guard run.count > 1, let first = run.first, let last = run.last else { return }
+            path.move(to: first)
+            for p in run.dropFirst() { path.addLine(to: p) }
+            path.addLine(to: CGPoint(x: last.x + down.x * far, y: last.y + down.y * far))
+            path.addLine(to: CGPoint(x: first.x + down.x * far, y: first.y + down.y * far))
+            path.closeSubpath()
+        }
+        let span = Double(min(reach, 179))
+        var azimuth = heading - span
+        while azimuth <= heading + span {
+            if let p = point(projector, azimuth, horizon.elevation(atAzimuth: azimuth)) { run.append(p) } else { close() }
+            azimuth += 0.2
+        }
+        close()
+        landLayer.path = path
     }
 
     /// The trail laid on the slope: solid where it's in sight and, seeing through ridges
@@ -657,8 +749,9 @@ final class OverlayCanvas: UIView {
     /// labels where they still fit (`LabelLayout`); a selected peak out of view gets an
     /// arrow at the edge. Every other peak in sight gets a small dot, so it can be tapped
     /// too. Returns the labels' positions along the horizon from the middle, for haptics.
+    /// Peaks `revealed` (in sight only from above) get dashed leaders, or open rings.
     private func layoutLabels(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, reach: Int,
-                              model: AppModel, at now: Date) -> [(id: Int64, x: Double)] {
+                              model: AppModel, revealed: Set<Int64>, at now: Date) -> [(id: Int64, x: Double)] {
         let units = model.settings.units
         // Zoomed in, peaks spread apart and there's room for more labels, a few at a time.
         let limit = LabelLayout.limit(base: model.settings.labels.maxLabels, zoom: model.zoom)
@@ -697,7 +790,8 @@ final class OverlayCanvas: UIView {
             var box: LabelBox?
             if canLabel {
                 labelable += 1
-                box = Self.labelBox(labelImage(v.peak, units, selected: false, hidden: false, below: false).box)
+                box = Self.labelBox(labelImage(v.peak, units, selected: false, hidden: false, below: false,
+                                               revealed: revealed.contains(v.id)).box)
             }
             points[v.id] = p
             peaks[v.id] = v.peak
@@ -718,7 +812,7 @@ final class OverlayCanvas: UIView {
             let isSelected = id == selectedID
             let hidden = isSelected && selected?.view.isVisible == false
             let image = labelImage(peak, units, selected: isSelected, hidden: hidden,
-                                   below: isSelected && result.selected == .below)
+                                   below: isSelected && result.selected == .below, revealed: revealed.contains(id))
             var slot = slots[id] ?? {
                 let l = CALayer()
                 l.contentsScale = displayScale
@@ -769,12 +863,32 @@ final class OverlayCanvas: UIView {
         }
 
         dots = result.dots.prefix(150).compactMap { id in points[id].map { (point: $0, id: id) } }
+        let ring: CGFloat = 2
         if renderer != nil {
-            for (p, _) in dots { overlaySegments.append(Self.dotStyle.segment(p, p)) }
+            for (p, id) in dots {
+                guard revealed.contains(id) else {
+                    overlaySegments.append(Self.dotStyle.segment(p, p))
+                    continue
+                }
+                var previous = CGPoint(x: p.x + ring, y: p.y)
+                for k in 1...8 {
+                    let a = CGFloat(k) / 8 * 2 * .pi
+                    let next = CGPoint(x: p.x + ring * cos(a), y: p.y + ring * sin(a))
+                    overlaySegments.append(Self.revealedDotStyle.segment(previous, next))
+                    previous = next
+                }
+            }
         } else {
-            let dotPath = CGMutablePath()
-            for (p, _) in dots { dotPath.addEllipse(in: CGRect(x: p.x - 2, y: p.y - 2, width: 4, height: 4)) }
+            let dotPath = CGMutablePath(), ringPath = CGMutablePath()
+            for (p, id) in dots {
+                if revealed.contains(id) {
+                    ringPath.addEllipse(in: CGRect(x: p.x - ring, y: p.y - ring, width: 2 * ring, height: 2 * ring))
+                } else {
+                    dotPath.addEllipse(in: CGRect(x: p.x - 2, y: p.y - 2, width: 4, height: 4))
+                }
+            }
             dotLayer.path = dotPath
+            revealedDotLayer.path = ringPath
         }
 
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
@@ -801,8 +915,9 @@ final class OverlayCanvas: UIView {
 
     /// A peak's label, drawn once: a dot, a leader line up from it and the name and height
     /// above, or for the selected peak with no room above, all of it below.
-    private func labelImage(_ peak: Peak, _ units: AppSettings.Units, selected: Bool, hidden: Bool, below: Bool) -> LabelImage {
-        let key = LabelKey(id: peak.id, units: units, selected: selected, hidden: hidden, below: below)
+    private func labelImage(_ peak: Peak, _ units: AppSettings.Units, selected: Bool, hidden: Bool, below: Bool,
+                            revealed: Bool = false) -> LabelImage {
+        let key = LabelKey(id: peak.id, units: units, selected: selected, hidden: hidden, below: below, revealed: revealed)
         imageClock += 1
         if let cached = images[key] {
             images[key]?.used = imageClock
@@ -844,7 +959,7 @@ final class OverlayCanvas: UIView {
             leader.move(to: CGPoint(x: 0, y: below ? 5 : -5))
             leader.addLine(to: CGPoint(x: 0, y: leaderEnd))
             leader.lineWidth = selected ? 1.5 : 1
-            if hidden { leader.setLineDash([3, 3], count: 2, phase: 0) }
+            if hidden || revealed { leader.setLineDash([3, 3], count: 2, phase: 0) }
             (selected ? Self.accent : UIColor.white.withAlphaComponent(0.7)).setStroke()
             leader.stroke()
             (selected ? Self.accent : UIColor.white).setFill()

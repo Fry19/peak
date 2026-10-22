@@ -139,6 +139,42 @@ final class HorizonTests: XCTestCase {
         XCTAssertTrue(segments.contains { $0.isSkyline && abs($0.azimuth0 - 180) < 1 && abs($0.distance - 5_000) < 300 })
     }
 
+    /// Risen 1.5 km above the observer, the summit behind the wall comes into sight; the
+    /// view's horizon then drops its depth map, which from up there holds far more points,
+    /// and keeps the skyline as it was.
+    func testSeenFromAboveTheWallAndWithoutDepth() {
+        let wall = destination(from: TestTerrain.center, azimuth: 180, distance: 5_000)
+        let hidden = destination(from: TestTerrain.center, azimuth: 180, distance: 20_000)
+        let terrain = TestTerrain.cones([
+            .init(latitude: wall.latitude, longitude: wall.longitude, height: 1_500, radius: 3_000),
+            .init(latitude: hidden.latitude, longitude: hidden.longitude, height: 2_000, radius: 4_000),
+        ])
+        let renderer = HorizonRenderer(terrain: terrain)
+        let ground = renderer.observer(latitude: 46, longitude: 8)
+        var risen = ground
+        risen.height += 1_500
+        let summit = [Peak(id: 1, name: "Hidden", latitude: hidden.latitude, longitude: hidden.longitude, elevation: 2_500)]
+        XCTAssertTrue(renderer.visiblePeaks(summit, from: ground, maxDistance: 80_000).isEmpty)
+        XCTAssertEqual(renderer.visiblePeaks(summit, from: risen, maxDistance: 80_000).map(\.id), [1])
+
+        var settings = HorizonSettings()
+        settings.azimuthStep = 5
+        settings.maxDistance = 40_000
+        let below = renderer.render(from: ground, settings: settings)
+        let above = renderer.render(from: risen, settings: settings)
+        let points = { (p: HorizonProfile) in (0..<p.count).reduce(0) { $0 + p.envelope(ofRay: $1).count } }
+        XCTAssertGreaterThan(points(above), 5 * points(below))
+
+        let slim = above.withoutDepth()
+        XCTAssertEqual(slim.elevations, above.elevations)
+        XCTAssertEqual(slim.distances, above.distances)
+        XCTAssertEqual(slim.count, above.count)
+        XCTAssertEqual(points(slim), 0)
+        XCTAssertNil(slim.distance(atAzimuth: 180, elevation: Double(above.elevations[36]) - 1))
+        XCTAssertTrue(slim.ridges(ofRay: 36).isEmpty)
+        XCTAssertEqual(slim.elevation(atAzimuth: 182.5), above.elevation(atAzimuth: 182.5))
+    }
+
     func testEnvelopeIsSortedAndEndsAtTheSkyline() {
         let renderer = HorizonRenderer(terrain: TestTerrain.range())
         var settings = HorizonSettings()
