@@ -51,7 +51,12 @@ struct RootView: View {
                             RoundButton(systemImage: "list.bullet", label: "Peaks") { model.sheet = .list }
                         }
                         StatusPill(model: model)
-                        if !model.aligning {
+                        if model.frozen?.pixels != nil, !model.aligning {
+                            // Paused: save or share the view, labeled.
+                            RoundButton(systemImage: "square.and.arrow.up", label: "Save or share this view") {
+                                model.capturePausedView()
+                            }
+                        } else if !model.aligning {
                             RoundButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right", label: "Line up by hand") {
                                 model.startAligning()
                             }
@@ -84,6 +89,9 @@ struct RootView: View {
         .onChange(of: model.settings) { _, settings in settings.save() }
         .sheet(item: $model.sheet) { sheet in
             SheetContent(model: model, sheet: sheet)
+        }
+        .fullScreenCover(item: $model.photo) { photo in
+            PhotoView(model: model, photo: photo)
         }
     }
 }

@@ -29,6 +29,8 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     weak var model: AppModel?
     /// The frame on screen.
     private(set) var shown: AppModel.Shown?
+    /// Its pixels, kept for saving it when the view is paused (only the newest frame's).
+    private(set) var shownPixels: CVPixelBuffer?
     private(set) var lastFrameDate = Date.distantPast
 
     init(model: AppModel) {
@@ -134,6 +136,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         renderer.enqueue(frame.sample)
         let turned = shown.map { $0.portrait != frame.portrait } ?? true
         shown = AppModel.Shown(time: frame.time, lens: frame.lens, portrait: frame.portrait)
+        shownPixels = frame.pixels
         lastFrameDate = Date()
         if turned { setNeedsLayout() }
         // Lay the overlay out for this frame now, so both reach the screen together.

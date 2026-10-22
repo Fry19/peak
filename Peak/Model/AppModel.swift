@@ -79,6 +79,8 @@ final class AppModel {
         var shown: Shown
         var pose: MotionTracker.Pose
         var correction: ViewCorrection
+        /// The frame's pixels, for saving it with its labels.
+        var pixels: CVPixelBuffer?
     }
 
     /// The frame on screen: when it was taken and through which lens.
@@ -144,6 +146,8 @@ final class AppModel {
     /// The peak highlighted in the view (tapped, or picked from the list).
     var selectedPeakID: Int64?
     var arTrail: ARTrail?
+    /// A still picture being labeled: the paused view, or a photo from the library.
+    var photo: LabeledPhoto?
     /// That trail seen from straight above, over the ridgelines, instead of the camera.
     var showsFromAbove = false
     /// Lining the view up by hand: the picture is paused and dragging moves the lines.
@@ -283,6 +287,13 @@ final class AppModel {
             self.correction.add(outcome)
             self.updateCorrector()
         }
+        #if DEBUG
+        // Checking photo labeling: no camera (and no prompt for it over the picture).
+        if Self.testPhoto != nil {
+            Task { @MainActor in openTestPhotoIfAsked() }
+            return
+        }
+        #endif
         setActive(true)
     }
 
@@ -394,7 +405,87 @@ final class AppModel {
 
     private func freeze() {
         if let shown = screen?.shown, let pose = motion.pose(at: shown.time), scene != nil {
-            frozen = Frozen(shown: shown, pose: pose, correction: viewCorrection(for: pose))
+            frozen = Frozen(shown: shown, pose: pose, correction: viewCorrection(for: pose), pixels: screen?.shownPixels)
+        }
+    }
+
+    // MARK: Labeled pictures
+
+    /// Opens the paused view as a picture to save or share, with its lines and labels.
+    @MainActor func capturePausedView() {
+        guard let frozen, let pixels = frozen.pixels, let scene else { return }
+        sheet = nil
+        photo = LabeledPhoto.capture(frozen, pixels: pixels, scene: scene, zoom: zoom)
+    }
+
+    /// Labels a photo from the library. Called as the sheet it was picked in closes, so the
+    /// picture opens once that's gone.
+    func labelPhoto(_ load: @escaping () async throws -> Data?) {
+        sheet = nil
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(450))
+            photo = LabeledPhoto.importing(load, model: self)
+        }
+    }
+
+    /// The scene for somewhere else, such as where a photo was taken: the one on screen if
+    /// it's from there, otherwise terrain and peaks loaded as for the live view (from the
+    /// phone where they're saved). `progress` says what's under way. Also says whether the
+    /// peaks came; without them there are only ridgelines.
+    @MainActor func scene(latitude lat: Double, longitude lon: Double,
+                          progress: @escaping @MainActor (String) -> Void) async throws -> (scene: TerrainScene, hasPeaks: Bool) {
+        if let scene, scene.position.distance(to: LatLon(lat, lon)) < 300, !peaks.isEmpty { return (scene, true) }
+        let store = self.store
+        progress("Finding peaks…")
+        let found = try? await store.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
+        let keys = DataStore.tiles(latitude: lat, longitude: lon, radius: TerrainScene.radius)
+            .sorted { DataStore.distance(from: lat, lon, to: $0) < DataStore.distance(from: lat, lon, to: $1) }
+        let here = DataStore.Key(south: Int(lat.rounded(.down)), west: Int(lon.rounded(.down)))
+        var tiles: [DataStore.Key: ElevationTile] = [:]
+        var done = 0
+        progress("Getting terrain · 0 of \(keys.count)")
+        await withTaskGroup(of: (DataStore.Key, ElevationTile?).self) { group in
+            for key in keys {
+                let level = key == here || DataStore.distance(from: lat, lon, to: key) < 30_000 ? 2 : 3
+                group.addTask {
+                    if await store.isSea(key) { return (key, Self.seaTile(key)) }
+                    do { return (key, try await store.tile(key, level: level) ?? Self.seaTile(key)) } catch { return (key, nil) }
+                }
+            }
+            for await (key, tile) in group {
+                done += 1
+                tiles[key] = tile
+                progress("Getting terrain · \(done) of \(keys.count)")
+            }
+        }
+        guard tiles[here] != nil else { throw PhotoPlaceError.noTerrain }
+        // Sharper terrain near the photo, as the live view has it.
+        var detail: [ElevationTile] = []
+        let near = keys.filter { DataStore.distance(from: lat, lon, to: $0) < 35_000 }
+        for (i, key) in near.enumerated() {
+            progress("Sharpening terrain · \(i + 1) of \(near.count)")
+            for (level, radius) in [(1, 35_000.0), (0, 10_000.0)] where DataStore.distance(from: lat, lon, to: key) < radius {
+                if let have = tiles[key], have.rows <= 4 || Self.level(of: have) <= level { continue }
+                if let patch = try? await store.patch(key, level: level, latitude: lat, longitude: lon, radius: radius) {
+                    detail.append(patch)
+                }
+            }
+        }
+        bytesDownloaded = await store.bytesDownloaded
+        progress("Drawing the view…")
+        let terrain = Terrain(tiles: tiles.values.compactMap { $0 }, detail: detail, missingIsSea: false)
+        let peaks = found ?? []
+        let built = await Task.detached(priority: .userInitiated) {
+            TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, peaks: peaks)
+        }.value
+        return (built, found != nil)
+    }
+
+    enum PhotoPlaceError: LocalizedError {
+        case noTerrain
+
+        var errorDescription: String? {
+            "Couldn't download the terrain where this photo was taken. Check your connection and try again."
         }
     }
 
@@ -480,12 +571,13 @@ final class AppModel {
         sheet = .peak(id)
     }
 
-    /// Facts and hikes for a peak, loading in the background.
-    func details(for peak: Peak) -> PeakDetails {
+    /// Facts and hikes for a peak, loading in the background. `place` is the scene the
+    /// peak is seen in, when it isn't the live one (a photo taken elsewhere).
+    func details(for peak: Peak, place: TerrainScene? = nil) -> PeakDetails {
         if let d = details[peak.id] { return d }
         let d = PeakDetails(peak: peak)
         details[peak.id] = d
-        d.load(store: store, terrain: { [weak self] in self?.scene?.terrain })
+        d.load(store: store, terrain: { [weak self] in place?.terrain ?? self?.scene?.terrain })
         return d
     }
 

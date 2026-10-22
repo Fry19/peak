@@ -221,6 +221,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = Peak;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Peak shows the names of the mountains in front of you on the camera picture.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Peak uses your location to work out which mountains you can see.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Peak saves your labeled mountain pictures to your photo library.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -255,6 +256,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = Peak;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Peak shows the names of the mountains in front of you on the camera picture.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Peak uses your location to work out which mountains you can see.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Peak saves your labeled mountain pictures to your photo library.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

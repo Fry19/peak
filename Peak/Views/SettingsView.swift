@@ -1,12 +1,23 @@
 import PeakCore
+import PhotosUI
 import SwiftUI
 
 struct SettingsView: View {
     @Bindable var model: AppModel
     @State private var confirmClear = false
+    @State private var picked: PhotosPickerItem?
 
     var body: some View {
         Form {
+            Section {
+                // Only the picked photo is shared with Peak: no access to the library is needed.
+                PhotosPicker(selection: $picked, matching: .images, preferredItemEncoding: .current) {
+                    Label("Label a photo", systemImage: "photo.on.rectangle.angled")
+                }
+            } footer: {
+                Text("Pick a mountain photo with its location saved, and Peak names the peaks in it.")
+            }
+
             Section("Display") {
                 Picker("Units", selection: $model.settings.units) {
                     ForEach(AppSettings.Units.allCases) { Text($0.title).tag($0) }
@@ -63,6 +74,11 @@ struct SettingsView: View {
             }
         }
         .onAppear { model.refreshStorage() }
+        .onChange(of: picked) { _, item in
+            guard let item else { return }
+            picked = nil
+            model.labelPhoto { try await item.loadTransferable(type: Data.self) }
+        }
         .confirmationDialog("Delete all downloaded terrain, peaks and hikes, and your offline areas?", isPresented: $confirmClear, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { model.clearDownloads() }
         }

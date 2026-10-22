@@ -1,7 +1,8 @@
 import Foundation
 
 public struct AlignmentSettings: Sendable {
-    /// Heading corrections searched, ± degrees. Phone compasses are often 5–15° off.
+    /// Heading corrections searched, ± degrees. Phone compasses are often 5–15° off. 180
+    /// searches all the way around, for a photo without a heading.
     public var headingRange = 20.0
     public var headingStep = 0.1
     /// Largest pitch and roll corrections allowed, ± degrees. ARKit's gravity estimate is
@@ -38,6 +39,11 @@ public struct AlignmentSettings: Sendable {
     /// Matched far skyline needed, as a fraction of the points and as a span of azimuth.
     public var minFarFraction = 0.2
     public var minFarSpan = 4.0
+    /// Other fits count against the best one (ambiguity) only with pitch and roll
+    /// corrections within these, degrees; nil counts them all. Searching all the way around,
+    /// a steeply tilted view somewhere else can fit part of the skyline about as well, but
+    /// no photo is that far off level.
+    public var rivalLimits: (pitch: Double, roll: Double)?
 
     public init() {}
 
@@ -236,8 +242,12 @@ public enum SkylineAligner {
             }
             return b > 0 ? min(1, a / b) : 1
         }
-        let ambiguity = basins.filter { abs($0.params[0] - q[0]) > 1.5 }.map { versus($0.params) }.max() ?? 0
-        let nearAmbiguity = basins.filter { (0.3...1.5).contains(abs($0.params[0] - q[0])) }.map { versus($0.params) }.max() ?? 0
+        let rivals = basins.filter { b in
+            settings.rivalLimits.map { abs(b.params[1]) <= $0.pitch && abs(b.params[2]) <= $0.roll } ?? true
+        }
+        let ambiguity = rivals.filter { abs(azimuthDifference($0.params[0], q[0])) > 1.5 }.map { versus($0.params) }.max() ?? 0
+        let nearAmbiguity = rivals.filter { (0.3...1.5).contains(abs(azimuthDifference($0.params[0], q[0]))) }
+            .map { versus($0.params) }.max() ?? 0
 
         // 3. Gate.
         let solved = apply(q, to: camera)
@@ -286,7 +296,7 @@ public enum SkylineAligner {
                                             nearAmbiguity)
         } else if !(rms <= settings.maxRMS) {
             result.rejectionReason = String(format: "residual too large (%.2f°)", rms)
-        } else if abs(q[0]) > settings.headingRange - settings.headingStep {
+        } else if settings.headingRange < 180, abs(q[0]) > settings.headingRange - settings.headingStep {
             result.rejectionReason = "best heading is at the edge of the search range"
         } else if abs(result.pitchCorrection) > settings.pitchRange || abs(result.rollCorrection) > settings.rollRange {
             result.rejectionReason = "pitch or roll correction too large"

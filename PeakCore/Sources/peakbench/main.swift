@@ -9,7 +9,7 @@ peakbench: desk test harness for skyline matching.
 
   peakbench synth --dem DIR --lat L --lon L --heading H [--pitch P] [--roll R] [--fov F]
                   [--width W] [--height H] [--compass-error E] [--clouds C] [--trees T]
-                  [--seed S] --out NAME
+                  [--seed S] [--haze-km K] [--snow-line M] --out NAME
       Render a synthetic photo (NAME.ppm, or NAME.png on a Mac) and its case file NAME.json.
 
   peakbench align CASE.json [--dem DIR] [--debug FILE] [--curve] [--points FILE.csv] [--working-width W]
@@ -210,6 +210,8 @@ func synthCommand(_ args: Arguments) throws {
     scene.seed = UInt64(args.int("seed") ?? 1)
     scene.clouds = args.double("clouds") ?? 0
     scene.trees = args.double("trees") ?? 0
+    if let haze = args.double("haze-km") { scene.hazeDistance = haze * 1000 }
+    if let snow = args.double("snow-line") { scene.snowLine = snow }
     let image = timed("Photo") { SyntheticPhoto.render(profile, camera: Camera(intrinsics: k, attitude: truth), scene: scene) }
 
     let imagePath = out + "." + defaultImageExtension

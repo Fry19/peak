@@ -68,43 +68,31 @@ func saveImage(_ image: RGBImage, to path: String) throws {
 
 /// Builds a case file from a photo's EXIF: GPS position, the compass heading the iPhone
 /// stores with each photo (GPSImgDirection), and the field of view from the 35 mm
-/// equivalent focal length.
+/// equivalent focal length, worked out as the app does for imported photos (`PhotoCamera`).
 func caseCommand(_ args: Arguments) throws {
     guard let path = args.positional.first else { throw HarnessError("which photo?") }
     guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
-          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+          let metadata = PhotoMetadata(properties: props)
     else { throw ImageError.unreadable(path) }
-    let gps = props[kCGImagePropertyGPSDictionary] as? [CFString: Any] ?? [:]
-    let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any] ?? [:]
-    guard var lat = gps[kCGImagePropertyGPSLatitude] as? Double, var lon = gps[kCGImagePropertyGPSLongitude] as? Double else {
-        throw HarnessError("\(path) has no GPS position")
+    let camera: PhotoCamera
+    do { camera = try PhotoCamera(metadata) } catch { throw HarnessError("\(path) has no GPS position") }
+    guard camera.hasHeading else { throw HarnessError("\(path) has no compass heading (GPSImgDirection)") }
+    if let d = camera.declination {
+        log(String(format: "the heading is magnetic: added the declination there, %+.1f°", d))
     }
-    if (gps[kCGImagePropertyGPSLatitudeRef] as? String) == "S" { lat = -lat }
-    if (gps[kCGImagePropertyGPSLongitudeRef] as? String) == "W" { lon = -lon }
-    guard let heading = gps[kCGImagePropertyGPSImgDirection] as? Double else {
-        throw HarnessError("\(path) has no compass heading (GPSImgDirection)")
+    if camera.focalLengthIsGuessed {
+        log("warning: no 35 mm equivalent focal length; assumed \(Int(PhotoCamera.defaultFocalLength35mm)) mm")
     }
-    if (gps[kCGImagePropertyGPSImgDirectionRef] as? String) == "M" {
-        log("warning: the heading is magnetic, not true north; add the local declination by hand")
-    }
-    guard let f35 = exif[kCGImagePropertyExifFocalLenIn35mmFilm] as? Double, f35 > 0 else {
-        throw HarnessError("\(path) has no 35 mm equivalent focal length")
-    }
-    var w = Double(props[kCGImagePropertyPixelWidth] as? Int ?? 4032)
-    var h = Double(props[kCGImagePropertyPixelHeight] as? Int ?? 3024)
-    // EXIF orientations 5–8 are rotated by 90°: the upright image is portrait.
-    if let o = props[kCGImagePropertyOrientation] as? Int, o >= 5 { swap(&w, &h) }
-    // The 35 mm equivalent matches the diagonal of a 36×24 mm frame (43.27 mm).
-    let sensorWidth = 43.27 * w / (w * w + h * h).squareRoot()
-    let fov = 2 * atan(sensorWidth / (2 * f35)) * 180 / .pi
-
-    let photo = PhotoCase(image: URL(fileURLWithPath: path).lastPathComponent, latitude: lat, longitude: lon,
-                          altitude: nil, heading: heading, pitch: nil, roll: nil, horizontalFOV: fov, truth: nil,
-                          anchors: nil, dem: nil, note: "From EXIF. Add anchors (marked summits) to measure the error.")
+    let fov = camera.intrinsics.horizontalFOV
+    let photo = PhotoCase(image: URL(fileURLWithPath: path).lastPathComponent, latitude: camera.latitude,
+                          longitude: camera.longitude, altitude: nil, heading: camera.prior.heading, pitch: nil, roll: nil,
+                          horizontalFOV: fov, truth: nil, anchors: nil, dem: nil,
+                          note: "From EXIF. Add anchors (marked summits) to measure the error.")
     let out = args.string("out") ?? URL(fileURLWithPath: path).deletingPathExtension().path + ".json"
     try writeCase(photo, to: out)
-    print("Wrote \(out): \(String(format: "%.5f, %.5f", lat, lon)), heading \(String(format: "%.1f", heading))°, " +
-          "horizontal field of view \(String(format: "%.1f", fov))°")
+    print("Wrote \(out): \(String(format: "%.5f, %.5f", camera.latitude, camera.longitude)), " +
+          "heading \(String(format: "%.1f", camera.prior.heading))°, horizontal field of view \(String(format: "%.1f", fov))°")
 }
 
 #else

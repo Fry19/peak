@@ -23,6 +23,10 @@ The overlay costs the main thread about a millisecond a frame: the lines are dra
 
 **Tap a label or a dot** for the peak's card: elevation, prominence, distance, bearing, how far above you it is, its range, first ascent and a Wikipedia summary and picture, and the **hikes nearby**: OpenStreetMap hiking routes and named paths within 8 km of the summit, plus unnamed paths up to it, with length, climb, difficulty on the SAC scale (T1–T6) and how far the start is from you. Those that reach the summit come first. A hike's card has a satellite map, an elevation profile and directions to the start. **Show on the mountain** lays the trail on the real slope in the camera view, leaving out the parts hidden behind nearer terrain.
 
+**Labeled pictures.** Tap the pill to pause the view, then the **share button** beside it: the frame on screen opens full size, turned upright the way you held the phone, with the ridgelines and labels drawn in the picture's own resolution (labels scaled to it, with a soft halo so they read on snow and bright sky) and a small attribution line. Choose **Labels** or **Lines only**, then **save to Photos** (Peak only asks to add pictures, never to see your library) or **share**. Tap a label for the peak's card.
+
+**Label a photo** (Settings) does the same for a photo from your library, through the system photo picker, so Peak sees only the photo you pick. It reads where the photo was taken, which way the camera faced (true or magnetic; a magnetic heading gets the local declination from the IGRF model), the lens and the orientation; downloads the terrain and peaks there if they aren't on the phone; and matches the photo's skyline to correct the compass, pitch and roll. A photo without a heading is matched all the way around, and only counts when no other direction fits about as well. When there's no clear match, drag the lines onto the mountains and turn them with two fingers; **Done** then matches again from there, which snaps the lines onto the skyline when it can.
+
 The **list button** (bottom left) lists every peak around you, those in view first, with search; picking one highlights it in the view, with an arrow at the edge when it's out of frame. **Settings** (bottom right): meters or feet, how many labels, ridges, the haptic tick, terrain on mobile data, **offline areas**, and storage.
 
 ### Staying lined up
@@ -133,6 +137,7 @@ iPhone photos record where they were taken and which way the camera faced (the c
    .build/release/peakbench case IMG_1234.jpg
    .build/release/peakbench align IMG_1234.json --dem ../DEM --debug IMG_1234-aligned.png
    ```
+   (`case` reads the photo's metadata the way the app does for imported photos, `PhotoCamera`, magnetic headings and portrait photos included.)
 4. To measure the error, `align` needs the true heading. Add one or two summits you can see to the case file as `anchors`, with the pixel where each summit is in the photo:
    ```json
    "anchors": [
@@ -140,6 +145,11 @@ iPhone photos record where they were taken and which way the camera faced (the c
    ]
    ```
    `align` then works out the true attitude from them and reports the compass error before and after correction.
+5. To see what the app makes of a photo without tapping through it, launch a Debug build in the simulator with the photo's path (somewhere the app can read, such as its container's `tmp`):
+   ```
+   SIMCTL_CHILD_PEAK_TEST_PHOTO=/path/to/IMG_1234.jpg xcrun simctl launch --console-pty booted com.fry19.peak
+   ```
+   It opens the photo as if picked from the library (without starting the camera), prints how it was lined up, and writes `IMG_1234-labels.jpg` and `IMG_1234-clean.jpg` to the app's Documents folder.
 
 ## Project layout
 
@@ -149,7 +159,7 @@ Peak/                      The iPhone app (SwiftUI)
   Model/                   Motion sensors, camera and lens, location, downloads, caching and offline
                            areas, skyline correction, settings
   Views/                   Camera screen and overlay (ridgelines, labels, trails), status pill, peak
-                           and hike cards, peak list, settings, offline areas
+                           and hike cards, peak list, settings, offline areas, labeled pictures
 PeakCore/                  Swift package, no iOS dependencies (builds on macOS and Linux)
   Sources/PeakCore/
     Geodesy.swift          WGS84, east-north-up frames, conformal-sphere rays
@@ -167,6 +177,8 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
     Trails.swift           Hiking routes and paths: parsing, joining ways, elevation profiles
     PeakFacts.swift        Facts from Wikidata and Wikipedia
     UprightFrame.swift     Turns sideways camera frames so the sky is up
+    PhotoMetadata.swift    A photo's metadata (as ImageIO reads it) to a camera, and matching it
+    MagneticDeclination.swift  Magnetic north from the IGRF, for magnetic photo headings
     SyntheticPhoto.swift   Fake photos with a known camera, for testing
     Image.swift            RGB images, PPM files, drawing
   Sources/peakbench/       The desk harness

@@ -8,10 +8,13 @@ import SwiftUI
 struct TrailDetailView: View {
     let model: AppModel
     let link: TrailLink
+    /// The scene of the photo the trail's peak was picked in, rather than the live view's.
+    var place: TerrainScene? = nil
 
     var body: some View {
         Group {
-            if let peak = model.peak(link.peakID), let hike = model.details(for: peak).hikes.first(where: { $0.id == link.trailID }) {
+            if let peak = place.map({ $0.allPeaks[link.peakID]?.peak }) ?? model.peak(link.peakID),
+               let hike = model.details(for: peak, place: place).hikes.first(where: { $0.id == link.trailID }) {
                 content(peak, hike)
             } else {
                 ContentUnavailableView("Hike not found", systemImage: "figure.hiking")
@@ -45,21 +48,24 @@ struct TrailDetailView: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
 
-                // Side by side where they fit, else one above the other.
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 10) {
-                        mountainButton(trail, peak, title: "On the mountain")
-                        aboveButton(trail, peak, fill: false)
+                // Side by side where they fit, else one above the other. (Not for a photo: the
+                // trail is drawn in the live view.)
+                if place == nil {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 10) {
+                            mountainButton(trail, peak, title: "On the mountain")
+                            aboveButton(trail, peak, fill: false)
+                        }
+                        VStack(spacing: 8) {
+                            mountainButton(trail, peak, title: "Show on the mountain")
+                            aboveButton(trail, peak, fill: true)
+                        }
                     }
-                    VStack(spacing: 8) {
-                        mountainButton(trail, peak, title: "Show on the mountain")
-                        aboveButton(trail, peak, fill: true)
-                    }
+                    .tint(Color(red: 1, green: 0.72, blue: 0.28))
+                    .lineLimit(1)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 }
-                .tint(Color(red: 1, green: 0.72, blue: 0.28))
-                .lineLimit(1)
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             }
 
             if let profile = hike.profile, profile.points.count > 2 {
@@ -159,8 +165,8 @@ struct TrailDetailView: View {
             stats.append(Stat(title: "Climb", value: Format.elevation(p.gain, units)))
             stats.append(Stat(title: "Descent", value: Format.elevation(p.loss, units)))
             stats.append(Stat(title: "Highest point", value: Format.elevation(p.highest, units)))
-            if let start = p.trailhead, let here = model.scene?.position {
-                stats.append(Stat(title: "Start from you", value: Format.distance(here.distance(to: start), units)))
+            if let start = p.trailhead, let here = (place ?? model.scene)?.position {
+                stats.append(Stat(title: place != nil ? "Start from photo spot" : "Start from you", value: Format.distance(here.distance(to: start), units)))
             }
         }
         if let d = hike.trail.difficulty { stats.append(Stat(title: "Difficulty", value: "\(d.grade) · \(d.title)")) }

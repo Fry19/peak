@@ -5,12 +5,14 @@ import SwiftUI
 struct PeakDetailView: View {
     let model: AppModel
     let peakID: Int64
+    /// The scene the peak is seen in when it's a photo's, not the live view's.
+    var place: TerrainScene? = nil
     @State private var details: PeakDetails?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         Group {
-            if let peak = model.peak(peakID) {
+            if let peak {
                 content(peak)
             } else {
                 ContentUnavailableView("Peak not found", systemImage: "mountain.2")
@@ -19,18 +21,25 @@ struct PeakDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button("Done") { model.sheet = nil }
+                Button("Done") { close() }
             }
         }
         .onAppear {
-            model.selectedPeakID = peakID
-            if details == nil, let peak = model.peak(peakID) { details = model.details(for: peak) }
+            if place == nil { model.selectedPeakID = peakID }
+            if details == nil, let peak { details = model.details(for: peak, place: place) }
         }
+    }
+
+    private var scene: TerrainScene? { place ?? model.scene }
+    private var peak: Peak? { place.map { $0.allPeaks[peakID]?.peak } ?? model.peak(peakID) }
+
+    private func close() {
+        if place == nil { model.sheet = nil } else { dismiss() }
     }
 
     private func content(_ peak: Peak) -> some View {
         let units = model.settings.units
-        let view = model.scene?.allPeaks[peak.id]
+        let view = scene?.allPeaks[peak.id]
         let facts = details?.facts
         return List {
             Section {
@@ -62,10 +71,11 @@ struct PeakDetailView: View {
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
 
                 Button {
-                    model.selectedPeakID = peak.id
-                    model.sheet = nil
+                    if place == nil { model.selectedPeakID = peak.id }
+                    close()
                 } label: {
-                    Label(view?.isVisible == false ? "Show where it is" : "Find in view", systemImage: "scope")
+                    Label(place != nil ? "Show in the photo" : view?.isVisible == false ? "Show where it is" : "Find in view",
+                          systemImage: "scope")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
@@ -119,8 +129,8 @@ struct PeakDetailView: View {
             stats.append(Stat(title: "Distance", value: Format.distance(view.distance, units)))
             stats.append(Stat(title: "Bearing", value: Format.bearing(view.azimuth)))
         }
-        if let observer = model.scene?.observer {
-            stats.append(Stat(title: "Above you", value: Format.climb(peak.elevation - observer.height, units)))
+        if let observer = scene?.observer {
+            stats.append(Stat(title: place != nil ? "Above the photo spot" : "Above you", value: Format.climb(peak.elevation - observer.height, units)))
         }
         if let range = facts?.range { stats.append(Stat(title: "Range", value: range)) }
         if let year = facts?.firstAscentYear { stats.append(Stat(title: "First ascent", value: String(year))) }
@@ -145,14 +155,14 @@ struct PeakDetailView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text(message).foregroundStyle(.secondary)
                 Button("Try again") {
-                    details?.loadHikes(store: model.store, terrain: { [weak model] in model?.scene?.terrain })
+                    details?.loadHikes(store: model.store, terrain: { [weak model, place] in place?.terrain ?? model?.scene?.terrain })
                 }
             }
         case .loaded:
             if let hikes = details?.hikes, !hikes.isEmpty {
                 ForEach(hikes) { hike in
                     NavigationLink(value: TrailLink(peakID: peak.id, trailID: hike.id)) {
-                        HikeRow(hike: hike, units: units, from: model.scene?.position)
+                        HikeRow(hike: hike, units: units, from: scene?.position)
                     }
                 }
             } else {
