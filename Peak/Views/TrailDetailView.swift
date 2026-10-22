@@ -119,6 +119,7 @@ struct TrailDetailView: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
+        .background(.sheetBackground)
     }
 
     private func mountainButton(_ trail: Trail, _ peak: Peak, title: String) -> some View {

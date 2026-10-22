@@ -139,7 +139,7 @@ private struct SheetContent: View {
             .id(id)
             .presentationDetents([.medium, .large])
             .presentationBackgroundInteraction(.enabled(upThrough: .medium))
-            .presentationBackground(.regularMaterial)
+            .presentationBackground(.sheetBackground)
         case .list:
             NavigationStack {
                 PeakListView(model: model)
@@ -147,12 +147,12 @@ private struct SheetContent: View {
                     .navigationDestination(for: TrailLink.self) { TrailDetailView(model: model, link: $0) }
             }
             .presentationDetents([.medium, .large])
-            .presentationBackground(.regularMaterial)
+            .presentationBackground(.sheetBackground)
         case .settings:
             NavigationStack {
                 SettingsView(model: model)
             }
-            .presentationBackground(.regularMaterial)
+            .presentationBackground(.sheetBackground)
         }
     }
 }
@@ -164,6 +164,13 @@ struct PeakLink: Hashable {
 struct TrailLink: Hashable {
     var peakID: Int64
     var trailID: String
+}
+
+extension ShapeStyle where Self == Color {
+    /// Behind every sheet and the pages pushed in it: near black, so the gray rows and tiles
+    /// stand out. A material turns light gray over a bright sky or snow, and the rows sink
+    /// into it; pages pushed in a sheet would otherwise get a gray of their own.
+    static var sheetBackground: Color { Color(white: 0.07) }
 }
 
 /// A round glass button for the bottom bar.

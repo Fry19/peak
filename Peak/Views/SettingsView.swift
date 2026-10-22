@@ -56,6 +56,7 @@ struct SettingsView: View {
             .font(.footnote)
         }
         .scrollContentBackground(.hidden)
+        .background(.sheetBackground)
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
