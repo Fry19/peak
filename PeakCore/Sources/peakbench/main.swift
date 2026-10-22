@@ -4,8 +4,9 @@ import PeakCore
 let usage = """
 peakbench: desk test harness for skyline matching.
 
-  peakbench horizon --dem DIR --lat L --lon L [--altitude M] [--csv FILE] [--image FILE]
+  peakbench horizon --dem DIR --lat L --lon L [--altitude M] [--peaks OVERPASS.json] [--csv FILE] [--image FILE]
       Render the horizon from a point and print a summary. --image writes a depth panorama.
+      --peaks raises blunted summits to those peaks' elevations first, as the app does.
 
   peakbench synth --dem DIR --lat L --lon L --heading H [--pitch P] [--roll R] [--fov F]
                   [--width W] [--height H] [--compass-error E] [--clouds C] [--trees T]
@@ -175,6 +176,10 @@ func signed(_ v: Double, _ digits: Int = 2) -> String { String(format: "%+.\(dig
 
 func horizonCommand(_ args: Arguments) throws {
     let terrain = try loadTerrain(args.string("dem"))
+    if let path = args.string("peaks") {
+        let peaks = try Overpass.peaks(fromJSON: Data(contentsOf: URL(fileURLWithPath: path)))
+        log("Raised \(terrain.raiseSummits(terrain.fillElevations(peaks))) of \(peaks.count) summits")
+    }
     let renderer = HorizonRenderer(terrain: terrain)
     let lat = try args.required("lat"), lon = try args.required("lon")
     let observer = args.double("altitude").map { GeoPoint(latitude: lat, longitude: lon, height: $0) }

@@ -476,58 +476,143 @@ extension Terrain {
     }
 
     /// A 30 m terrain model blunts sharp summits: the Matterhorn's top is 148 m short. Raises
-    /// the terrain around each peak to a cone reaching the peak's surveyed elevation, so
-    /// skylines and ridgelines have their real tips. The cone is about as steep as a sharp
-    /// summit (45°) and only ever raises the terrain, so doing this twice changes nothing.
-    /// Peaks where the terrain already comes within `minDeficit` meters of the elevation,
-    /// or falls short by more than `maxDeficit` (likely a wrong elevation), are left alone.
-    /// Returns how many summits were raised.
+    /// the terrain near each peak to a tip at the peak's surveyed elevation, so skylines and
+    /// ridgelines have their real tips. In each direction the tip comes down just steeply
+    /// enough to land on the terrain's flank, and it ends where it meets the terrain, so it
+    /// joins it without a step however far the terrain falls away around the top (see
+    /// `ElevationTile.raiseSummit`). The terrain is only ever raised, and the tip's point takes
+    /// the peak's elevation, so doing this twice changes nothing. Peaks where the terrain
+    /// already comes within `minDeficit` meters of the elevation, or falls short by more than
+    /// `maxDeficit` (likely a wrong elevation), are left alone. The tip lands within `radius`
+    /// meters of the summit, or three pixels on coarser tiles. Returns how many summits were raised.
     @discardableResult
     public func raiseSummits(_ peaks: [Peak], radius: Double = 250, minDeficit: Double = 8, maxDeficit: Double = 300) -> Int {
         var raised = 0
         for peak in peaks where !peak.estimatedElevation {
             // Coarse pixels are kilometers wide: a summit's tip on one would be a broad dome.
             guard let tile = finestTile(latitude: peak.latitude, longitude: peak.longitude), !tile.isCoarse else { continue }
-            let metersPerLat = 111_320.0, metersPerLon = 111_320 * cos(peak.latitude * .pi / 180)
-            let pixel = max(tile.stepLatitude * metersPerLat, tile.stepLongitude * metersPerLon)
-            let y = (tile.originLatitude - peak.latitude) / tile.stepLatitude
-            let x = (peak.longitude - tile.originLongitude) / tile.stepLongitude
-            let reachRows = Int(radius / (tile.stepLatitude * metersPerLat)) + 1
-            let reachCols = Int(radius / (tile.stepLongitude * metersPerLon)) + 1
-            let rowLow: Int = max(0, Int(y) - reachRows), rowHigh: Int = min(tile.rows - 1, Int(y) + reachRows)
-            let colLow: Int = max(0, Int(x) - reachCols), colHigh: Int = min(tile.cols - 1, Int(x) + reachCols)
-            guard rowLow <= rowHigh, colLow <= colHigh else { continue }
-            let rows = rowLow...rowHigh, cols = colLow...colHigh
-            let rowMeters: Double = tile.stepLatitude * metersPerLat, colMeters: Double = tile.stepLongitude * metersPerLon
-            func distance(_ r: Int, _ c: Int) -> Double {
-                let dy: Double = (Double(r) - y) * rowMeters
-                let dx: Double = (Double(c) - x) * colMeters
-                return (dx * dx + dy * dy).squareRoot()
-            }
-            // The model's top near the summit.
-            var top = -Double.infinity
-            for r in rows {
-                for c in cols where distance(r, c) <= radius {
-                    let v = tile.heights[r * tile.cols + c]
-                    if v != ElevationTile.noData { top = max(top, Double(v)) }
-                }
-            }
-            let deficit = peak.elevation - top
-            guard top.isFinite, deficit >= minDeficit, deficit <= maxDeficit else { continue }
-            // At least a pixel and a half wide, so the nearest grid point gets most of the tip.
-            let coneRadius = min(radius, max(deficit, 1.5 * pixel))
-            for r in rows {
-                for c in cols {
-                    let d = distance(r, c)
-                    guard d < coneRadius else { continue }
-                    let i = r * tile.cols + c
-                    guard tile.heights[i] != ElevationTile.noData else { continue }
-                    let cone = Int16(max(-32767, min(32767, (peak.elevation - deficit * d / coneRadius).rounded())))
-                    if cone > tile.heights[i] { tile.heights[i] = cone }
-                }
-            }
-            raised += 1
+            if tile.raiseSummit(peak, radius: radius, minDeficit: minDeficit, maxDeficit: maxDeficit) { raised += 1 }
         }
         return raised
+    }
+}
+
+extension ElevationTile {
+    /// Directions a restored tip's slope is found in.
+    static let tipDirections = 48
+    /// How much steeper than just touching the flank a tip's sides are, so they land on the
+    /// terrain rather than skimming it; steeper again while the tip still runs past its reach.
+    static let tipMargins = [0.15, 0.5, 1.5]
+
+    /// Raises one summit (see `Terrain.raiseSummits`). True if any height changed.
+    ///
+    /// The tip's point goes on the grid point nearest the summit, since between grid points
+    /// it would be cut off. In each direction its side is a straight line down from the
+    /// elevation, a little steeper than the steepest that stays above the terrain, so it lands
+    /// on the flank where the blunting ends. The cells raised are those connected to the point
+    /// (diagonally too) where the tip stands above the terrain, so wherever the tip ends it
+    /// has come down to the terrain: a raised cell and its neighbors differ by no more than
+    /// the tip drops between them.
+    func raiseSummit(_ peak: Peak, radius: Double, minDeficit: Double, maxDeficit: Double) -> Bool {
+        let rowMeters = stepLatitude * 111_320, colMeters = stepLongitude * 111_320 * cos(peak.latitude * .pi / 180)
+        let pixel = max(rowMeters, colMeters)
+        let r0 = Int(((originLatitude - peak.latitude) / stepLatitude).rounded())
+        let c0 = Int(((peak.longitude - originLongitude) / stepLongitude).rounded())
+        guard r0 >= 0, r0 < rows, c0 >= 0, c0 < cols, value(row: r0, col: c0) != Self.noData else { return false }
+        // The tip lands within `reach`. Past it, it plunges below the terrain within two pixels.
+        let reach = max(radius, 3 * pixel), window = reach + 3 * pixel
+        let rowLow = max(0, r0 - Int(window / rowMeters)), rowHigh = min(rows - 1, r0 + Int(window / rowMeters))
+        let colLow = max(0, c0 - Int(window / colMeters)), colHigh = min(cols - 1, c0 + Int(window / colMeters))
+        func offset(_ r: Int, _ c: Int) -> (north: Double, east: Double, distance: Double) {
+            let north = Double(r0 - r) * rowMeters, east = Double(c - c0) * colMeters
+            return (north, east, (north * north + east * east).squareRoot())
+        }
+        // The model's top near the summit, and its lowest point in the window.
+        var top = -Double.infinity, low = Double.infinity
+        for r in rowLow...rowHigh {
+            for c in colLow...colHigh {
+                let v = value(row: r, col: c)
+                guard v != Self.noData else { continue }
+                if offset(r, c).distance <= reach { top = max(top, Double(v)) }
+                low = min(low, Double(v))
+            }
+        }
+        let elevation = peak.elevation, deficit = elevation - top
+        guard deficit >= max(1, minDeficit), deficit <= maxDeficit else { return false }
+
+        // Along each direction, the steepest straight side that stays above the terrain.
+        func height(_ y: Double, _ x: Double) -> Double? {
+            let r = Int(y.rounded(.down)), c = Int(x.rounded(.down))
+            guard r >= 0, c >= 0, r + 1 < rows, c + 1 < cols else { return nil }
+            let a = value(row: r, col: c), b = value(row: r, col: c + 1)
+            let e = value(row: r + 1, col: c), f = value(row: r + 1, col: c + 1)
+            guard a != Self.noData, b != Self.noData, e != Self.noData, f != Self.noData else { return nil }
+            let fy = y - Double(r), fx = x - Double(c)
+            return (Double(a) * (1 - fx) + Double(b) * fx) * (1 - fy) + (Double(e) * (1 - fx) + Double(f) * fx) * fy
+        }
+        let n = Self.tipDirections
+        var touching = [Double](repeating: .infinity, count: n)
+        for k in 0..<n {
+            let angle = 2 * Double.pi * Double(k) / Double(n), north = cos(angle), east = sin(angle)
+            var d = pixel / 2
+            while d <= reach {
+                if let h = height(Double(r0) - d * north / rowMeters, Double(c0) + d * east / colMeters) {
+                    touching[k] = min(touching[k], (elevation - h) / d)
+                }
+                d += pixel / 2
+            }
+        }
+        // Directions off the tile take their neighbor's.
+        guard let known = touching.firstIndex(where: \.isFinite) else { return false }
+        for step in 1..<n where !touching[(known + step) % n].isFinite {
+            touching[(known + step) % n] = touching[(known + step - 1) % n]
+        }
+        // At least as steep as the neighboring directions, so it comes down between them too.
+        let slope = (0..<n).map { max(touching[($0 + n - 1) % n], touching[$0], touching[($0 + 1) % n]) }
+
+        let width = colHigh - colLow + 1
+        for (attempt, margin) in Self.tipMargins.enumerated() {
+            func tip(_ r: Int, _ c: Int) -> (height: Double, distance: Double) {
+                let o = offset(r, c)
+                guard o.distance > 0 else { return (elevation, 0) }
+                var t = atan2(o.east, o.north) / (2 * .pi) * Double(n)
+                if t < 0 { t += Double(n) }
+                let k = Int(t) % n, f = t - t.rounded(.down)
+                let side = (1 + margin) * (slope[k] * (1 - f) + slope[(k + 1) % n] * f)
+                let past = max(0, o.distance - reach) / (2 * pixel)
+                return (elevation - side * o.distance - (elevation - low) * past * past, o.distance)
+            }
+            // The cells connected to the point where the tip stands above the terrain, rounded
+            // down so the tip never stands above the elevation.
+            var seen = [Bool](repeating: false, count: (rowHigh - rowLow + 1) * width)
+            var stack = [(r0, c0)]
+            seen[(r0 - rowLow) * width + (c0 - colLow)] = true
+            var raised: [(index: Int, height: Int16)] = []
+            var ranPast = false
+            while let (r, c) = stack.popLast() {
+                let v = value(row: r, col: c)
+                guard v != Self.noData else { continue }
+                let (h, d) = tip(r, c)
+                guard h.rounded(.down) > Double(v) else { continue }
+                raised.append((r * cols + c, Int16(min(32767, h.rounded(.down)))))
+                ranPast = ranPast || d > reach
+                for dr in -1...1 {
+                    for dc in -1...1 where dr != 0 || dc != 0 {
+                        let rr = r + dr, cc = c + dc
+                        guard rr >= rowLow, rr <= rowHigh, cc >= colLow, cc <= colHigh else { continue }
+                        let j = (rr - rowLow) * width + (cc - colLow)
+                        if !seen[j] {
+                            seen[j] = true
+                            stack.append((rr, cc))
+                        }
+                    }
+                }
+            }
+            // A tip that skims a long, gentle top past its reach is tried steeper.
+            if ranPast, attempt + 1 < Self.tipMargins.count { continue }
+            for cell in raised { heights[cell.index] = cell.height }
+            return !raised.isEmpty
+        }
+        return false
     }
 }

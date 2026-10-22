@@ -76,10 +76,46 @@ final class TerrainTests: XCTestCase {
                      Peak(id: 3, name: "Wrong height", latitude: 45.8, longitude: 7.8, elevation: 9_000)]
         XCTAssertEqual(terrain.raiseSummits(peaks), 1)
         XCTAssertEqual(terrain.height(latitude: summit.lat, longitude: summit.lon), 3_000, accuracy: 1)
-        // Halfway down the restored tip: 75 m below it, 75 m out.
-        XCTAssertEqual(terrain.height(latitude: summit.lat + 75 / 111_320, longitude: summit.lon), 2_925, accuracy: 6)
+        // Halfway down the restored tip, 75 m out: about 75 m below it, the sides coming down
+        // a little steeper than the 45° flanks so they land on them.
+        let halfway = terrain.height(latitude: summit.lat + 75 / 111_320, longitude: summit.lon)
+        XCTAssertLessThanOrEqual(halfway, 2_925 + 1)
+        XCTAssertGreaterThan(halfway, 3_000 - 1.25 * 75)
         XCTAssertEqual(terrain.height(latitude: summit.lat + 0.004, longitude: summit.lon), far, "unchanged 450 m away")
         XCTAssertEqual(terrain.raiseSummits(peaks), 0, "raising again changes nothing")
+    }
+
+    /// A needle surveyed 150 m above a rounded top that falls away fast (the Matterhorn in a
+    /// 30 m model): the restored tip comes down onto the dome's flanks rather than ending in a
+    /// wall where the dome has fallen below its old top. Seen from 5 km, the skyline rises to
+    /// the summit no steeper than the tip's own sides. The summit sits between grid points.
+    func testRaisedTipJoinsARoundedTopWithoutAStep() {
+        let summit = (lat: 45.5 + 0.4 / 3600, lon: 7.5 + 0.3 / 3600)
+        func dome(_ lat: Double, _ lon: Double) -> Double {
+            let dy = (lat - summit.lat) * 111_320, dx = (lon - summit.lon) * 111_320 * cos(summit.lat * .pi / 180)
+            let d = (dx * dx + dy * dy).squareRoot()
+            return max(1_500, 2_850 - 0.8 * ((d * d + 100 * 100).squareRoot() - 100))   // rounded over ~100 m, then 39°
+        }
+        let terrain = Terrain(tiles: [ElevationTile(south: 45, west: 7, size: 3600, height: dome)])
+        let peaks = [Peak(id: 1, name: "Needle", latitude: summit.lat, longitude: summit.lon, elevation: 3_000)]
+        XCTAssertEqual(terrain.raiseSummits(peaks), 1)
+        let raised = terrain.tiles[0].heightValues
+        XCTAssertEqual(terrain.raiseSummits(peaks), 0)
+        XCTAssertTrue(terrain.tiles[0].heightValues == raised, "raising again changes nothing")
+        XCTAssertEqual(terrain.height(latitude: 45.5, longitude: 7.5), 3_000, "the point is on the nearest grid point")
+
+        let renderer = HorizonRenderer(terrain: terrain)
+        let east = summit.lon + 5_000 / (111_320 * cos(summit.lat * .pi / 180))
+        let observer = renderer.observer(latitude: summit.lat, longitude: east)
+        var settings = HorizonSettings()
+        settings.azimuthStep = 0.05
+        settings.maxDistance = 10_000
+        let profile = renderer.render(from: observer, settings: settings)
+        let skyline = stride(from: 266.0, through: 274.0, by: 0.05).map { profile.elevation(atAzimuth: $0) }
+        let steepest = zip(skyline, skyline.dropFirst()).map { abs($1 - $0) / 0.05 }.max()!
+        XCTAssertLessThan(steepest, 1.5, "degrees up per degree across: no wall where the tip meets the dome")
+        let top = atan((3_000 - observer.height) / 5_000) * 180 / .pi
+        XCTAssertEqual(skyline.max()!, top, accuracy: 0.15, "the skyline reaches the summit")
     }
 
     /// Peaks without an elevation take the terrain's top near them; the rest are untouched.
