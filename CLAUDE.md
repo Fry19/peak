@@ -1,4 +1,8 @@
+@AGENTS.md
+
 # Peak AR App: Project Brief
+
+Shared working rules live in [AGENTS.md](AGENTS.md); read the [peer collaboration procedures](.agents/skills/peer-collaboration/SKILL.md) before consulting, reviewing, or delegating. This brief includes the original proposal; use the current source and README for implemented behavior.
 
 An AR app that labels mountain peaks (name + elevation) in the live camera view, traces their outlines, and lets you tap a peak to see details and the hiking trails that climb it.
 

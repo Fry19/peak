@@ -4,6 +4,8 @@ An iPhone app that labels the mountains in your camera view and stays lined up w
 
 This repo holds the skyline matching from the [project brief](CLAUDE.md), built and measured at a desk first, and the iPhone app (0.8) that uses it in a live camera view, with peak details and hikes.
 
+For development, see the shared [agent guidance](AGENTS.md) and [Codex/Claude peer collaboration workflow](.agents/skills/peer-collaboration/SKILL.md).
+
 ![Synthetic photo toward the Matterhorn from Gornergrat. Red: the horizon where an 8° wrong compass puts it. Green: after skyline matching. Yellow: the detected skyline. Cyan: ridges behind the skyline.](docs/matterhorn-aligned.jpg)
 
 *Red is where an 8° wrong compass puts the horizon, green is after correction (0.02° off), yellow is the detected skyline, and cyan marks ridges behind it.*
