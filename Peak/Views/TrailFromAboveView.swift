@@ -37,7 +37,8 @@ struct TrailFromAboveView: View {
             let safe = geo.safeAreaInsets
             // The map fills the screen; the trail fits between the chip and the bottom bar.
             let full = CGSize(width: geo.size.width + safe.leading + safe.trailing, height: geo.size.height + safe.top + safe.bottom)
-            let content = EdgeInsets(top: safe.top + 84, leading: 20, bottom: safe.bottom + 64, trailing: 20)
+            // The bottom keeps clear of the bar, so arrows along it don't sit on its buttons.
+            let content = EdgeInsets(top: safe.top + 84, leading: 20, bottom: safe.bottom + 84, trailing: 20)
             let satellite = model.fromAboveSatellite
             ZStack {
                 Self.background
