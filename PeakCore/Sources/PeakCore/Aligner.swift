@@ -5,13 +5,20 @@ public struct AlignmentSettings: Sendable {
     /// searches all the way around, for a photo without a heading.
     public var headingRange = 20.0
     public var headingStep = 0.1
-    /// Largest pitch and roll corrections allowed, ± degrees. ARKit's gravity estimate is
-    /// good to well under a degree; photos without attitude data need wider ranges.
-    public var pitchRange = 3.0
-    public var rollRange = 2.0
+    /// Largest pitch and roll corrections allowed, ± degrees: the best fit and every rival
+    /// it's measured against stay within them. The motion sensors' gravity is good to a few
+    /// tenths of a degree, and the camera's own tilt on the phone (`level`, learned from
+    /// matches) is in the prior already. More freedom lets a short or flat skyline fit a
+    /// wrong heading by tilting: a roof's slope taken for a ridge's. Pitch keeps a little
+    /// more, for refraction and the eye's height. Photos without attitude data need wider ranges.
+    public var pitchRange = 1.5
+    public var rollRange = 1.0
+    /// Roll seeds for the coarse search go out this far (nil: `rollRange`). A search all the
+    /// way around keeps them near level, for speed, while the refinement may go further.
+    public var coarseRollRange: Double?
     /// Prior spread of the pitch and roll estimates, in degrees.
-    public var pitchSigma = 1.0
-    public var rollSigma = 1.0
+    public var pitchSigma = 0.5
+    public var rollSigma = 0.5
     /// Also solve for the field of view (when the lens data may be off).
     public var refineFieldOfView = false
     public var fieldOfViewSigma = 0.03
@@ -44,11 +51,6 @@ public struct AlignmentSettings: Sendable {
     /// Matched far skyline needed, as a fraction of the points and as a span of azimuth.
     public var minFarFraction = 0.2
     public var minFarSpan = 4.0
-    /// Other fits count against the best one (ambiguity) only with pitch and roll
-    /// corrections within these, degrees; nil counts them all. Searching all the way around,
-    /// a steeply tilted view somewhere else can fit part of the skyline about as well, but
-    /// no photo is that far off level.
-    public var rivalLimits: (pitch: Double, roll: Double)?
 
     public init() {}
 
@@ -94,11 +96,24 @@ public struct AlignmentResult: Sendable {
     /// The same against fits 0.3–1.5° away: near 1 means the skyline doesn't pin the
     /// heading down to better than a degree or so.
     public var nearAmbiguity: Double
+    /// The fits `ambiguity` and `nearAmbiguity` were measured against: the closest
+    /// contenders more than 1.5° away and 0.3–1.5° away (nil when there was none).
+    public var runnerUp: Rival?
+    public var nearRunnerUp: Rival?
     public var pointCount: Int
     public var accepted: Bool
     public var rejectionReason: String?
     /// The coarse search: cost for each heading correction.
     public var headingCurve: [(correction: Double, cost: Double)]
+
+    /// Another fit, as corrections to the prior like the best one's.
+    public struct Rival: Sendable {
+        public var headingCorrection: Double
+        public var pitchCorrection: Double
+        public var rollCorrection: Double
+        /// The best fit's cost over this one's, as in `ambiguity`.
+        public var ratio: Double
+    }
 }
 
 /// Finds the camera attitude that makes the detected skyline match the rendered horizon.
@@ -121,7 +136,8 @@ public enum SkylineAligner {
         func reject(_ reason: String, curve: [(Double, Double)] = []) -> AlignmentResult {
             AlignmentResult(attitude: prior, intrinsics: camera.intrinsics, headingCorrection: 0,
                             pitchCorrection: 0, rollCorrection: 0, rms: .nan, inlierFraction: 0, farFraction: 0,
-                            ambiguity: 1, nearAmbiguity: 1, pointCount: points.count, accepted: false,
+                            ambiguity: 1, nearAmbiguity: 1, runnerUp: nil, nearRunnerUp: nil,
+                            pointCount: points.count, accepted: false,
                             rejectionReason: reason, headingCurve: curve.map { ($0.0, $0.1) })
         }
         guard skyline.candidateFraction >= settings.minValidFraction, points.count >= 20 else {
@@ -139,10 +155,11 @@ public enum SkylineAligner {
         // 1. Coarse search. Turning the heading rotates every viewing direction about the
         //    vertical, so it just shifts azimuths. Pitch and roll get a few candidates, and
         //    whatever pitch is left over is taken out as the median elevation offset of the
-        //    far points.
+        //    far points, as far as the pitch range allows. Each point's candidate is picked
+        //    before that offset comes out, so a narrow range gets pitch seeds 1° apart.
         let cap = 3.0
-        let pitchCandidates = candidates(range: settings.pitchRange, spacing: 2)
-        let rollCandidates = candidates(range: settings.rollRange, spacing: 1)
+        let pitchCandidates = candidates(range: settings.pitchRange, spacing: settings.pitchRange > 2 ? 2 : 1)
+        let rollCandidates = candidates(range: settings.coarseRollRange ?? settings.rollRange, spacing: 1)
         let headingCount = Int((settings.headingRange / settings.headingStep).rounded())
         var curve = [(Double, Double)]()
         var curveArgs = [(pitch: Double, roll: Double, offset: Double)]()
@@ -183,7 +200,10 @@ public enum SkylineAligner {
                     sigmas[i] = raySigma[best.j]
                     if rayFar[best.j] { farResiduals.append(best.r) }
                 }
-                let offset = max(-1.5, min(1.5, median(farResiduals.count >= 10 ? farResiduals : residuals)))
+                // The pitch correction this makes, candidate less offset, stays in range.
+                let dp = combos[k].0
+                let offset = max(-1.5, dp - settings.pitchRange,
+                                 min(1.5, dp + settings.pitchRange, median(farResiduals.count >= 10 ? farResiduals : residuals)))
                 var cost = 0.0
                 for i in points.indices {
                     var e = Double.infinity
@@ -204,8 +224,8 @@ public enum SkylineAligner {
             curveArgs.append(bestArgs)
         }
 
-        // 2. Refine the best few basins with all parameters free, and score each refined
-        //    solution with the same robust cost as the coarse search.
+        // 2. Refine the best few basins with all parameters free (pitch and roll within their
+        //    ranges), and score each refined solution with the same robust cost as the coarse search.
         let separation = Int(1.5 / settings.headingStep)
         /// Each point's robust cost: its best candidate's error in expected errors, capped.
         func errors(_ q: [Double]) -> [Double] {
@@ -254,12 +274,18 @@ public enum SkylineAligner {
             }
             return b > 0 ? min(1, a / b) : 1
         }
-        let rivals = basins.filter { b in
-            settings.rivalLimits.map { abs(b.params[1]) <= $0.pitch && abs(b.params[2]) <= $0.roll } ?? true
+        // Every basin was refined within the same pitch and roll ranges, so a rival can't
+        // buy its fit with a tilt no photo has either.
+        func closest(_ within: (Double) -> Bool) -> AlignmentResult.Rival? {
+            basins.filter { within(abs(azimuthDifference($0.params[0], q[0]))) }
+                .map { b in AlignmentResult.Rival(headingCorrection: b.params[0], pitchCorrection: b.params[1],
+                                                  rollCorrection: b.params[2], ratio: versus(b.params)) }
+                .max { $0.ratio < $1.ratio }
         }
-        let ambiguity = rivals.filter { abs(azimuthDifference($0.params[0], q[0])) > 1.5 }.map { versus($0.params) }.max() ?? 0
-        let nearAmbiguity = rivals.filter { (0.3...1.5).contains(abs(azimuthDifference($0.params[0], q[0]))) }
-            .map { versus($0.params) }.max() ?? 0
+        let runnerUp = closest { $0 > 1.5 }
+        let nearRunnerUp = closest { (0.3...1.5).contains($0) }
+        let ambiguity = runnerUp?.ratio ?? 0
+        let nearAmbiguity = nearRunnerUp?.ratio ?? 0
 
         // 3. Gate.
         let solved = apply(q, to: camera)
@@ -294,6 +320,7 @@ public enum SkylineAligner {
             headingCorrection: q[0], pitchCorrection: solved.attitude.pitch - prior.pitch,
             rollCorrection: solved.attitude.roll - prior.roll, rms: rms, inlierFraction: inlierFraction,
             farFraction: farFraction, ambiguity: ambiguity, nearAmbiguity: nearAmbiguity,
+            runnerUp: runnerUp, nearRunnerUp: nearRunnerUp,
             pointCount: points.count, accepted: true,
             rejectionReason: nil, headingCurve: curve.map { ($0.0, $0.1) })
         if inlierFraction < settings.minInlierFraction {
@@ -310,8 +337,6 @@ public enum SkylineAligner {
             result.rejectionReason = String(format: "residual too large (%.2f°)", rms)
         } else if settings.headingRange < 180, abs(q[0]) > settings.headingRange - settings.headingStep {
             result.rejectionReason = "best heading is at the edge of the search range"
-        } else if abs(result.pitchCorrection) > settings.pitchRange || abs(result.rollCorrection) > settings.rollRange {
-            result.rejectionReason = "pitch or roll correction too large"
         }
         result.accepted = result.rejectionReason == nil
         return result
@@ -364,7 +389,15 @@ public enum SkylineAligner {
             return total
         }
 
-        var q = start
+        // Pitch and roll stay within their ranges.
+        let limits = [Double.infinity, settings.pitchRange, settings.rollRange, Double.infinity]
+        func clamped(_ q: [Double]) -> [Double] {
+            var q = q
+            for j in 1...2 { q[j] = max(-limits[j], min(limits[j], q[j])) }
+            return q
+        }
+
+        var q = clamped(start)
         var r = residuals(q)
         var current = cost(r, q)
         var lambda = 1e-2
@@ -399,13 +432,14 @@ public enum SkylineAligner {
             for _ in 0..<8 {
                 var damped = a
                 for j in 0..<free { damped[j][j] *= 1 + lambda }
-                guard let step = solve(damped, g.map { -$0 }) else { lambda *= 10; continue }
+                guard let step = boundedStep(damped, g, q: q, limits: limits) else { lambda *= 10; continue }
                 var candidate = q
                 for j in 0..<free { candidate[j] += step[j] }
+                candidate = clamped(candidate)
                 let rc = residuals(candidate)
                 let cc = cost(rc, candidate)
                 if cc < current {
-                    let delta = step.map(abs).max() ?? 0
+                    let delta = (0..<free).map { abs(candidate[$0] - q[$0]) }.max() ?? 0
                     q = candidate
                     r = rc
                     current = cc
@@ -419,6 +453,34 @@ public enum SkylineAligner {
             if !improved { break }
         }
         return (q, current)
+    }
+
+    /// The damped Gauss–Newton step for `a` · step = −`g` with parameters held at the edges
+    /// of their `limits` (an active set): one the step pushes further out is held there and
+    /// the rest solved again without it, and a held one is let go again once moving it back
+    /// inside would lower the cost. Clipping alone would leave the others where the held
+    /// one's pull put them.
+    static func boundedStep(_ a: [[Double]], _ g: [Double], q: [Double], limits: [Double]) -> [Double]? {
+        var held = Set<Int>()
+        var step: [Double]?
+        for _ in 0..<(2 * g.count + 2) {
+            let open = g.indices.filter { !held.contains($0) }
+            guard let s = solve(open.map { j in open.map { a[j][$0] } }, open.map { -g[$0] }) else { return nil }
+            var next = [Double](repeating: 0, count: g.count)
+            for (n, j) in open.enumerated() { next[j] = s[n] }
+            step = next
+            // The cost's slope at the step: a held parameter it pulls back inside is let go.
+            let slope = g.indices.map { j in g[j] + g.indices.reduce(0) { $0 + a[j][$1] * next[$1] } }
+            if let j = held.first(where: { slope[$0] * q[$0] > 0 }) {
+                held.remove(j)
+                continue
+            }
+            // The one pushed furthest past its edge is held, then the rest solved again.
+            guard let j = open.filter({ abs(q[$0]) >= limits[$0] - 1e-9 && next[$0] * q[$0] > 0 })
+                .max(by: { abs(next[$0]) < abs(next[$1]) }) else { return next }
+            held.insert(j)
+        }
+        return step
     }
 
     static func candidates(range: Double, spacing: Double) -> [Double] {

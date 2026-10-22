@@ -221,5 +221,13 @@ final class PhotoImportTests: XCTestCase {
         let m = camera.match(image, horizon: horizon)
         XCTAssertTrue(m.alignment.accepted, m.alignment.rejectionReason ?? "")
         XCTAssertEqual(azimuthDifference(m.alignment.attitude.heading, truth.heading), 0, accuracy: 0.1)
+        // Its corrections, and its rivals', are to the photo's own prior, not the second pass's.
+        let a = m.alignment
+        XCTAssertEqual(azimuthDifference(camera.prior.heading + a.headingCorrection, a.attitude.heading), 0, accuracy: 1e-9)
+        XCTAssertEqual(camera.prior.pitch + a.pitchCorrection, a.attitude.pitch, accuracy: 1e-9)
+        XCTAssertEqual(camera.prior.roll + a.rollCorrection, a.attitude.roll, accuracy: 1e-9)
+        if let near = a.nearRunnerUp {
+            XCTAssertLessThanOrEqual(abs(azimuthDifference(near.headingCorrection, a.headingCorrection)), 1.5 + 1e-9)
+        }
     }
 }

@@ -23,6 +23,12 @@ final class SkylineCorrector: @unchecked Sendable {
         var rms: Double
         /// Why a frame was turned away (nil when accepted).
         var reason: String?
+        /// How close the closest other heading came, and that fit (`AlignmentResult`), kept
+        /// with test frames so a rejection can be looked into.
+        var ambiguity: Double
+        var nearAmbiguity: Double
+        var runnerUp: AlignmentResult.Rival?
+        var nearRunnerUp: AlignmentResult.Rival?
         var seconds: Double
     }
 
@@ -136,7 +142,8 @@ final class SkylineCorrector: @unchecked Sendable {
             let outcome = Outcome(delta: a.headingCorrection, from: base.heading,
                                   pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
                                   sideways: isSideways, lens: lens.name, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
-                                  seconds: m.seconds)
+                                  ambiguity: a.ambiguity, nearAmbiguity: a.nearAmbiguity, runnerUp: a.runnerUp,
+                                  nearRunnerUp: a.nearRunnerUp, seconds: m.seconds)
             if let capture, let frame = Self.testFrame(upright, correction: correction, horizon: horizon,
                                                        measuredLens: lens.measured, outcome: outcome) {
                 DispatchQueue.main.async { capture(frame) }
@@ -173,6 +180,18 @@ final class SkylineCorrector: @unchecked Sendable {
             var measuredLens: Bool
             var match: [String: String]
         }
+        var match = ["accepted": outcome.accepted ? "yes" : "no", "reason": outcome.reason ?? "",
+                     "heading": String(format: "%+.3f", outcome.delta), "pitch": String(format: "%+.3f", outcome.pitchDelta),
+                     "roll": String(format: "%+.3f", outcome.rollDelta), "rms": String(format: "%.3f", outcome.rms),
+                     "ambiguity": String(format: "%.2f", outcome.ambiguity),
+                     "nearAmbiguity": String(format: "%.2f", outcome.nearAmbiguity)]
+        // The closest other fits, as corrections like the match's own.
+        for (key, rival) in [("runnerUp", outcome.runnerUp), ("nearRunnerUp", outcome.nearRunnerUp)] {
+            guard let rival else { continue }
+            match[key + "Heading"] = String(format: "%+.3f", rival.headingCorrection)
+            match[key + "Pitch"] = String(format: "%+.3f", rival.pitchCorrection)
+            match[key + "Roll"] = String(format: "%+.3f", rival.rollCorrection)
+        }
         let file = Case(
             image: name + ".png", latitude: horizon.observer.latitude, longitude: horizon.observer.longitude,
             altitude: horizon.observer.height,
@@ -183,10 +202,7 @@ final class SkylineCorrector: @unchecked Sendable {
             app: App(sensors: ["heading": sensors.heading, "pitch": sensors.pitch, "roll": sensors.roll],
                      correction: ["heading": correction.heading, "pitch": correction.pitch, "roll": correction.roll],
                      intrinsics: ["width": Double(k.width), "height": Double(k.height), "fx": k.fx, "fy": k.fy, "cx": k.cx, "cy": k.cy],
-                     measuredLens: measuredLens,
-                     match: ["accepted": outcome.accepted ? "yes" : "no", "reason": outcome.reason ?? "",
-                             "heading": String(format: "%+.3f", outcome.delta), "pitch": String(format: "%+.3f", outcome.pitchDelta),
-                             "roll": String(format: "%+.3f", outcome.rollDelta), "rms": String(format: "%.3f", outcome.rms)]))
+                     measuredLens: measuredLens, match: match))
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(file) else { return nil }

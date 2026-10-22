@@ -347,6 +347,11 @@ func report(_ m: SkylineMatcher.Match, truth: Attitude?) {
     print("Pitch correction \(signed(a.pitchCorrection))°, roll correction \(signed(a.rollCorrection))°")
     print("Fit: \(f(a.rms, 3))° RMS; \(Int(a.inlierFraction * 100))% of points match, \(Int(a.farFraction * 100))% " +
           "match and are far away; ambiguity \(f(a.ambiguity)), within 1.5° \(f(a.nearAmbiguity))")
+    for (label, rival) in [("Runner-up", a.runnerUp), ("Runner-up within 1.5°", a.nearRunnerUp)] {
+        guard let rival else { continue }
+        print("\(label): heading \(signed(rival.headingCorrection))°, pitch \(signed(rival.pitchCorrection))°, " +
+              "roll \(signed(rival.rollCorrection))° (\(f(rival.ratio)))")
+    }
     print(a.accepted ? "Accepted" : "Rejected: \(a.rejectionReason ?? "")")
     if let truth {
         let before = azimuthDifference(m.camera.attitude.heading, truth.heading)

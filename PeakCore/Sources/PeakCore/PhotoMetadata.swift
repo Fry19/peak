@@ -216,17 +216,31 @@ public struct PhotoCamera: Sendable, Equatable {
         var around = matcher
         around.usesSearchBand = false   // every column can hold the skyline
         around.settings.headingStep = 0.5
-        around.settings.rollRange = 1
+        around.settings.coarseRollRange = 1
         around.settings.refineFieldOfView = false
-        around.settings.rivalLimits = (matcher.settings.pitchRange, matcher.settings.rollRange)
         let found = around.match(image, intrinsics: k, prior: prior, horizon: horizon)
         var prior = self.prior
         prior.heading = found.alignment.attitude.heading
         prior.pitch = found.alignment.attitude.pitch
         matcher.settings.headingRange = 5
         var m = matcher.match(image, intrinsics: k, prior: prior, horizon: horizon)
+        // Corrections to the photo's own prior, as the first pass's (and its rivals') are.
+        let dh = azimuthDifference(prior.heading, self.prior.heading)
+        let dp = prior.pitch - self.prior.pitch, dr = prior.roll - self.prior.roll
+        func rebased(_ r: AlignmentResult.Rival?) -> AlignmentResult.Rival? {
+            r.map { AlignmentResult.Rival(headingCorrection: azimuthDifference($0.headingCorrection + dh, 0),
+                                          pitchCorrection: $0.pitchCorrection + dp, rollCorrection: $0.rollCorrection + dr,
+                                          ratio: $0.ratio) }
+        }
         m.alignment.headingCorrection = azimuthDifference(m.alignment.attitude.heading, self.prior.heading)
-        m.alignment.ambiguity = max(m.alignment.ambiguity, found.alignment.ambiguity)
+        m.alignment.pitchCorrection += dp
+        m.alignment.rollCorrection += dr
+        m.alignment.runnerUp = rebased(m.alignment.runnerUp)
+        m.alignment.nearRunnerUp = rebased(m.alignment.nearRunnerUp)
+        if found.alignment.ambiguity > m.alignment.ambiguity {
+            m.alignment.ambiguity = found.alignment.ambiguity
+            m.alignment.runnerUp = found.alignment.runnerUp
+        }
         m.seconds += found.seconds
         if m.alignment.accepted, found.alignment.ambiguity > matcher.settings.maxAmbiguity {
             m.alignment.accepted = false

@@ -61,6 +61,67 @@ final class AlignmentTests: XCTestCase {
         XCTAssertFalse(m.alignment.accepted)
     }
 
+    /// A view tilted further than the sensors could be off: the fit, and every rival it's
+    /// measured against, stays within the pitch and roll ranges.
+    func testPitchAndRollStayInRange() {
+        let renderer = HorizonRenderer(terrain: Self.terrain)
+        let observer = renderer.observer(latitude: 46.05, longitude: 7.95)
+        let world = horizon(from: observer, step: 0.05)
+        let truth = Attitude(heading: farHeading(world), pitch: 1, roll: 3)
+        var scene = SyntheticScene()
+        scene.hazeDistance = 200_000
+        let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth), scene: scene)
+        var prior = truth
+        prior.heading = normalizedAzimuth(truth.heading + 7)
+        prior.roll = 0
+        let s = AlignmentSettings()
+        let a = SkylineMatcher().match(photo, intrinsics: k, prior: prior, horizon: horizon(from: observer)).alignment
+        XCTAssertLessThanOrEqual(abs(a.pitchCorrection), s.pitchRange + 1e-9)
+        XCTAssertLessThanOrEqual(abs(a.rollCorrection), s.rollRange + 1e-9)
+        for rival in [a.runnerUp, a.nearRunnerUp].compactMap({ $0 }) {
+            XCTAssertLessThanOrEqual(abs(rival.pitchCorrection), s.pitchRange + 1e-9)
+            XCTAssertLessThanOrEqual(abs(rival.rollCorrection), s.rollRange + 1e-9)
+        }
+    }
+
+    /// A flat horizon fits every heading: the rejection names the fit that came closest.
+    func testAmbiguityReportsTheRunnerUp() throws {
+        let observer = GeoPoint(latitude: 46, longitude: 8, height: 450)
+        let world = horizon(from: observer, terrain: TestTerrain.cones([], base: 400))
+        let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: Attitude(heading: 75, pitch: 1)))
+        let a = SkylineMatcher().match(photo, intrinsics: k, prior: Attitude(heading: 81, pitch: 1), horizon: world).alignment
+        XCTAssertFalse(a.accepted)
+        let rival = try XCTUnwrap(a.runnerUp)
+        XCTAssertGreaterThan(abs(azimuthDifference(rival.headingCorrection, a.headingCorrection)), 1.5)
+        XCTAssertEqual(rival.ratio, a.ambiguity, accuracy: 1e-12)
+    }
+
+    /// A step that pushes a parameter past the edge it's at holds it there and solves for
+    /// the others without it.
+    func testBoundedStepHoldsAParameterAtItsEdge() {
+        let a = [[2.0, 1.0, 0.0], [1.0, 2.0, 0.0], [0.0, 0.0, 1.0]]
+        let g = [1.0, -4.0, 0.5]
+        let limits = [Double.infinity, 1.0, 1.0]
+        // Inside the range: the plain solution.
+        let free = SkylineAligner.boundedStep(a, g, q: [0, 0.2, 0], limits: limits)!
+        XCTAssertEqual(free[0], -2, accuracy: 1e-12)
+        XCTAssertEqual(free[1], 3, accuracy: 1e-12)
+        // At the edge the step pushes past: held, and the rest solved without it.
+        let held = SkylineAligner.boundedStep(a, g, q: [0, 1.0, 0], limits: limits)!
+        XCTAssertEqual(held[1], 0)
+        XCTAssertEqual(held[0], -0.5, accuracy: 1e-12)
+        XCTAssertEqual(held[2], -0.5, accuracy: 1e-12)
+        // At the opposite edge the step leads back inside, so it's free.
+        XCTAssertEqual(SkylineAligner.boundedStep(a, g, q: [0, -1.0, 0], limits: limits)![1], 3, accuracy: 1e-12)
+
+        // Both at their edges and both pushed out, but holding the one pushed hardest lets the
+        // other move back inside: it isn't held as well (that would stop the fit dead).
+        let coupled = [[1.0, 0, 0], [0, 8, -3.6], [0, -3.6, 8]]
+        let step = SkylineAligner.boundedStep(coupled, [0, 0.008, -8], q: [0, 1, 1], limits: limits)!
+        XCTAssertEqual(step[1], -0.001, accuracy: 1e-12)
+        XCTAssertEqual(step[2], 0)
+    }
+
     func testAnchorsGiveTheTrueAttitude() {
         let observer = GeoPoint(latitude: 46, longitude: 8, height: 2_000)
         let truth = Attitude(heading: 211, pitch: 3, roll: -2)
