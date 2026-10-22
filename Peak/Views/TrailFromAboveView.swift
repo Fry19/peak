@@ -1,5 +1,6 @@
 import PeakCore
 import SwiftUI
+import simd
 
 /// The trail seen from straight above, north up, over the terrain's ridgelines: a dark
 /// hillshade, the crests glowing faintly (main ridges brightest), the trail in orange, the
@@ -116,17 +117,18 @@ struct TrailFromAboveView: View {
             HStack(alignment: .center) {
                 ScaleBar(pointsPerMeter: viewport.pointsPerMeter(camera), units: model.settings.units)
                 Spacer(minLength: 8)
+                // The main thing to do here, so it's the one amber button.
                 Button {
                     walking = true
                 } label: {
                     Label("Walk in 3D", systemImage: "play.fill")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: 15, weight: .semibold))
                         .imageScale(.small)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 14)
-                        .frame(height: 36)
-                        .glassBackground(in: Capsule())
-                        .environment(\.colorScheme, .dark)
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 18)
+                        .frame(height: 44)
+                        .background(Color.amber, in: Capsule())
+                        .shadow(color: Color.amber.opacity(0.35), radius: 10)
                 }
                 .accessibilityLabel("Walk the trail in 3D")
                 Spacer(minLength: 8)
@@ -139,13 +141,18 @@ struct TrailFromAboveView: View {
                 if model.online || model.fromAboveSatellite {
                     satelliteButton
                 }
-                Text("N")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.85))
-                    .frame(width: 30, height: 30)
-                    .glassBackground(in: Circle())
-                    .environment(\.colorScheme, .dark)
-                    .accessibilityLabel("North is up")
+                // North is always up: a mark, not a button.
+                VStack(spacing: 0) {
+                    Image(systemName: "arrowtriangle.up.fill")
+                        .font(.system(size: 6))
+                    Text("N")
+                        .font(.system(size: 11, weight: .bold))
+                }
+                .foregroundStyle(.white.opacity(0.75))
+                .shadow(color: .black.opacity(0.7), radius: 2)
+                .frame(width: 22)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("North is up")
             }
             .animation(.easeInOut(duration: 0.2), value: camera == MapCamera())
             if imageryState == .failed, model.fromAboveSatellite {
@@ -177,7 +184,7 @@ struct TrailFromAboveView: View {
                         .controlSize(.mini)
                         .tint(.black)
                 } else {
-                    Image(systemName: "square.2.layers.3d")
+                    Image(systemName: "globe.europe.africa.fill")
                         .font(.system(size: 13, weight: .semibold))
                 }
             }
@@ -461,8 +468,9 @@ struct OverheadMap: @unchecked Sendable {
     }
 
     /// The area to fit on screen: the trail, plus the summit and you where they're close by.
-    /// One is taken in only if the trail still shows at least two thirds as large on a screen
-    /// `aspect` wide to 1 high; when one is farther, an arrow at the edge points to it instead,
+    /// One is taken in only if the trail still shows at least two fifths as large on a screen
+    /// `aspect` wide to 1 high, since where the hike leads and where you are matter as much as
+    /// its bends; when one is farther, an arrow at the edge points to it instead,
     /// so the trail isn't shrunk to a squiggle in a corner. A kilometer across at least: the
     /// terrain's 30 m grid gets soft beyond that.
     /// `arrowRoom` is how much of the screen's height an arrow along the top or bottom takes;
@@ -476,7 +484,7 @@ struct OverheadMap: @unchecked Sendable {
         let trailOnly = scale(frame)
         var left: [LatLon] = []
         for extra in extras {
-            if let wider = around(points + [extra]), scale(wider) >= trailOnly / 1.5 {
+            if let wider = around(points + [extra]), scale(wider) >= trailOnly / 2.5 {
                 points.append(extra)
                 frame = wider
             } else {
@@ -516,6 +524,28 @@ struct OverheadMap: @unchecked Sendable {
     }
 }
 
+extension OverheadMap {
+    /// Where the trail's lines begin and end, map meters.
+    var trailEnds: [SIMD2<Double>] {
+        var ends: [SIMD2<Double>] = []
+        var last: CGPoint?
+        trail.forEach { element in
+            switch element {
+            case let .move(to: p):
+                if let last { ends.append(SIMD2(last.x, last.y)) }
+                ends.append(SIMD2(p.x, p.y))
+                last = p
+            case let .line(to: p): last = p
+            case let .quadCurve(to: p, control: _): last = p
+            case let .curve(to: p, control1: _, control2: _): last = p
+            case .closeSubpath: break
+            }
+        }
+        if let last { ends.append(SIMD2(last.x, last.y)) }
+        return ends
+    }
+}
+
 /// The map for one camera. Animatable, so recentering and double-tap zooms glide.
 private struct MapLayer: View, Animatable {
     let map: OverheadMap
@@ -539,17 +569,6 @@ private struct MapLayer: View, Animatable {
     }
 
     private static let tint = Color(red: 0.86, green: 0.94, blue: 1.0)
-
-    /// With the summit and you both off the map the same way, your arrow moves in a row so
-    /// the two don't overlap.
-    private var youShift: CGFloat {
-        guard let summit = map.summit, let observer = you ?? map.observer else { return 0 }
-        let inner = viewport.inner
-        guard !inner.contains(viewport.screen(summit, camera)), !inner.contains(viewport.screen(observer, camera)) else { return 0 }
-        let a = EdgeArrow.anchor(viewport, camera, summit), b = EdgeArrow.anchor(viewport, camera, observer)
-        guard abs(a.x - b.x) < 150, abs(a.y - b.y) < 30 else { return 0 }
-        return b.y > inner.midY ? -32 : 32
-    }
 
     var body: some View {
         let t = viewport.transform(camera)
@@ -585,21 +604,30 @@ private struct MapLayer: View, Animatable {
                                    style: StrokeStyle(lineWidth: band.width, lineCap: .round, lineJoin: .round))
                 }
                 let trail = map.trail.applying(t)
-                if imagery.isEmpty {
-                    context.stroke(trail, with: .color(TrailFromAboveView.trailColor.opacity(0.32)),
-                                   style: StrokeStyle(lineWidth: 9, lineCap: .round, lineJoin: .round))
-                } else {
-                    // A dark edge holds the line apart from snow and pale rock.
-                    context.stroke(trail, with: .color(.black.opacity(0.55)),
-                                   style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
-                }
+                // A dark edge holds the line apart from the ground, snow and pale rock.
+                context.stroke(trail, with: .color(.black.opacity(imagery.isEmpty ? 0.6 : 0.55)),
+                               style: StrokeStyle(lineWidth: 5.5, lineCap: .round, lineJoin: .round))
                 context.stroke(trail, with: .color(TrailFromAboveView.trailColor),
-                               style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+                               style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+                // The far end: a small dot, unless the summit's marker is there already.
+                if let end = trailEnd {
+                    let p = viewport.screen(end, camera)
+                    let dot = Path(ellipseIn: CGRect(x: p.x - 4.5, y: p.y - 4.5, width: 9, height: 9))
+                    context.fill(dot, with: .color(TrailFromAboveView.trailColor))
+                    context.stroke(dot, with: .color(.black.opacity(0.6)), lineWidth: 1.5)
+                }
+                // The start: a ring, named.
                 if let start = trailhead {
                     let p = viewport.screen(start, camera)
-                    let ring = Path(ellipseIn: CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10))
+                    let ring = Path(ellipseIn: CGRect(x: p.x - 6, y: p.y - 6, width: 12, height: 12))
                     context.fill(ring, with: .color(TrailFromAboveView.background))
-                    context.stroke(ring, with: .color(TrailFromAboveView.trailColor), lineWidth: 2)
+                    context.stroke(ring, with: .color(TrailFromAboveView.trailColor), lineWidth: 2.5)
+                    let label = context.resolve(Text("Start").font(.system(size: 11, weight: .semibold)).foregroundStyle(.white))
+                    let size = label.measure(in: CGSize(width: 200, height: 40))
+                    let below = CGPoint(x: p.x, y: p.y + 10 + size.height / 2)
+                    var shadow = context
+                    shadow.addFilter(.shadow(color: .black.opacity(0.9), radius: 2))
+                    shadow.draw(label, at: below)
                 }
             }
             .allowsHitTesting(false)
@@ -609,15 +637,39 @@ private struct MapLayer: View, Animatable {
                     // The name goes beside the dot on the side with more room.
                     SummitMarker(peak: peak, units: units, leftward: p.x > viewport.size.width * 0.6, action: onSummit)
                         .position(p)
-                } else {
-                    EdgeArrow(viewport: viewport, camera: camera, at: summit, title: peak.name, color: .white, units: units)
-                        .onTapGesture(perform: onSummit)
                 }
             }
-            if let observer = you ?? map.observer {
-                You(viewport: viewport, camera: camera, at: observer, units: units, shift: youShift)
+            if let observer = you ?? map.observer, viewport.inner.contains(viewport.screen(observer, camera)) {
+                You(viewport: viewport, camera: camera, at: observer)
             }
+            EdgeArrows(viewport: viewport, camera: camera, units: units, items: offMap)
         }
+    }
+
+    /// The summit and you, where they're off the map.
+    private var offMap: [EdgeArrows.Item] {
+        var items: [EdgeArrows.Item] = []
+        if let summit = map.summit, let peak = map.peak, !viewport.inner.contains(viewport.screen(summit, camera)) {
+            items.append(EdgeArrows.Item(title: peak.name, color: .white, at: summit, action: onSummit))
+        }
+        if let observer = you ?? map.observer, !viewport.inner.contains(viewport.screen(observer, camera)) {
+            items.append(EdgeArrows.Item(title: "You", color: Color(red: 0.45, green: 0.72, blue: 1), at: observer, action: nil))
+        }
+        return items
+    }
+
+    /// The trail's far end from where it starts, unless the summit is drawn right there. A
+    /// trail comes in pieces; where two meet isn't an end, so only loose ends count.
+    private var trailEnd: SIMD2<Double>? {
+        let ends = map.trailEnds
+        let loose = ends.indices.filter { i in
+            !ends.indices.contains { j in j != i && simd_distance(ends[i], ends[j]) < 25 }
+        }.map { ends[$0] }
+        guard let start = trailhead ?? loose.first else { return nil }
+        let far = loose.max { simd_distance($0, start) < simd_distance($1, start) }
+        guard let far, simd_distance(far, start) > 50 else { return nil }
+        if let summit = map.summit, simd_distance(far, summit) < 150 { return nil }
+        return far
     }
 }
 
@@ -656,47 +708,42 @@ private struct SummitMarker: View {
     }
 }
 
-/// You: a dot where you are, or an arrow at the edge pointing your way with how far.
+/// You: a dot where you are. Off the map, `EdgeArrows` points your way instead.
 private struct You: View {
     let viewport: Viewport
     let camera: MapCamera
     let at: SIMD2<Double>
-    let units: AppSettings.Units
-    var shift: CGFloat = 0
 
     var body: some View {
-        let p = viewport.screen(at, camera)
-        let inner = viewport.inner
-        if inner.contains(p) {
-            ZStack {
-                Circle().fill(Color(red: 0.35, green: 0.65, blue: 1).opacity(0.22)).frame(width: 26, height: 26)
-                Circle().fill(.white).frame(width: 13, height: 13)
-                Circle().fill(Color(red: 0.25, green: 0.58, blue: 1)).frame(width: 9, height: 9)
-            }
-            .position(p)
-            .accessibilityLabel("You are here")
-        } else {
-            EdgeArrow(viewport: viewport, camera: camera, at: at, title: "You", color: Color(red: 0.45, green: 0.72, blue: 1), units: units,
-                      shift: shift)
+        ZStack {
+            Circle().fill(Color(red: 0.35, green: 0.65, blue: 1).opacity(0.22)).frame(width: 26, height: 26)
+            Circle().fill(.white).frame(width: 13, height: 13)
+            Circle().fill(Color(red: 0.25, green: 0.58, blue: 1)).frame(width: 9, height: 9)
         }
+        .position(viewport.screen(at, camera))
+        .accessibilityLabel("You are here")
     }
 }
 
-/// Something off the map: an arrow pointing its way, with its name and how far. It sits along
-/// the top or bottom edge, where the map leaves room for it (`OverheadMap.frame`), rather
-/// than on a side, where it would cover the trail.
-private struct EdgeArrow: View {
+/// What's off the map: for each, an arrow pointing its way with its name and how far. They
+/// sit along the top or bottom edge, where the map leaves room for them (`OverheadMap.frame`),
+/// rather than on a side, where they would cover the trail; two near each other on one edge
+/// sit side by side in a row.
+private struct EdgeArrows: View {
+    struct Item {
+        var title: String
+        var color: Color
+        var at: SIMD2<Double>
+        var action: (() -> Void)?
+    }
+
     let viewport: Viewport
     let camera: MapCamera
-    let at: SIMD2<Double>
-    let title: String
-    let color: Color
     let units: AppSettings.Units
-    /// Moved this far down (up when negative), to keep clear of another arrow.
-    var shift: CGFloat = 0
+    let items: [Item]
 
-    /// Where the line from the middle toward it meets the top or bottom edge, kept clear of
-    /// the corners.
+    /// Where the line from the middle toward a point meets the top or bottom edge, kept clear
+    /// of the corners.
     static func anchor(_ viewport: Viewport, _ camera: MapCamera, _ at: SIMD2<Double>) -> CGPoint {
         let p = viewport.screen(at, camera)
         let inner = viewport.inner
@@ -708,19 +755,43 @@ private struct EdgeArrow: View {
     }
 
     var body: some View {
-        let p = viewport.screen(at, camera)
+        let placed = items.map { (item: $0, spot: Self.anchor(viewport, camera, $0.at)) }.sorted { $0.spot.x < $1.spot.x }
+        let midY = viewport.inner.midY
+        ZStack {
+            row(placed.filter { $0.spot.y < midY })
+            row(placed.filter { $0.spot.y >= midY })
+        }
+    }
+
+    @ViewBuilder private func row(_ placed: [(item: Item, spot: CGPoint)]) -> some View {
+        if let first = placed.first, let last = placed.last, placed.count > 1, last.spot.x - first.spot.x < 220 {
+            // Close together: one row, centered where they point, kept on screen.
+            let inner = viewport.inner
+            let x = min(max(placed.map(\.spot.x).reduce(0, +) / CGFloat(placed.count), inner.minX + 120), inner.maxX - 120)
+            HStack(spacing: 8) {
+                ForEach(Array(placed.enumerated()), id: \.offset) { _, entry in pill(entry.item) }
+            }
+            .fixedSize()
+            .position(x: x, y: first.spot.y)
+        } else {
+            ForEach(Array(placed.enumerated()), id: \.offset) { _, entry in
+                pill(entry.item).position(entry.spot)
+            }
+        }
+    }
+
+    private func pill(_ item: Item) -> some View {
+        let p = viewport.screen(item.at, camera)
         let inner = viewport.inner
         let c = CGPoint(x: inner.midX, y: inner.midY)
-        let dx = p.x - c.x, dy = p.y - c.y
-        let spot = Self.anchor(viewport, camera, at)
         let center = viewport.mapPoint(c, camera)
-        let distance = ((at - center) * (at - center)).sum().squareRoot()
-        HStack(spacing: 4) {
+        let distance = ((item.at - center) * (item.at - center)).sum().squareRoot()
+        return HStack(spacing: 4) {
             Image(systemName: "location.north.fill")
                 .font(.system(size: 10, weight: .bold))
-                .rotationEffect(.radians(atan2(dx, -dy)))
-                .foregroundStyle(color)
-            Text("\(title) · \(Format.distance(distance, units))")
+                .rotationEffect(.radians(atan2(p.x - c.x, c.y - p.y)))
+                .foregroundStyle(item.color)
+            Text("\(item.title) · \(Format.distance(distance, units))")
                 .font(.system(size: 11, weight: .medium))
                 .monospacedDigit()
                 .lineLimit(1)
@@ -731,8 +802,9 @@ private struct EdgeArrow: View {
         .glassBackground(in: Capsule())
         .environment(\.colorScheme, .dark)
         .fixedSize()
-        .position(x: spot.x, y: spot.y + shift)
-        .accessibilityLabel("\(title), \(Format.distance(distance, units)) away, off the map")
+        .contentShape(Capsule())
+        .onTapGesture { item.action?() }
+        .accessibilityLabel("\(item.title), \(Format.distance(distance, units)) away, off the map")
     }
 }
 
@@ -805,10 +877,11 @@ private struct FromAboveChip: View {
             Button {
                 model.showsFromAbove = false
             } label: {
-                Image(systemName: "camera.viewfinder")
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(width: 28, height: 28)
-                    .background(.white.opacity(0.15), in: Circle())
+                Label("Camera", systemImage: "camera.viewfinder")
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 10)
+                    .frame(height: 28)
+                    .background(.white.opacity(0.15), in: Capsule())
                     .tapArea()
             }
             .accessibilityLabel("Back to the camera")
