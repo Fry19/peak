@@ -10,22 +10,30 @@ struct MapImagery: @unchecked Sendable {
     /// Where the picture's edges lie on the map, meters east and north of `center`.
     let rect: CGRect
     let center: LatLon
+    /// Whether it's Apple's aerial photos rather than its coarser, greener mosaic: whether a
+    /// point of the snapshot covered no more ground than `aerialMetersPerPoint`. Kept when its
+    /// colors are matched to the photos'.
+    let aerial: Bool
 
     enum Failure: Error {
         case noImage
     }
 
-    /// The imagery for `rect` (map meters around `projection`'s center), `width` pixels across,
-    /// drawn `scale` pixels a point. Apple picks which of its mosaics to draw by how much ground
-    /// a point covers (`aerialMetersPerPoint`): at 1, a picture as coarse as its aerial photos
-    /// allow still shows them, where at 2 it would be the coarser mosaic.
-    @MainActor static func load(projection: MapProjection, rect: CGRect, width: Int, scale: Double = 2) async throws -> MapImagery {
+    /// The imagery for `rect` (map meters around `projection`'s center), `width` pixels across.
+    /// Apple picks which of its mosaics to draw by how much ground a point of the snapshot
+    /// covers (`aerialMetersPerPoint`), so it's drawn two pixels a point unless one a point
+    /// keeps it to the aerial photos, where two wouldn't: the same pixels either way.
+    @MainActor static func load(projection: MapProjection, rect: CGRect, width: Int) async throws -> MapImagery {
         let northWest = projection.latLon(SIMD2(rect.minX, rect.maxY))
         let southEast = projection.latLon(SIMD2(rect.maxX, rect.minY))
         let a = MKMapPoint(CLLocationCoordinate2D(latitude: northWest.latitude, longitude: northWest.longitude))
         let b = MKMapPoint(CLLocationCoordinate2D(latitude: southEast.latitude, longitude: southEast.longitude))
         let mapRect = MKMapRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y)
 
+        let limit = aerialMetersPerPoint(at: projection.latLon(SIMD2(rect.midX, rect.midY)).latitude)
+        let metersPerPixel = rect.width / Double(width)
+        let scale = 2 * metersPerPixel > limit ? 1.0 : 2.0
+        let aerial = scale * metersPerPixel <= limit
         let options = MKMapSnapshotter.Options()
         options.mapRect = mapRect
         options.size = CGSize(width: Double(width) / scale, height: Double(width) / scale * mapRect.height / mapRect.width)
@@ -56,7 +64,7 @@ struct MapImagery: @unchecked Sendable {
             return (y, onSnapshot(projection.latLon(SIMD2(rect.midX, y))).y)
         }
         let imagery = try await Task.detached(priority: .userInitiated) {
-            try reproject(source, rect: rect, center: projection.center, width: width, left: left, right: right, edges: edges)
+            try reproject(source, rect: rect, center: projection.center, aerial: aerial, width: width, left: left, right: right, edges: edges)
         }.value
         try Task.checkCancellation()
         return imagery
@@ -65,7 +73,7 @@ struct MapImagery: @unchecked Sendable {
     /// Apple's imagery is Web Mercator, stretched north–south away from the equator; the map
     /// is spaced evenly by latitude. Drawn in strips a few kilometers high, each stretched to
     /// fit, the two agree to well under a meter.
-    private static func reproject(_ source: CGImage, rect: CGRect, center: LatLon, width: Int, left: Double, right: Double,
+    private static func reproject(_ source: CGImage, rect: CGRect, center: LatLon, aerial: Bool, width: Int, left: Double, right: Double,
                                   edges: [(map: Double, snapshot: Double)]) throws -> MapImagery {
         let height = max(1, Int((Double(width) * rect.height / rect.width).rounded()))
         guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
@@ -90,7 +98,7 @@ struct MapImagery: @unchecked Sendable {
             context.restoreGState()
         }
         guard let image = context.makeImage() else { throw Failure.noImage }
-        return MapImagery(image: image, rect: rect, center: center)
+        return MapImagery(image: image, rect: rect, center: center, aerial: aerial)
     }
 
     // MARK: Apple's mosaics
@@ -105,22 +113,22 @@ struct MapImagery: @unchecked Sendable {
 
     /// These colors brought to `reference`'s where the two overlap, channel by channel, to the
     /// same mean and nearly the same spread: coarse imagery is Apple's greener mosaic, and
-    /// beside its aerial photos it reads as ground half loaded. The reference is drawn at this
-    /// picture's coarseness first, so its finer detail doesn't count as contrast; the spread
+    /// beside its aerial photos it reads as ground half loaded. Both are compared drawn at the
+    /// coarser one's pixels, so the finer one's detail doesn't count as contrast; the spread
     /// changes by at most a third either way. Unchanged without enough overlap or variation.
     func matched(to reference: MapImagery) -> MapImagery {
         guard reference.center == center else { return self }
         let overlap = rect.intersection(reference.rect)
-        let perMeter = Double(image.width) / rect.width
+        let perMeter = min(Double(image.width) / rect.width, Double(reference.image.width) / reference.rect.width)
         let cols = Int(overlap.width * perMeter), rows = Int(overlap.height * perMeter)
-        guard !overlap.isNull, cols >= 16, rows >= 16, var mine = Bitmap(image),
+        guard !overlap.isNull, cols >= 16, rows >= 16,
+              let mine = Bitmap(image, width: cols, height: rows, placing: rect, over: overlap),
               let theirs = Bitmap(reference.image, width: cols, height: rows, placing: reference.rect, over: overlap) else { return self }
         var a = [[Double]](repeating: [], count: 3), b = [[Double]](repeating: [], count: 3)
         let step = max(1, max(cols, rows) / 64)
         for row in stride(from: 0, to: rows, by: step) {
             for col in stride(from: 0, to: cols, by: step) {
-                let p = SIMD2(overlap.minX + (Double(col) + 0.5) / perMeter, overlap.maxY - (Double(row) + 0.5) / perMeter)
-                guard let here = mine.pixel(at: p, in: rect),
+                guard let here = mine.pixel(col: col, row: row),
                       let there = theirs.pixel(col: col, row: row) else { continue }
                 for c in 0..<3 {
                     a[c].append(here[c])
@@ -139,9 +147,10 @@ struct MapImagery: @unchecked Sendable {
             let gain = from.spread > 2 ? min(1.33, max(0.75, to.spread / from.spread)) : 1
             lut[c] = (0..<256).map { UInt8(max(0, min(255, (Double($0) - from.mean) * gain + to.mean)).rounded()) }
         }
-        mine.apply(lut)
-        guard let image = mine.image() else { return self }
-        return MapImagery(image: image, rect: rect, center: center)
+        guard var whole = Bitmap(image) else { return self }
+        whole.apply(lut)
+        guard let image = whole.image() else { return self }
+        return MapImagery(image: image, rect: rect, center: center, aerial: aerial)
     }
 
     /// A picture's pixels, RGBA, row 0 at the north edge.
@@ -182,13 +191,6 @@ struct MapImagery: @unchecked Sendable {
             // Transparent snapshot/reprojection edges aren't terrain colors.
             guard data[i + 3] == 255 else { return nil }
             return SIMD3(Double(data[i]), Double(data[i + 1]), Double(data[i + 2]))
-        }
-
-        func pixel(at p: SIMD2<Double>, in rect: CGRect) -> SIMD3<Double>? {
-            let col = Int((p.x - rect.minX) / rect.width * Double(width))
-            let row = Int((rect.maxY - p.y) / rect.height * Double(height))
-            guard col >= 0, row >= 0, col < width, row < height else { return nil }
-            return pixel(col: col, row: row)
         }
 
         mutating func apply(_ lut: [[UInt8]]) {
