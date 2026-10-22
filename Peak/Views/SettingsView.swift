@@ -17,6 +17,7 @@ struct SettingsView: View {
             } footer: {
                 Text("Pick a mountain photo with its location saved, and Peak names the peaks in it.")
             }
+            .sheetSection()
 
             Section("Display") {
                 Picker("Units", selection: $model.settings.units) {
@@ -29,6 +30,7 @@ struct SettingsView: View {
                 Toggle("Tick when a peak crosses the middle", isOn: $model.settings.haptics)
                 Toggle("Today's sun path", isOn: $model.settings.showSunPath)
             }
+            .sheetSection()
 
             Section {
                 NavigationLink {
@@ -50,12 +52,14 @@ struct SettingsView: View {
             } footer: {
                 Text("Peak keeps the terrain, peaks and hikes it downloads, so places you've been work without a signal. Going somewhere without one? Save it in Offline areas before you go.")
             }
+            .sheetSection()
 
             Section {
                 Toggle("Show diagnostics", isOn: $model.settings.showDiagnostics)
             } footer: {
                 Text("Long-press the status pill to show or hide them. A screenshot of them helps when the lines don't line up.")
             }
+            .sheetSection()
 
             Section("About") {
                 LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
@@ -64,6 +68,7 @@ struct SettingsView: View {
                 Text("Facts: Wikidata (CC0) and Wikipedia (CC BY-SA).")
                 Link("Source code", destination: URL(string: "https://github.com/Fry19/peak")!)
             }
+            .sheetSection()
             .font(.footnote)
         }
         .scrollContentBackground(.hidden)

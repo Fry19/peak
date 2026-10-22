@@ -121,6 +121,7 @@ struct HikeDaylightSection: View {
             } footer: {
                 Text("Walking times by DIN 33466 (4 km/h on the level, 300 m/h up, 500 m/h down), up to the highest point and back the same way, without breaks. Sun times over the terrain model.")
             }
+            .sheetSection()
         }
     }
 

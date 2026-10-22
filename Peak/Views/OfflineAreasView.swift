@@ -19,6 +19,7 @@ struct OfflineAreasView: View {
             } footer: {
                 Text("Pick a place on the map before you go. Peak downloads its terrain, the peaks you can see from it and their hikes, so the view, peak details and hikes all work there without a signal.")
             }
+            .sheetSection()
 
             if !model.areas.isEmpty {
                 Section("Saved") {
@@ -29,6 +30,7 @@ struct OfflineAreasView: View {
                             }
                     }
                 }
+                .sheetSection()
             }
         }
         .scrollContentBackground(.hidden)
@@ -223,7 +225,7 @@ struct SaveAreaView: View {
             .controlSize(.large)
         }
         .padding()
-        .background(.regularMaterial)
+        .background(.sheetBackground)
         .onChange(of: radius) {
             // Keep the whole circle in view.
             let span = radius * 2.8

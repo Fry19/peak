@@ -29,7 +29,7 @@ struct TrailFromAboveView: View {
         case idle, loading, failed
     }
 
-    static let background = Color(red: 0.035, green: 0.043, blue: 0.058)
+    static let background = Color.sheetBackground
     static let trailColor = Color(red: 1, green: 0.72, blue: 0.28)
 
     var body: some View {

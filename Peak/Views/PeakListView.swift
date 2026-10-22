@@ -29,11 +29,13 @@ struct PeakListView: View {
                 Section("In view") {
                     ForEach(visible.prefix(200), id: \.peak.id) { row($0, units) }
                 }
+                .sheetSection()
             }
             if !hidden.isEmpty {
                 Section("Hidden behind nearer terrain") {
                     ForEach(hidden.prefix(200), id: \.peak.id) { row($0, units) }
                 }
+                .sheetSection()
             }
         }
         .listStyle(.insetGrouped)

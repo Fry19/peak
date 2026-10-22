@@ -74,6 +74,7 @@ struct TrailLiveSection: View {
             } header: {
                 Text("On the trail")
             }
+            .sheetSection()
         }
     }
 

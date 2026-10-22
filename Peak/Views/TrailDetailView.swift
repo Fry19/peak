@@ -57,6 +57,7 @@ struct TrailDetailView: View {
                         .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 }
             }
+            .sheetSection()
 
             if place == nil { TrailLiveSection(model: model, hike: hike) }
 
@@ -65,6 +66,7 @@ struct TrailDetailView: View {
                     ProfileChart(profile: profile, units: units)
                         .frame(height: 160)
                 }
+                .sheetSection()
             }
 
             HikeDaylightSection(model: model, hike: hike)
@@ -79,6 +81,7 @@ struct TrailDetailView: View {
                         }
                     }
                 }
+                .sheetSection()
             }
 
             Section {
@@ -98,6 +101,7 @@ struct TrailDetailView: View {
                     Link(destination: site) { Label("Website", systemImage: "safari") }
                 }
             }
+            .sheetSection()
 
             if trail.note != nil || trail.from != nil || trail.operatorName != nil {
                 Section("Details") {
@@ -105,6 +109,7 @@ struct TrailDetailView: View {
                     if let op = trail.operatorName { LabeledContent("Maintained by", value: op) }
                     if let note = trail.note { Text(note).font(.callout) }
                 }
+                .sheetSection()
             }
 
             Section {
@@ -114,6 +119,7 @@ struct TrailDetailView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
+            .sheetSection()
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)

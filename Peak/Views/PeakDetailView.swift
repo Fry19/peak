@@ -65,7 +65,7 @@ struct PeakDetailView: View {
                         case .failure:
                             EmptyView()
                         default:
-                            RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground))
+                            RoundedRectangle(cornerRadius: 14).fill(Color.sheetSurface)
                                 .frame(height: 180)
                         }
                     }
@@ -91,10 +91,12 @@ struct PeakDetailView: View {
                 .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             }
+            .sheetSection()
 
             Section {
                 PeakSunRow(model: model, peak: peak)
             }
+            .sheetSection()
 
             if let summary = facts?.summary {
                 Section("About") {
@@ -106,6 +108,7 @@ struct PeakDetailView: View {
                         }
                     }
                 }
+                .sheetSection()
             }
 
             Section {
@@ -115,12 +118,14 @@ struct PeakDetailView: View {
             } footer: {
                 Text("Trails from OpenStreetMap within \(Format.distance(DataStore.hikeRadius, units)) of the summit. Climbs and lengths come from the terrain model; check conditions before you go.")
             }
+            .sheetSection()
 
             Section {
                 Text("Elevation from OpenStreetMap. Facts from Wikidata (CC0) and Wikipedia (CC BY-SA).")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
+            .sheetSection()
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
@@ -284,7 +289,7 @@ struct StatGrid: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(10)
-                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
+                .background(Color.sheetSurface, in: RoundedRectangle(cornerRadius: 12))
             }
         }
     }

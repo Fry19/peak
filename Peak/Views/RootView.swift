@@ -189,10 +189,21 @@ struct TrailLink: Hashable {
 }
 
 extension ShapeStyle where Self == Color {
-    /// Behind every sheet and the pages pushed in it: near black, so the gray rows and tiles
-    /// stand out. A material turns light gray over a bright sky or snow, and the rows sink
-    /// into it; pages pushed in a sheet would otherwise get a gray of their own.
-    static var sheetBackground: Color { Color(white: 0.07) }
+    /// Behind every sheet and the pages pushed in it: the cool blue-black of the views from
+    /// above and the 3D walk, so the whole app is one night-sky palette. Opaque: a material
+    /// turns light gray over a bright sky or snow, and the rows sink into it.
+    static var sheetBackground: Color { Color(red: 0.035, green: 0.043, blue: 0.058) }
+    /// Rows and tiles on a sheet: the same blue, a step lighter, in place of the system's
+    /// neutral gray.
+    static var sheetSurface: Color { Color(red: 0.085, green: 0.1, blue: 0.125) }
+}
+
+extension View {
+    /// A sheet's list section, its rows in the app's slate instead of the system gray. Rows
+    /// that set their own background keep it.
+    func sheetSection() -> some View {
+        listRowBackground(Color.sheetSurface)
+    }
 }
 
 /// A round glass button for the bottom bar.

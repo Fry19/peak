@@ -50,7 +50,7 @@ struct PhotoView: View {
                     .navigationDestination(for: TrailLink.self) { TrailDetailView(model: model, link: $0, place: photo.scene) }
             }
             .presentationDetents([.medium, .large])
-            .presentationBackground(.regularMaterial)
+            .presentationBackground(.sheetBackground)
         }
     }
 
