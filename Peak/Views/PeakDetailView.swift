@@ -129,6 +129,7 @@ struct PeakDetailView: View {
 
     private func subtitle(_ view: TerrainScene.PeakView?) -> String {
         guard let view else { return "Peak" }
+        if view.isUncertain { return "May be in view: the terrain here is coarse" }
         return view.isVisible ? "In view from here" : "Hidden behind nearer terrain"
     }
 

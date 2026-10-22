@@ -25,3 +25,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Worldwide base layer (built by Tools/build_base_layer.py)
+Peak/Resources/World.pkbase

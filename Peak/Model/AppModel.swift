@@ -143,7 +143,8 @@ final class AppModel {
     /// Precise Location is on, or allowed for now.
     private(set) var preciseLocation = true
     var status: AppStatus {
-        AppStatus.resolve(camera: cameraState, location: locationPermission, preciseLocation: preciseLocation, load: loadState)
+        AppStatus.resolve(camera: cameraState, location: locationPermission, preciseLocation: preciseLocation, load: loadState,
+                          coarseTerrain: scene?.isCoarse ?? false)
     }
     private(set) var peaksState: PeaksState = .loading
     var scene: TerrainScene?
@@ -198,6 +199,10 @@ final class AppModel {
     let motion = MotionTracker()
     @ObservationIgnored weak var screen: CameraScreenView?
     let store = DataStore()
+    /// Coarse terrain and every named peak for the whole world, bundled, so the view works
+    /// on first launch anywhere without a signal (`BaseLayer`). Nil if the build left it out.
+    let baseLayer: BaseLayer? = Bundle.main.url(forResource: "World", withExtension: "pkbase")
+        .flatMap { try? BaseLayer(contentsOf: $0) }
     let sun = SunService()
     private let corrector = SkylineCorrector()
     private let mailbox = FrameMailbox()
@@ -751,13 +756,27 @@ final class AppModel {
                 center = location ?? start
                 await rebuild()
                 guard !superseded else { return }
-            } else if scene != nil {
+            } else if scene != nil, !keepsCoarseScene(at: LatLon(lat, lon)) {
+                // (The base layer's view of this very spot, from a try that failed, stays.)
                 center = nil
                 scene = nil
                 sceneAccuracy = .infinity
                 updateCorrector()
             }
             if scene == nil { loadState = .loading("Getting terrain…") }
+            // No terrain here on the phone and none coming soon (no signal, or a slow one):
+            // draw the view from the bundled base layer meanwhile; tiles replace it as they come.
+            if tiles[here] == nil, baseLayer != nil {
+                let cached = await store.cachedLevel(here) != nil
+                let wait: Double = cached ? 4 : online ? 3 : 0
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(wait))
+                    guard generation == self.loadGeneration, self.tiles[here] == nil, self.scene == nil else { return }
+                    self.center = self.location ?? start
+                    await self.rebuild()
+                    if self.scene != nil, generation == self.loadGeneration { self.loadState = .ready }
+                }
+            }
             var done = 0
             await withTaskGroup(of: (DataStore.Key, ElevationTile?).self) { group in
                 for key in keys {
@@ -852,6 +871,11 @@ final class AppModel {
         peaksPlace = (lat, lon, generation)
         peaksState = .loading
         let store = self.store
+        // No peaks yet and none coming soon: the bundled ones meanwhile.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(online ? 4 : 0))
+            useBasePeaks(lat, lon, generation: generation)
+        }
         peaksTask = Task { @MainActor in
             var wait = 10.0
             while !Task.isCancelled {
@@ -867,6 +891,7 @@ final class AppModel {
                     return
                 } catch {
                     guard generation == loadGeneration, !Task.isCancelled else { return }
+                    useBasePeaks(lat, lon, generation: generation)
                     peaksState = .retrying(at: Date().addingTimeInterval(wait), reason: error.localizedDescription)
                     try? await Task.sleep(for: .seconds(wait))
                     guard generation == loadGeneration, !Task.isCancelled else { return }
@@ -875,6 +900,20 @@ final class AppModel {
                 }
             }
         }
+    }
+
+    /// The view is the base layer's, of about this spot: drawn when a try at the terrain
+    /// here failed, and kept for the next.
+    private func keepsCoarseScene(at point: LatLon) -> Bool {
+        guard let scene, scene.isCoarse else { return false }
+        return scene.position.distance(to: point) < Self.reloadDistance
+    }
+
+    /// The bundled base layer's peaks around a point, while this load has none of its own.
+    private func useBasePeaks(_ lat: Double, _ lon: Double, generation: Int) {
+        guard let baseLayer, generation == loadGeneration, peaks.isEmpty, peaksState != .loaded else { return }
+        peaks = baseLayer.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
+        if scene != nil { Task { @MainActor in await rebuild() } }
     }
 
     /// Tries again for terrain that failed after a wait that grows each time.
@@ -1163,14 +1202,21 @@ final class AppModel {
         repeat {
             rebuildAgain = false
             guard let center else { break }
-            let terrain = Terrain(tiles: Array(tiles.values), detail: detail.values.flatMap { $0.values }, missingIsSea: false)
-            let peaks = self.peaks
             let lat = center.coordinate.latitude, lon = center.coordinate.longitude
+            let detailTiles = detail.values.flatMap { $0.values }
+            // The base layer wherever no tile is in (yet), else nothing there.
+            let terrain = baseLayer.map {
+                Terrain(tiles: Array(tiles.values), detail: detailTiles, base: $0, latitude: lat, longitude: lon,
+                        radius: TerrainScene.radius + 10_000)
+            } ?? Terrain(tiles: Array(tiles.values), detail: detailTiles, missingIsSea: false)
+            let peaks = self.peaks
             let accuracy = center.horizontalAccuracy
+            // Only used on coarse ground, where it beats kilometers of averaged terrain.
+            let altitude = center.verticalAccuracy > 0 && center.verticalAccuracy < 50 ? center.altitude : nil
             let started = Date()
             // Below the interface's priority, so building never makes the screen stutter.
             let built = await Task.detached(priority: .utility) {
-                TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, accuracy: accuracy, peaks: peaks)
+                TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, accuracy: accuracy, altitude: altitude, peaks: peaks)
             }.value
             lastBuildSeconds = Date().timeIntervalSince(started)
             // Moved far on while building, or somewhere the terrain isn't in yet: not from the old spot.

@@ -20,6 +20,9 @@ public final class ElevationTile: @unchecked Sendable {
     public let stepLatitude: Double
     public let stepLongitude: Double
     let heights: UnsafeMutableBufferPointer<Int16>
+    /// From the worldwide base layer (`BaseLayer`): kilometers between pixels, so good for
+    /// far skylines but not for what's near.
+    public internal(set) var isCoarse = false
 
     public convenience init(south: Int, west: Int, rows: Int, cols: Int,
                             originLatitude: Double, originLongitude: Double,
@@ -212,6 +215,8 @@ public final class Terrain: @unchecked Sendable {
     /// Patches of each cell, finest first: `patches[patchStart[cell]..<patchStart[cell + 1]]`.
     let patches: [ElevationTile]
     let patchStart: [Int]
+    /// Some of the terrain is the base layer's coarse tiles.
+    public let hasCoarse: Bool
 
     /// `detail` patches are used wherever they have data, finest first; elsewhere, and
     /// within a pixel of their edges, the 1° `tiles` are.
@@ -237,6 +242,7 @@ public final class Terrain: @unchecked Sendable {
         }
         self.patches = patches
         patchStart = start
+        hasCoarse = tiles.contains(where: \.isCoarse)
     }
 
     /// Loads every .pkdem file in a directory.
@@ -443,6 +449,12 @@ extension Terrain {
         return grid[cell]
     }
 
+    /// Whether the terrain at a point is the base layer's coarse terrain (no finer tile or
+    /// patch has data there).
+    public func isCoarse(latitude: Double, longitude: Double) -> Bool {
+        hasCoarse && finestTile(latitude: latitude, longitude: longitude)?.isCoarse == true
+    }
+
     /// Peaks with `estimatedElevation` get the terrain's highest point within `radius`
     /// meters of them; those outside the terrain are left out. Others pass through.
     public func fillElevations(_ peaks: [Peak], radius: Double = 60) -> [Peak] {
@@ -474,7 +486,8 @@ extension Terrain {
     public func raiseSummits(_ peaks: [Peak], radius: Double = 250, minDeficit: Double = 8, maxDeficit: Double = 300) -> Int {
         var raised = 0
         for peak in peaks where !peak.estimatedElevation {
-            guard let tile = finestTile(latitude: peak.latitude, longitude: peak.longitude) else { continue }
+            // Coarse pixels are kilometers wide: a summit's tip on one would be a broad dome.
+            guard let tile = finestTile(latitude: peak.latitude, longitude: peak.longitude), !tile.isCoarse else { continue }
             let metersPerLat = 111_320.0, metersPerLon = 111_320 * cos(peak.latitude * .pi / 180)
             let pixel = max(tile.stepLatitude * metersPerLat, tile.stepLongitude * metersPerLon)
             let y = (tile.originLatitude - peak.latitude) / tile.stepLatitude

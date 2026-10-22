@@ -47,6 +47,13 @@ public struct VisiblePeak: Sendable, Identifiable {
     /// Distance along the ground (horizontal, as on a map), meters.
     public var distance: Double
     public var id: Int64 { peak.id }
+
+    public init(peak: Peak, azimuth: Double, elevation: Double, distance: Double) {
+        self.peak = peak
+        self.azimuth = azimuth
+        self.elevation = elevation
+        self.distance = distance
+    }
 }
 
 extension HorizonRenderer {

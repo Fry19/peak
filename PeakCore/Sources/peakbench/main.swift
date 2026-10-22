@@ -68,6 +68,9 @@ peakbench: desk test harness for skyline matching.
       When the sun comes into and goes out of sight over the real terrain, against the
       flat-horizon almanac, and with --peak-*, when it reaches and leaves that summit.
 
+  peakbench base --base FILE.pkbase --dem DIR --lat L --lon L [--max-km K] [--markdown FILE]
+      How far the worldwide base layer's skyline is from the full DEM's, by distance.
+
   peakbench facts ENTITY.json --id Q [--labels LABELS.json] [--summary SUMMARY.json]
       Read a peak's facts from Wikidata and Wikipedia responses.
 
@@ -574,12 +577,14 @@ struct BenchConditions {
     /// Match against the app's mixed 30/60/120 m terrain (summits raised if peaks are given).
     var appTerrain = false
     var peaks: [Peak]?
+    /// Match against the worldwide base layer only, as on first launch with nothing downloaded.
+    var base: BaseLayer?
     /// Largest |k1| and |rolling shutter| (degrees); each run draws its own within them.
     var maxK1 = 0.0
     var maxRollingShutter = 0.0
     var scene = "alps"
 
-    var isDefault: Bool { perturbation == nil && !appTerrain && maxK1 == 0 && maxRollingShutter == 0 && scene == "alps" }
+    var isDefault: Bool { perturbation == nil && !appTerrain && base == nil && maxK1 == 0 && maxRollingShutter == 0 && scene == "alps" }
 
     init(_ args: Arguments) throws {
         let harder = args.options["harder"] != nil
@@ -592,6 +597,11 @@ struct BenchConditions {
             perturbation = p
         }
         appTerrain = harder || args.string("match") == "app"
+        if args.string("match") == "base" {
+            guard let path = args.string("base") else { throw HarnessError("--match base needs --base FILE.pkbase") }
+            base = try BaseLayer(contentsOf: URL(fileURLWithPath: path))
+            appTerrain = false
+        }
         if harder || args.string("camera") == "real" {
             maxK1 = 0.005
             maxRollingShutter = 0.3
@@ -609,6 +619,7 @@ struct BenchConditions {
         if scene != "alps" { parts.append(scene) }
         if perturbation != nil { parts.append("different DEM") }
         if appTerrain { parts.append(peaks == nil ? "app terrain" : "app terrain + summit cones") }
+        if base != nil { parts.append("base layer only") }
         if maxK1 > 0 || maxRollingShutter > 0 { parts.append("lens + rolling shutter") }
         return parts.joined(separator: ", ")
     }
@@ -624,6 +635,9 @@ struct BenchConditions {
             lines.append("Matched against the app's terrain: 30 m within 10 km, 60 m within 35 km, 120 m beyond" +
                          (peaks.map { ", summits raised to \($0.count) OpenStreetMap peaks (matching side only)." }
                           ?? "; summits not raised (no --peaks file)."))
+        }
+        if base != nil {
+            lines.append("Matched against the worldwide base layer only (no tiles downloaded), the eye at the GPS altitude (±10 m).")
         }
         if maxK1 > 0 || maxRollingShutter > 0 {
             lines.append("Camera: radial distortion k1 within ±\(f(maxK1, 4)), rolling shutter within ±\(f(maxRollingShutter, 2))° across the frame.")
@@ -660,6 +674,9 @@ func benchCommand(_ args: Arguments) throws {
             log("Raised \(raised) of \(peaks.count) summits")
         }
     }
+    if let base = conditions.base {
+        matchTerrain = Terrain(tiles: [], base: base, latitude: lat, longitude: lon, radius: HorizonSettings().maxDistance + 20_000)
+    }
     let renderer = HorizonRenderer(terrain: matchTerrain)
     let worldRenderer = HorizonRenderer(terrain: worldTerrain)
     let runs = args.int("runs") ?? 30
@@ -684,7 +701,10 @@ func benchCommand(_ args: Arguments) throws {
                                distance: spread * rng.uniform().squareRoot())
         let truePosition = worldRenderer.observer(latitude: spot.latitude, longitude: spot.longitude)
         let gps = destination(from: truePosition, azimuth: 360 * rng.uniform(), distance: gpsError * rng.uniform())
-        let believed = renderer.observer(latitude: gps.latitude, longitude: gps.longitude)
+        var believed = renderer.observer(latitude: gps.latitude, longitude: gps.longitude)
+        // On the base layer the ground under you is kilometers of average: the app stands
+        // the eye at the GPS altitude instead.
+        if conditions.base != nil { believed.height = truePosition.height + 10 * extra.gaussian() }
 
         var heading = 360 * rng.uniform()
         // The photo comes from a finer render at the true spot than the one we match against.
@@ -707,7 +727,7 @@ func benchCommand(_ args: Arguments) throws {
         if conditions.maxRollingShutter > 0 { realism.rollingShutter = conditions.maxRollingShutter * (2 * extra.uniform() - 1) }
 
         let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth), scene: scene, realism: realism)
-        let horizon = renderer.render(from: believed)
+        let horizon = renderer.render(from: believed, settings: conditions.base != nil ? .coarse : HorizonSettings())
 
         let compassError = max(-compassMax, min(compassMax, compassSigma * rng.gaussian()))
         var prior = truth
@@ -861,6 +881,7 @@ do {
     case "facts": try factsCommand(args)
     case "sun": try sunCommand(args)
     case "relief": try reliefCommand(args)
+    case "base": try baseCommand(args)
     case "case": try caseCommand(args)
     case "help", "-h", "--help": print(usage)
     default:

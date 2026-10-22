@@ -17,8 +17,9 @@ struct PeakListView: View {
         let units = model.settings.units
         let all = sorted(model.scene.map { Array($0.allPeaks.values) } ?? [])
         let matching = query.isEmpty ? all : all.filter { $0.peak.name.localizedCaseInsensitiveContains(query) }
-        let visible = matching.filter(\.isVisible)
-        let hidden = matching.filter { !$0.isVisible }
+        // Peaks the coarse base layer can't settle are listed with those in view.
+        let visible = matching.filter { $0.isVisible || $0.isUncertain }
+        let hidden = matching.filter { !$0.isVisible && !$0.isUncertain }
         return List {
             if model.scene == nil {
                 Text("Peaks appear once the terrain around you has loaded.")

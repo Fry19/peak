@@ -647,7 +647,8 @@ final class OverlayCanvas: UIView {
         for v in scene.peaks where v.id != selectedID {
             guard abs(azimuthDifference(v.azimuth, heading)) < range,
                   let p = point(projector, v.azimuth, v.elevation), view.contains(p) else { continue }
-            let canLabel = labelable < limit * 3 || labeled.contains(v.id)
+            // Peaks whose line of sight the coarse base layer can't settle get a dot only.
+            let canLabel = (labelable < limit * 3 || labeled.contains(v.id)) && !scene.uncertain.contains(v.id)
             guard canLabel || candidates.count < 200 else { continue }
             var box: LabelBox?
             if canLabel {

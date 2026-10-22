@@ -78,7 +78,7 @@ struct RootView: View {
                             RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
                         }
                     }
-                    Text("Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors")
+                    Text("Terrain © Copernicus DEM (DLR, Airbus), NOAA ETOPO · Map data © OpenStreetMap contributors")
                         .font(.system(size: 9))
                         .foregroundStyle(.white.opacity(0.45))
                 }

@@ -43,6 +43,8 @@ public struct SkylineMatcher: Sendable {
         let k = camera.intrinsics
         let projector = camera.projector
         let pitchPixels = tan(settings.pitchRange * .pi / 180) * k.fy
+        // The base layer's coarse terrain puts near ridges a degree or two low.
+        let coarsePixels = horizon.coarseRays.contains(true) ? tan(2.5 * .pi / 180) * k.fy : 0
         return (0..<k.width).map { x in
             let px = Double(x) + 0.5
             let center = projector.look(x: px, y: k.cy)
@@ -54,7 +56,7 @@ public struct SkylineMatcher: Sendable {
             }
             guard let top = projector.pixel(azimuth: center.azimuth, elevation: high),
                   let bottom = projector.pixel(azimuth: center.azimuth, elevation: low) else { return 0...k.height }
-            let margin = pitchPixels + abs(px - k.cx) * tan(settings.rollRange * .pi / 180) + Double(k.height) / 60
+            let margin = pitchPixels + coarsePixels + abs(px - k.cx) * tan(settings.rollRange * .pi / 180) + Double(k.height) / 60
             let a = max(0, min(k.height, Int((min(top.y, bottom.y) - margin).rounded(.down))))
             let b = max(a, min(k.height, Int((max(top.y, bottom.y) + margin).rounded(.up))))
             return a...b

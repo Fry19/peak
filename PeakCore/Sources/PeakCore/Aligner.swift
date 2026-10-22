@@ -36,6 +36,11 @@ public struct AlignmentSettings: Sendable {
     public var maxRMS = 0.2
     /// Skyline at least this far away is "far": a 10 m position error moves it by under 0.15°.
     public var farDistance = 4_000.0
+    /// On the base layer's coarse terrain (`HorizonProfile.coarseRays`): its height error,
+    /// meters, and how far its skyline must be to count as far. At Gornergrat its skyline
+    /// is typically 75 m (and up to 400 m) off in height, at any distance.
+    public var coarseError = 150.0
+    public var coarseFarDistance = 20_000.0
     /// Matched far skyline needed, as a fraction of the points and as a span of azimuth.
     public var minFarFraction = 0.2
     public var minFarSpan = 4.0
@@ -58,9 +63,15 @@ public struct AlignmentSettings: Sendable {
     }
 
     /// Expected angular error (degrees) of a skyline point `distance` meters away.
-    func sigma(distance: Double) -> Double {
+    func sigma(distance: Double, coarse: Bool = false) -> Double {
         let parallax = atan(positionUncertainty / max(distance, 1)) * 180 / .pi
-        return (measurementNoise * measurementNoise + parallax * parallax).squareRoot()
+        let terrain = coarse ? atan(coarseError / max(distance, 1)) * 180 / .pi : 0
+        return (measurementNoise * measurementNoise + parallax * parallax + terrain * terrain).squareRoot()
+    }
+
+    /// Whether skyline `distance` meters away counts as far.
+    func isFar(distance: Double, coarse: Bool = false) -> Bool {
+        distance >= (coarse ? coarseFarDistance : farDistance)
     }
 }
 
@@ -118,8 +129,9 @@ public enum SkylineAligner {
         }
 
         // Expected error for every ray of the rendered horizon.
-        let raySigma = horizon.distances.map { settings.sigma(distance: Double($0)) }
-        let rayFar = horizon.distances.map { Double($0) >= settings.farDistance }
+        let coarse = horizon.coarseRays.isEmpty ? [Bool](repeating: false, count: horizon.count) : horizon.coarseRays
+        let raySigma = zip(horizon.distances, coarse).map { settings.sigma(distance: Double($0), coarse: $1) }
+        let rayFar = zip(horizon.distances, coarse).map { settings.isFar(distance: Double($0), coarse: $1) }
         func ray(_ azimuth: Double) -> Int {
             Int((normalizedAzimuth(azimuth) / horizon.azimuthStep).rounded()) % horizon.count
         }

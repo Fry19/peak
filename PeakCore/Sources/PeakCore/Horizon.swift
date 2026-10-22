@@ -14,6 +14,15 @@ public struct HorizonSettings: Sendable {
     public var refraction = 0.13
 
     public init() {}
+
+    /// For an observer on the base layer's coarse terrain: the first few kilometers are
+    /// left out, since the ground there is kilometers of average (often above the eye, at
+    /// the GPS altitude, or below it on a ridge) and would hide everything behind it.
+    public static var coarse: HorizonSettings {
+        var s = HorizonSettings()
+        s.minDistance = 3_000
+        return s
+    }
 }
 
 /// What the terrain looks like from one point: for every azimuth, the elevation angle of
@@ -37,6 +46,9 @@ public struct HorizonProfile: Sendable {
     public let elevations: [Float]
     /// Distance to the skyline (meters) for ray i.
     public let distances: [Float]
+    /// For each ray, whether its skyline is on the base layer's coarse terrain (`Terrain.hasCoarse`);
+    /// empty when none is.
+    public internal(set) var coarseRays: [Bool] = []
     let envelopeStart: [Int]
     let envelope: [EnvelopePoint]
 
@@ -157,8 +169,15 @@ public final class HorizonRenderer: @unchecked Sendable {
 
         var start = [Int](repeating: 0, count: rayCount + 1)
         for i in 0..<rayCount { start[i + 1] = start[i] + perRay[i].count }
-        return HorizonProfile(observer: observer, settings: settings, elevations: elevations,
-                              distances: distances, envelopeStart: start, envelope: perRay.flatMap { $0 })
+        var profile = HorizonProfile(observer: observer, settings: settings, elevations: elevations,
+                                     distances: distances, envelopeStart: start, envelope: perRay.flatMap { $0 })
+        if terrain.hasCoarse {
+            profile.coarseRays = (0..<rayCount).map { i in
+                let p = destination(from: observer, azimuth: Double(i) * settings.azimuthStep, distance: Double(distances[i]))
+                return terrain.isCoarse(latitude: p.latitude, longitude: p.longitude)
+            }
+        }
+        return profile
     }
 
     /// Highest apparent elevation angle of the terrain along one azimuth, out to `distance`.

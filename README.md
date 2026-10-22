@@ -45,6 +45,8 @@ Labels stand upright in the world whichever way you hold the phone, even with th
 
 **Downloads:** the Copernicus tiles have lower-resolution copies built in, and the full 30 m image is stored in blocks of about 2.5 MB. Peak starts downloading as soon as it has a rough position, fetching tiles at 240 m (about 0.6 MB each) and 120 m within 30 km (2 MB), all at once, and shows the view as soon as the tile you're in arrives. Then it sharpens the terrain block by block: the full 30 m within 10 km, 60 m within 35 km and 120 m everywhere, and 30 m within 15–25 km on Wi-Fi (or on mobile data, unless you turn that off). Peaks and hikes come from OpenStreetMap through the Overpass API, facts from Wikidata and Wikipedia. Everything is cached on the phone. Overpass searches ask two servers at once (the main one and OpenStreetMap France's) and take the first good answer, then try the others; a server that answers but reports the query ran out of time counts as busy, not as "no hikes". When the peaks can't be fetched (no signal, every server busy) and none are saved for the place, the pill says **Getting peaks…** and Peak tries again, after 10 s and then less often, up to once a minute.
 
+**First launch anywhere, without a signal:** the app bundles a worldwide base layer (`World.pkbase`, 47 MB): coarse terrain for the whole world and every named OpenStreetMap peak (about 700,000). Where nothing is on the phone yet and the terrain doesn't come within a few seconds (at once with no signal), the view is drawn from it, and the pill says **Coarse terrain**; the downloaded tiles replace it as they arrive. Its terrain is good for far skylines, not near ones, so on it Peak stands your eye at the GPS altitude rather than on kilometers of averaged ground, leaves the first 3 km out of the horizon, matches the skyline only where it is at least 20 km away (with wider expected errors), and shows peaks whose line of sight it can't settle (near ones, or ones just clearing a ridge) as dots, never as labeled in sight or hidden. The bundled peaks stand in the same way until OpenStreetMap answers.
+
 **Offline areas** (Settings): before a trip without a signal, pick a place on a map (search for, say, Great Smoky Mountains), choose a radius of 5–50 km and download it. Peak fetches what the view needs anywhere in the circle: 30 m terrain within 10 km of it, 60 m within 35 km, 120 m for everything that can be seen from it (80 km), the peaks in that range, and the hikes of every peak in it. The hikes are fetched in boxes of up to 30 km, so a large area doesn't run out of time on the server, with the unnamed paths up to every summit, as for a single peak. It shows the size first (about 70 MB for 25 km in the Smokies), the progress while downloading, and resumes a download that stopped, without fetching again what it already has (at launch and when the connection comes back; on mobile data only if terrain on mobile data is on). An area counts as saved only when everything was kept, so a full disk shows as a failure. Inside a saved area the peaks and hikes come from the phone, without waiting on the network; an area that stopped partway still lends what it has. With no signal outside an area, the peaks cached nearest you that reach this far are used. Deleting an area keeps the terrain another area, or the place you are, still uses.
 
 Not in 0.8 yet: a learned skyline detector, your position on a trail, and lidar terrain.
@@ -217,6 +219,8 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
   Sources/peakbench/       The desk harness
   Tests/PeakCoreTests/     Unit tests on procedural terrain with known geometry
 Tools/fetch_dem.py         Downloads Copernicus tiles and writes .pkdem files
+Tools/fetch_world_peaks.py Every named OpenStreetMap peak and volcano, for the base layer
+Tools/build_base_layer.py  Builds the worldwide base layer (World.pkbase) from ETOPO 2022 and those peaks
 Tools/make_icon.py         Renders the app icon, the Matterhorn from Gornergrat, from the DEM tiles
 docs/                      Images for this README
 ```
@@ -233,6 +237,29 @@ GitHub Actions runs on every push:
 
 **Release** runs when a `v*` tag is pushed (or by hand with a tag name): it builds `Peak_<version>.ipa` and publishes it on the Releases page.
 
+## The worldwide base layer
+
+`Peak/Resources/World.pkbase` is built reproducibly from two public sources (about 5.4 GB of downloads, 20 minutes; the build itself takes a minute on a laptop):
+
+```bash
+python3 Tools/fetch_world_peaks.py --out build/world_peaks.tsv
+python3 Tools/build_base_layer.py --etopo build/etopo15 --download --peaks build/world_peaks.tsv --out Peak/Resources/World.pkbase
+```
+
+(`build_base_layer.py` needs numpy and h5py.) **Terrain** comes from NOAA's ETOPO 2022 at 15″ (public domain), whose land is mostly Copernicus GLO-30, on the same EGM2008 heights as the tiles the app downloads. Each 1° cell keeps the coarsest of 30″ (about 0.9 km), 1′, 2′ or 4′ that stays within a height error, chosen so the terrain fits 36 MB: 3,375 cells of high relief get 30″, 19,505 cells of plains and ice get 4′, and open sea gets none. A pixel holds the highest point of its block rather than the mean: at Gornergrat that halves the skyline's error (the mean sinks every ridge). Heights are in 4 m steps, coded as differences from a planar prediction and deflated. **Peaks**: every named `natural=peak|volcano` node (699,289 in October 2026) from QLever's OpenStreetMap SPARQL endpoint, in 5° blocks of columns: id, position to 1e-5°, elevation, prominence, Wikidata item and name; 10.2 MB. The file layout is in the builder's docstring; PeakCore's `BaseLayer` reads it.
+
+How far its skyline is from the full Copernicus DEM's at Gornergrat (`peakbench base --base Peak/Resources/World.pkbase --dem DEM --lat 45.9837 --lon 7.7856`), per 0.1° ray, by how far the real skyline is, with the eye at the right height:
+
+| Skyline distance | Rays | Median | 90th percentile | Worst | Bias |
+|---|---:|---:|---:|---:|---:|
+| 0–5 km | 467 | 1.27° | 3.52° | 4.58° | −1.27° |
+| 5–10 km | 1580 | 0.50° | 1.22° | 1.87° | −0.42° |
+| 10–20 km | 1384 | 0.28° | 0.70° | 1.56° | −0.16° |
+| 20–40 km | 15 | 0.27° | 0.32° | 0.32° | −0.27° |
+| 40–80 km | 154 | 0.07° | 0.16° | 0.27° | −0.07° |
+
+Standing on the base layer's own ground instead puts the eye 155 m too low on this ridge, and the smoothed slopes around it hide the far skyline altogether; hence the GPS altitude and the 3 km left out. `peakbench bench … --match base --base FILE` matches synthetic photos of the real terrain against the base layer alone: at Gornergrat, Monte Rosa and above Sion (40 runs each, ARKit and photo modes), 59 of 240 frames were accepted, none off by more than 0.25° (median 0.05°); the rest were turned away, mostly for too little skyline beyond 20 km. Matching against coarse terrain without those gates accepted a frame 1.3° off.
+
 ## Next
 
 - Run it on real photos with marked summits, and tune detection on them.
@@ -244,4 +271,4 @@ GitHub Actions runs on every push:
 
 ## Data and attribution
 
-Terrain: produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018, provided under COPERNICUS by the European Union and ESA; all rights reserved. Peaks and trails: © OpenStreetMap contributors, available under the Open Database License (ODbL). The app shows both in small print under the status pill. Facts: Wikidata (CC0) and Wikipedia (CC BY-SA), credited on each peak's card and in Settings.
+Terrain: produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018, provided under COPERNICUS by the European Union and ESA; all rights reserved. Worldwide base layer: NOAA NCEI ETOPO 2022 (public domain, doi:10.25921/fd45-gt74). Peaks and trails: © OpenStreetMap contributors, available under the Open Database License (ODbL). The app shows both in small print under the status pill. Facts: Wikidata (CC0) and Wikipedia (CC BY-SA), credited on each peak's card and in Settings.

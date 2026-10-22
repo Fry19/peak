@@ -125,7 +125,10 @@ public enum AppStatus: Equatable {
         case failed(String)
     }
 
-    public static func resolve(camera: Camera, location: Permission, preciseLocation: Bool, load: Load) -> AppStatus {
+    /// `coarseTerrain`: the view is drawn from the bundled base layer here, until finer
+    /// terrain is downloaded.
+    public static func resolve(camera: Camera, location: Permission, preciseLocation: Bool, load: Load,
+                               coarseTerrain: Bool = false) -> AppStatus {
         if camera == .denied {
             return .problem("Peak needs the camera to label the mountains. Allow it in Settings.", action: .openSettings)
         }
@@ -147,7 +150,8 @@ public enum AppStatus: Equatable {
         case let .loading(text):
             return .loading(text)
         case .ready:
-            return .ready(note: preciseLocation ? nil : "Approximate location")
+            let notes = [preciseLocation ? nil : "Approximate location", coarseTerrain ? "Coarse terrain" : nil].compactMap { $0 }
+            return .ready(note: notes.isEmpty ? nil : notes.joined(separator: " · "))
         }
     }
 }

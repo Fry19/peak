@@ -2,3 +2,4 @@ numpy
 tifffile
 imagecodecs
 pillow
+h5py
