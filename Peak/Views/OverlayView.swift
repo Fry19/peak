@@ -97,6 +97,16 @@ final class OverlayCanvas: UIView {
     private var backdropFading = Date.distantPast
     private static let sky = UIColor(red: 0.075, green: 0.09, blue: 0.12, alpha: 1)
     private static let land = UIColor(red: 0.02, green: 0.025, blue: 0.035, alpha: 1)
+    /// The terrain in 3D under the view from above (`PanoramaMesh`): slopes from a dark slate
+    /// away from the light to a pale one toward it, fading into the sky with distance.
+    private static let terrainDark = SIMD3<Float>(0.045, 0.055, 0.075)
+    private static let terrainLight = SIMD3<Float>(0.34, 0.39, 0.46)
+    private static let terrainHaze: Float = 35_000
+    /// How much the terrain in 3D shows, fading with the backdrop, and the height it was last
+    /// seen from, for fading out from there.
+    private var terrainOpacity: Float = 0
+    private var terrainLift: Float = 0
+    private var lastTerrainFrame = Date()
     /// Peaks in sight only from above, without Metal: open rings.
     private let revealedDotLayer: CAShapeLayer = {
         let l = CAShapeLayer()
@@ -302,14 +312,17 @@ final class OverlayCanvas: UIView {
         lineSegments.removeAll(keepingCapacity: true)
         overlaySegments.removeAll(keepingCapacity: true)
         showBackdrop(risen != nil, at: now)
-        layoutLand(risen != nil || now < backdropFading ? scene.horizon : nil, projector, heading: camera.attitude.heading,
-                   reach: reach)
+        // From above, the terrain in 3D where the GPU can draw it, else the land filled in flat.
+        let terrain = terrainCamera(risen.flatMap { _ in model.risenMesh }, lift: risen?.height, camera: camera, at: now)
+        layoutLand(terrain == nil && (risen != nil || now < backdropFading) ? scene.horizon : nil, projector,
+                   heading: camera.attitude.heading, reach: reach)
         // Increase Contrast: brighter lines over a darker halo.
         let contrast = UIAccessibility.isDarkerSystemColorsEnabled
         // Seen from above, the skyline can reach the edge of the terrain on the phone, which
-        // isn't a skyline: it's drawn as faintly as the farthest ridges.
+        // isn't a skyline: it's left out over the terrain in 3D, which fades out before it, and
+        // otherwise drawn as faintly as the farthest ridges.
         layoutRidges(scene, projector, heading: camera.attitude.heading, reach: reach, ridges: settings.showRidges,
-                     contrast: contrast, edge: risen != nil ? Float(TerrainScene.radius) * 0.97 : nil)
+                     contrast: contrast, edge: risen != nil ? Float(TerrainScene.radius) * 0.97 : nil, overTerrain: terrain != nil)
         // Dashes keep their size on the mountain while zooming, halving at each doubling,
         // so they're 9 to 18 points apart on screen.
         let dashScale = camera.intrinsics.fx / model.zoom * pow(2, floor(log2(max(1, model.zoom)))) * .pi / 180
@@ -319,7 +332,7 @@ final class OverlayCanvas: UIView {
         layoutSunPath(risen == nil && settings.showSunPath ? model.sun.path(scene: scene) : nil, projector)
         let placed = layoutLabels(scene, projector, heading: camera.attitude.heading, reach: reach, model: model,
                                   revealed: risen?.revealed ?? [], at: now)
-        renderer?.draw(lines: lineSegments, overlay: overlaySegments, halo: contrast ? 0.5 : 0.28,
+        renderer?.draw(lines: lineSegments, overlay: overlaySegments, halo: contrast ? 0.5 : 0.28, terrain: terrain,
                        size: bounds.size, scale: displayScale)
         // A heading correction turning the view by δ slides everything the other way.
         let shift = -correctionTurn * camera.intrinsics.fx * .pi / 180
@@ -428,14 +441,24 @@ final class OverlayCanvas: UIView {
         }
     }
 
-    /// Skyline pieces at least `edge` meters away are drawn as the farthest ridges.
+    /// Skyline pieces at least `edge` meters away are drawn as the farthest ridges, or left
+    /// out over the terrain in 3D (`overTerrain`), whose shading already shows the slopes, so
+    /// the ridges in front of the skyline are quieter there.
     private func layoutRidges(_ scene: TerrainScene, _ projector: Camera.Projector, heading: Double, reach: Int, ridges: Bool,
-                              contrast: Bool, edge: Float? = nil) {
+                              contrast: Bool, edge: Float? = nil, overTerrain: Bool = false) {
         let gpu = renderer != nil
         // For the GPU, consecutive pieces of a line are merged into segments a few points
         // long: the panorama's 0.1° steps are only about a point apart on screen.
         var runs = [(start: CGPoint, end: CGPoint)?](repeating: nil, count: Self.bands.count + 1)
-        let bandStyles = contrast ? Self.contrastBandStyles : Self.bandStyles
+        var bandStyles = contrast ? Self.contrastBandStyles : Self.bandStyles
+        if overTerrain && !contrast {
+            bandStyles = bandStyles.map {
+                var style = $0
+                style.color.w *= 0.5
+                style.glowAlpha *= 0.5
+                return style
+            }
+        }
         let skylineStyle = contrast ? Self.contrastSkylineStyle : Self.skylineStyle
         func styleFor(_ style: Int) -> Style { style < Self.bands.count ? bandStyles[style] : skylineStyle }
         func emit(_ a: CGPoint, _ b: CGPoint, _ style: Int) {
@@ -458,6 +481,7 @@ final class OverlayCanvas: UIView {
                       let b = point(projector, Double(s.azimuth1), Double(s.elevation1)),
                       bounds.contains(a) || bounds.contains(b) else { continue }
                 let atEdge = s.isSkyline && edge.map { s.distance >= $0 } == true
+                if atEdge && overTerrain { continue }
                 let band = s.isSkyline && !atEdge ? -1 : (Self.bands.firstIndex { s.distance < $0.0 } ?? Self.bands.count - 1)
                 if gpu {
                     emit(a, b, band < 0 ? Self.bands.count : band)
@@ -496,6 +520,33 @@ final class OverlayCanvas: UIView {
         animation.toValue = to
         animation.duration = duration * CFTimeInterval(abs(to - from))
         backdrop.add(animation, forKey: "fade")
+    }
+
+    /// The camera for the terrain in 3D (`mesh`, seen from `lift` meters above the live view's
+    /// eye), fading in and out with the backdrop; nil when there's none to draw, or no Metal.
+    private func terrainCamera(_ mesh: AppModel.RiseMesh?, lift: Double?, camera: Camera, at now: Date) -> TerrainCamera? {
+        guard let renderer, renderer.drawsTerrain else { return nil }
+        let dt = Float(max(0, min(0.1, now.timeIntervalSince(lastTerrainFrame))))
+        lastTerrainFrame = now
+        if let mesh, let lift {
+            renderer.setTerrain(mesh.mesh, id: mesh.generation)
+            terrainLift = Float(lift)
+            terrainOpacity = min(1, terrainOpacity + dt / 0.2)
+        } else {
+            terrainOpacity = max(0, terrainOpacity - dt / 0.2)
+        }
+        guard terrainOpacity > 0 else {
+            // Let the GPU's copy go once the views from above are let go.
+            if model?.riseWork.mesh == nil, model?.riseWork.staleMeshes.isEmpty ?? true { renderer.setTerrain(nil, id: 0) }
+            return nil
+        }
+        let axes = camera.attitude.axes, k = camera.intrinsics
+        func float(_ v: SIMD3<Double>) -> SIMD3<Float> { SIMD3(Float(v.x), Float(v.y), Float(v.z)) }
+        let sky = Self.sky.cgColor.components ?? [0, 0, 0]
+        return TerrainCamera(right: float(axes.right), down: float(axes.down), forward: float(axes.forward),
+                             lens: SIMD4(Float(k.fx), Float(k.fy), Float(k.cx), Float(k.cy)), lift: terrainLift,
+                             opacity: terrainOpacity, sky: SIMD3(Float(sky[0]), Float(sky[1]), Float(sky[2])),
+                             dark: Self.terrainDark, light: Self.terrainLight, haze: Self.terrainHaze)
     }
 
     /// The land below the skyline, filled, across the view: from each stretch of skyline in

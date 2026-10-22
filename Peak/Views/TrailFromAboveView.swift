@@ -23,9 +23,12 @@ struct TrailFromAboveView: View {
     @State private var lastMagnification = 1.0
     /// Walking the trail in 3D, over this view.
     @State private var walking = false
-    /// Satellite imagery of the whole map, and sharper imagery of where you've zoomed in.
+    /// Satellite imagery of the whole map, and sharper imagery of where you've zoomed in, as
+    /// shown, in the colors of Apple's aerial photos; and each as it loaded.
     @State private var imagery: MapImagery?
     @State private var closeUp: MapImagery?
+    @State private var imageryLoaded: MapImagery?
+    @State private var closeUpLoaded: MapImagery?
     @State private var terrainDetail: OverheadMap.Detail?
     /// Coarser terrain, and imagery, out to where you are when that's beyond the map, so
     /// zooming out shows you and the trail together.
@@ -130,6 +133,12 @@ struct TrailFromAboveView: View {
             // Again when the map's own imagery arrives after it.
             .task(id: [wideLoaded.map { ObjectIdentifier($0.image) }, imagery.map { ObjectIdentifier($0.image) }]) {
                 await matchWideImagery()
+            }
+            .task(id: CalibrationKey(imagery: imageryLoaded.map { ObjectIdentifier($0.image) }, online: model.online)) {
+                await calibrateImagery()
+            }
+            .task(id: [closeUpLoaded.map { ObjectIdentifier($0.image) }, imagery.map { ObjectIdentifier($0.image) }]) {
+                await matchCloseUp()
             }
             .onChange(of: satellite) { _, on in
                 if !on { imageryState = .idle }
@@ -306,6 +315,11 @@ struct TrailFromAboveView: View {
         var online: Bool
     }
 
+    private struct CalibrationKey: Equatable {
+        var imagery: ObjectIdentifier?
+        var online: Bool
+    }
+
     private struct CloseUpKey: Equatable {
         var on: Bool
         var center: LatLon?
@@ -397,7 +411,9 @@ struct TrailFromAboveView: View {
         if let imagery, imagery.center == map.projection.center, imagery.rect == rect { return }
         // Imagery of a map around another center would land in the wrong place.
         if imagery?.center != map.projection.center { imagery = nil }
+        if imageryLoaded?.center != map.projection.center { imageryLoaded = nil }
         if closeUp?.center != map.projection.center { closeUp = nil }
+        if closeUpLoaded?.center != map.projection.center { closeUpLoaded = nil }
         if wideImagery?.center != map.projection.center { wideImagery = nil }
         if wideLoaded?.center != map.projection.center { wideLoaded = nil }
         imageryState = .loading
@@ -406,6 +422,7 @@ struct TrailFromAboveView: View {
         do {
             let loaded = try await MapImagery.load(projection: map.projection, rect: rect, width: max(1, Int(rect.width * scale)))
             guard !Task.isCancelled else { return }
+            imageryLoaded = loaded
             withAnimation(.easeOut(duration: 0.3)) { imagery = loaded }
             imageryState = .idle
         } catch {
@@ -432,7 +449,35 @@ struct TrailFromAboveView: View {
         let scale = min(3 * k, 3_000 / max(rect.width, rect.height))
         guard let loaded = try? await MapImagery.load(projection: map.projection, rect: rect, width: max(1, Int(rect.width * scale))),
               !Task.isCancelled, loaded.center == self.map?.projection.center else { return }
-        closeUp = loaded
+        closeUpLoaded = loaded
+    }
+
+    /// For all but a short trail, a point of the whole map's imagery covers more ground than
+    /// Apple's aerial photos allow, so it's the coarser, greener mosaic, and zooming in onto the
+    /// photos changes the colors: it's shown in the photos' colors, from a sample of them in the
+    /// middle of the map, once that loads (as it loaded until then).
+    private func calibrateImagery() async {
+        guard let loaded = imageryLoaded, !loaded.aerial, let map, loaded.center == map.projection.center else { return }
+        let limit = MapImagery.aerialMetersPerPoint(at: map.projection.center.latitude)
+        let side = min(loaded.rect.width, loaded.rect.height, 1_536 * limit)
+        let rect = CGRect(x: loaded.rect.midX - side / 2, y: loaded.rect.midY - side / 2, width: side, height: side)
+        guard let sample = try? await MapImagery.load(projection: map.projection, rect: rect, width: Int((side / limit).rounded(.up))),
+              !Task.isCancelled, sample.aerial, imageryLoaded?.image === loaded.image else { return }
+        let matched = await Task.detached(priority: .utility) { loaded.matched(to: sample) }.value
+        guard !Task.isCancelled, imageryLoaded?.image === loaded.image else { return }
+        imagery = matched
+    }
+
+    /// A close-up not zoomed in far enough to be the aerial photos is shown in the colors of
+    /// the whole map's imagery, which covers everywhere it can be (again when that changes).
+    private func matchCloseUp() async {
+        guard let loaded = closeUpLoaded else { return }
+        var shown = loaded
+        if !loaded.aerial, let reference = imagery, reference.center == loaded.center {
+            shown = await Task.detached(priority: .utility) { loaded.matched(to: reference) }.value
+            guard !Task.isCancelled, closeUpLoaded?.image === loaded.image else { return }
+        }
+        closeUp = shown
     }
 
     /// When you're farther out than the map reaches, coarser terrain for the whole screen

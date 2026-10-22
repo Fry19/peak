@@ -780,7 +780,7 @@ final class WalkWorld: @unchecked Sendable {
     var center: LatLon { far.projection.center }
 
     /// How fine the imagery over the hills around is: as coarse as Apple's aerial photos go,
-    /// drawn a pixel a point, since the ring's own picture, coarser, is its greener mosaic.
+    /// since the ring's own picture, coarser, is its greener mosaic.
     var midMetersPerPixel: Double { MapImagery.aerialMetersPerPoint(at: center.latitude) }
 
     /// Where the photos over the hills around go: past the sharp terrain out to where the haze
@@ -795,7 +795,7 @@ final class WalkWorld: @unchecked Sendable {
 
     @MainActor func loadMidImagery(_ rect: CGRect) async -> MapImagery? {
         try? await MapImagery.load(projection: far.projection, rect: rect,
-                                   width: min(3_072, Int((rect.width / midMetersPerPixel).rounded(.up))), scale: 1)
+                                   width: min(3_072, Int((rect.width / midMetersPerPixel).rounded(.up))))
     }
 
     /// Whether the photos over the hills around are laid (changed on the main thread only).

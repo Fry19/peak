@@ -95,9 +95,10 @@ struct RootView: View {
                     }
                     Text("Terrain © Copernicus DEM (DLR, Airbus), NOAA ETOPO · Map data © OpenStreetMap contributors")
                         .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(0.6))
+                        // Over the lit terrain from above, fuller, with a darker halo.
+                        .foregroundStyle(.white.opacity(model.rise.level > 0 ? 0.9 : 0.6))
                         .multilineTextAlignment(.center)
-                        .shadow(color: .black.opacity(0.6), radius: 1)
+                        .shadow(color: .black.opacity(model.rise.level > 0 ? 0.9 : 0.6), radius: model.rise.level > 0 ? 2 : 1)
                 }
                 .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { bottomControls = $0 }
             }
