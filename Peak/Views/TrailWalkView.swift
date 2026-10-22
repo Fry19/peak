@@ -140,7 +140,7 @@ final class WalkWorld: @unchecked Sendable {
     }
 
     static func build(trail: Trail, peak: Peak?, terrain: Terrain, units: AppSettings.Units) -> WalkWorld? {
-        guard let frame = OverheadMap.frame(trail: trail, around: peak.map { [$0.position] } ?? []) else { return nil }
+        guard let frame = OverheadMap.frame(trail: trail, around: peak.map { [$0.position] } ?? [], aspect: 0.46) else { return nil }
         // The trail with a few kilometers around it at the terrain's own 30 m where it can,
         // and around that a wide, coarser ring out to where the haze swallows it, so a view
         // toward the horizon shows the ranges beyond instead of the terrain's edge.

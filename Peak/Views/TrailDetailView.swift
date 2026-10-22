@@ -3,8 +3,8 @@ import MapKit
 import PeakCore
 import SwiftUI
 
-/// A hike's card: the route on a map, its numbers, the climb, and buttons to draw it on
-/// the mountain or see it from above.
+/// A hike's card: the route from above (tap for the full map), its numbers, the climb, and
+/// a button to draw it on the mountain.
 struct TrailDetailView: View {
     let model: AppModel
     let link: TrailLink
@@ -38,7 +38,7 @@ struct TrailDetailView: View {
                 .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 4, trailing: 4))
 
-                TrailMap(trail: trail, peak: peak, start: hike.profile?.trailhead)
+                TrailMapPreview(model: model, trail: trail, peak: peak, trailhead: hike.profile?.trailhead, place: place)
                     .frame(height: 220)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                     .listRowBackground(Color.clear)
@@ -48,23 +48,13 @@ struct TrailDetailView: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
 
-                // Side by side where they fit, else one above the other. (Not for a photo: the
-                // trail is drawn in the live view.)
+                // Not for a photo: the trail is drawn in the live view.
                 if place == nil {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 10) {
-                            mountainButton(trail, peak, title: "On the mountain")
-                            aboveButton(trail, peak, fill: false)
-                        }
-                        VStack(spacing: 8) {
-                            mountainButton(trail, peak, title: "Show on the mountain")
-                            aboveButton(trail, peak, fill: true)
-                        }
-                    }
-                    .tint(Color(red: 1, green: 0.72, blue: 0.28))
-                    .lineLimit(1)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                    mountainButton(trail, peak)
+                        .tint(Color(red: 1, green: 0.72, blue: 0.28))
+                        .lineLimit(1)
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 }
             }
 
@@ -130,26 +120,16 @@ struct TrailDetailView: View {
         .background(.sheetBackground)
     }
 
-    private func mountainButton(_ trail: Trail, _ peak: Peak, title: String) -> some View {
+    private func mountainButton(_ trail: Trail, _ peak: Peak) -> some View {
         Button {
             model.showOnMountain(trail, peakID: peak.id)
         } label: {
-            Label(title, systemImage: "mountain.2.fill")
+            Label("Show on the mountain", systemImage: "mountain.2.fill")
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
+        .controlSize(.large)
         .foregroundStyle(.black)
-    }
-
-    private func aboveButton(_ trail: Trail, _ peak: Peak, fill: Bool) -> some View {
-        Button {
-            model.showFromAbove(trail, peakID: peak.id)
-        } label: {
-            Label("From above", systemImage: "map")
-                .frame(maxWidth: fill ? .infinity : nil)
-        }
-        .buttonStyle(.bordered)
-        .foregroundStyle(Color(red: 1, green: 0.72, blue: 0.28))
     }
 
     private func kind(_ trail: Trail) -> String {
@@ -182,41 +162,6 @@ struct TrailDetailView: View {
     private func osmURL(_ trail: Trail) -> URL? {
         guard trail.id.hasPrefix("r"), let id = Int64(trail.id.dropFirst()) else { return nil }
         return URL(string: "https://www.openstreetmap.org/relation/\(id)")
-    }
-}
-
-/// The trail on a satellite map with the summit and the start marked.
-private struct TrailMap: View {
-    let trail: Trail
-    let peak: Peak
-    let start: LatLon?
-
-    var body: some View {
-        Map(initialPosition: .rect(region)) {
-            ForEach(Array(trail.lines.enumerated()), id: \.offset) { _, line in
-                MapPolyline(coordinates: line.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) })
-                    .stroke(Color(red: 1, green: 0.72, blue: 0.28), lineWidth: 3)
-            }
-            Marker(peak.name, systemImage: "mountain.2.fill", coordinate: CLLocationCoordinate2D(latitude: peak.latitude, longitude: peak.longitude))
-                .tint(.indigo)
-            if let start {
-                Marker("Start", systemImage: "figure.hiking", coordinate: CLLocationCoordinate2D(latitude: start.latitude, longitude: start.longitude))
-                    .tint(.orange)
-            }
-            UserAnnotation()
-        }
-        .mapStyle(.hybrid(elevation: .realistic))
-    }
-
-    private var region: MKMapRect {
-        var rect = MKMapRect.null
-        let points = trail.lines.flatMap { $0 } + [peak.position]
-        for p in points {
-            let m = MKMapPoint(CLLocationCoordinate2D(latitude: p.latitude, longitude: p.longitude))
-            rect = rect.union(MKMapRect(x: m.x, y: m.y, width: 0, height: 0))
-        }
-        let pad = max(rect.width, rect.height) * 0.15 + 500
-        return rect.insetBy(dx: -pad, dy: -pad)
     }
 }
 
