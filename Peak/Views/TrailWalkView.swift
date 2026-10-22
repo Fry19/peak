@@ -313,6 +313,31 @@ final class WalkWorld: @unchecked Sendable {
     /// The ground's height at a map position, meters.
     func ground(_ p: SIMD2<Double>) -> Double { relief.height(at: p) }
 
+    /// The ground's height at a map position, meters: the sharp terrain's, or past it the
+    /// ring's; NaN beyond both.
+    func groundOrRing(_ p: SIMD2<Double>) -> Double {
+        let h = relief.height(at: p)
+        return h.isFinite ? h : far.height(at: p)
+    }
+
+    /// The lowest the camera may be at a map position, meters: 15 m over the highest ground
+    /// within 25 m, so the near clipping plane (10 m out) stays out of the slopes around it.
+    /// Off the sharp terrain, the ring's ground; nowhere, no limit.
+    func lowestEye(at p: SIMD2<Double>) -> Double {
+        var top = relief.highest(within: 25, of: p)
+        if !top.isFinite { top = far.highest(within: 25, of: p) }
+        return top.isFinite ? top + 15 : -.infinity
+    }
+
+    /// Whether a camera at `eye` (map meters) is over the ground and sees `subject` over what's
+    /// in between, as the camera following the walker does: by up to 40 m near the camera,
+    /// less close up, where 40 m would keep it from ever coming near.
+    func isClear(_ eye: SIMD3<Double>, seeing subject: SIMD3<Double>) -> Bool {
+        guard eye.z >= lowestEye(at: SIMD2(eye.x, eye.y)) else { return false }
+        let clearance = min(40, simd_distance(eye, subject) / 10)
+        return TrailWalk.raised(eye, toSee: subject, clearance: clearance, ground: groundOrRing).z <= eye.z + 0.01
+    }
+
     /// Following the walker low, near the horizon, so the slopes and the ranges ahead stand
     /// up in 3D; steep climbs tilt it down a little, and ridges in the way lift it.
     func follow(at distance: Double) -> (eye: SIMD3<Double>, target: SIMD3<Double>) {
@@ -915,8 +940,16 @@ final class WalkPlayer {
     @ObservationIgnored private var target = SIMD3<Double>(0, 0, 0)
     /// Where a blend into following starts from, and when.
     @ObservationIgnored private var blend: (eye: SIMD3<Double>, target: SIMD3<Double>, up: SIMD3<Double>, started: CFTimeInterval)?
+    /// Looking around while paused: where the camera is around the walker (degrees clockwise
+    /// from north, degrees above level, meters), and how fast a flick still turns it (degrees
+    /// a second, around and up).
+    @ObservationIgnored private var orbit = (azimuth: 0.0, elevation: 20.0, distance: 600.0)
+    @ObservationIgnored private var spin = SIMD2<Double>(0, 0)
+    @ObservationIgnored private var gestures: Gestures?
 
     static let introSeconds = 2.8
+    /// How far a drag of one point turns the camera, degrees.
+    static let degreesPerPoint = 0.3
 
     /// Walking speed, meters per second: a short trail takes half a minute, a long one two.
     var speed: Double {
@@ -936,6 +969,15 @@ final class WalkPlayer {
         playing = true
         ended = false
         view.allowsCameraControl = false
+        if gestures == nil {
+            // Paused, drag to look around the walker and pinch to come closer or go further.
+            let gestures = Gestures(self)
+            let pan = UIPanGestureRecognizer(target: gestures, action: #selector(Gestures.pan(_:)))
+            pan.maximumNumberOfTouches = 1
+            view.addGestureRecognizer(pan)
+            view.addGestureRecognizer(UIPinchGestureRecognizer(target: gestures, action: #selector(Gestures.pinch(_:))))
+            self.gestures = gestures
+        }
         link?.invalidate()
         let link = CADisplayLink(target: Ticker(self), selector: #selector(Ticker.tick(_:)))
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
@@ -983,9 +1025,7 @@ final class WalkPlayer {
         ended = false
         if case .intro = mode { mode = .follow }
         if case .free = mode {
-            // Keep looking around from the new spot: the camera jumps to follow it. Dragging
-            // may have put SceneKit's own camera in its place; this one moves.
-            view?.pointOfView = world.camera
+            // Keep looking around from the new spot: the camera jumps to follow it.
             let pose = world.follow(at: distance)
             eye = pose.eye
             target = pose.target
@@ -1001,14 +1041,71 @@ final class WalkPlayer {
         pointOrbit()
     }
 
-    /// Lets the camera be dragged around the walker.
+    /// Lets the camera be dragged around the walker, from where it is. It turns to the walker
+    /// on the first drag.
     private func pointOrbit() {
-        guard let view, let world else { return }
-        view.allowsCameraControl = true
-        view.defaultCameraController.interactionMode = .orbitTurntable
-        view.defaultCameraController.worldUp = SCNVector3(0, 1, 0)
-        view.defaultCameraController.target = WalkWorld.scn(world.walkerPosition(at: distance))
-        view.defaultCameraController.inertiaEnabled = true
+        guard let world else { return }
+        // Scrubbing and rebuilding set the model pose immediately; the presentation pose
+        // may still be the previous frame until SceneKit commits its transaction.
+        let p = world.camera.simdWorldPosition
+        let eye = SIMD3(Double(p.x), Double(-p.z), Double(p.y))
+        let o = TrailWalk.orbitAngles(of: eye, around: world.walkerPosition(at: distance))
+        orbit = (o.azimuth, min(89, max(-10, o.elevation)), min(Self.furthest, max(Self.closest, o.distance)))
+        spin = .zero
+    }
+
+    /// Turns the camera around the walker by a drag, points: dragging right turns the ground
+    /// right, dragging down lifts the camera to look down more.
+    fileprivate func turn(by drag: SIMD2<Double>) {
+        guard case .free = mode else { return }
+        let previous = orbit
+        spin = .zero
+        orbit.azimuth = (orbit.azimuth + drag.x * Self.degreesPerPoint).truncatingRemainder(dividingBy: 360)
+        orbit.elevation = min(89, max(-10, orbit.elevation + drag.y * Self.degreesPerPoint))
+        orbitCamera(from: previous)
+    }
+
+    /// Keeps turning after a flick, slowing down, from its speed in points a second; not with
+    /// Reduce Motion on, nor after a drag that was cancelled.
+    fileprivate func coast(_ velocity: SIMD2<Double>) {
+        guard case .free = mode, !UIAccessibility.isReduceMotionEnabled else { return }
+        spin = velocity * Self.degreesPerPoint
+    }
+
+    fileprivate func stopCoasting() { spin = .zero }
+
+    /// Brings the camera closer to the walker, or further, by a pinch's scale.
+    fileprivate func zoom(by scale: Double) {
+        guard case .free = mode, scale > 0 else { return }
+        let previous = orbit
+        spin = .zero
+        orbit.distance = min(Self.furthest, max(Self.closest, orbit.distance / scale))
+        orbitCamera(from: previous)
+    }
+
+    /// How close to the walker the camera comes, and how far it goes, looking around, meters.
+    static let closest = 60.0
+    static let furthest = 20_000.0
+
+    /// Puts the camera where `orbit` says, looking at the walker. Swung toward a slope, it
+    /// stops at the lowest angle where it's over the ground and sees the walker over what's in
+    /// between, as following does, rather than going into the hill; a flick stops sinking there.
+    /// Where no angle is clear, it stays where it was.
+    private func orbitCamera(from previous: (azimuth: Double, elevation: Double, distance: Double)? = nil) {
+        guard let world else { return }
+        let walker = world.walkerPosition(at: distance)
+        guard let lowest = TrailWalk.lowestClearElevation(around: walker, azimuth: orbit.azimuth, distance: orbit.distance,
+                                                          from: orbit.elevation, isClear: { world.isClear($0, seeing: walker) }) else {
+            if let previous { orbit = previous }
+            spin = .zero
+            return
+        }
+        if lowest > orbit.elevation {
+            orbit.elevation = lowest
+            spin.y = max(0, spin.y)
+        }
+        let eye = TrailWalk.orbit(around: walker, azimuth: orbit.azimuth, elevation: orbit.elevation, distance: orbit.distance)
+        place(eye: eye, target: walker, up: SIMD3(0, 0, 1))
     }
 
     private func startFollowing() {
@@ -1066,7 +1163,14 @@ final class WalkPlayer {
                 pointOrbit()
             }
         case .free:
-            break
+            if spin != .zero {
+                let previous = orbit
+                orbit.azimuth = (orbit.azimuth + spin.x * dt).truncatingRemainder(dividingBy: 360)
+                orbit.elevation = min(89, max(-10, orbit.elevation + spin.y * dt))
+                spin *= exp(-dt / 0.3)
+                if (spin * spin).sum() < 1 { spin = .zero }
+                orbitCamera(from: previous)
+            }
         }
         moveWalker()
         if let pov = view?.pointOfView?.presentation {
@@ -1085,10 +1189,6 @@ final class WalkPlayer {
             // Only what changed is set, so a still scene isn't drawn again.
             if abs(world.crests.opacity - opacity) > 1e-3 { world.crests.opacity = opacity }
             if world.crests.isHidden != (opacity < 0.01) { world.crests.isHidden = opacity < 0.01 }
-            // Looking around, dragged or pinched away from the walker, the haze follows too.
-            if case .free = mode, let target = view?.defaultCameraController.target {
-                world.haze(range: Double(simd_distance(pov.simdWorldPosition, SIMD3(target.x, target.y, target.z))))
-            }
         }
         if now - lastShown > 0.08 || !playing {
             lastShown = now
@@ -1119,6 +1219,34 @@ final class WalkPlayer {
         @objc func tick(_ link: CADisplayLink) {
             guard let player else { return link.invalidate() }
             player.tick(link)
+        }
+    }
+
+    /// Hands the look-around gestures to the player, which it holds weakly: the player keeps
+    /// this, since a gesture doesn't keep its target.
+    private final class Gestures: NSObject {
+        weak var player: WalkPlayer?
+        init(_ player: WalkPlayer) { self.player = player }
+
+        @objc func pan(_ gesture: UIPanGestureRecognizer) {
+            guard let player else { return }
+            switch gesture.state {
+            case .began, .changed:
+                let t = gesture.translation(in: gesture.view)
+                gesture.setTranslation(.zero, in: gesture.view)
+                player.turn(by: SIMD2(Double(t.x), Double(t.y)))
+            case .ended:
+                let v = gesture.velocity(in: gesture.view)
+                player.coast(SIMD2(Double(v.x), Double(v.y)))
+            default:
+                player.stopCoasting()
+            }
+        }
+
+        @objc func pinch(_ gesture: UIPinchGestureRecognizer) {
+            guard let player, gesture.state == .began || gesture.state == .changed else { return }
+            player.zoom(by: Double(gesture.scale))
+            gesture.scale = 1
         }
     }
 }

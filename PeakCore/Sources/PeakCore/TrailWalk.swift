@@ -26,6 +26,24 @@ extension ReliefMap {
         return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
     }
 
+    /// The highest grid point of every grid square within `radius` meters of `p` (a square
+    /// around it, to be safe), meters; NaN where none has terrain. The mesh's triangles never
+    /// rise above their corners, so nothing drawn there is higher; the bilinear height can be
+    /// lower than a triangle split along the higher diagonal.
+    public func highest(within radius: Double, of p: SIMD2<Double>) -> Double {
+        let col = p.x / cellSize + Double(cols - 1) / 2
+        let row = Double(rows - 1) / 2 - p.y / cellSize
+        let reach = radius / cellSize
+        let c0 = max(0, Int((col - reach).rounded(.down))), c1 = min(cols - 1, Int((col + reach).rounded(.up)))
+        let r0 = max(0, Int((row - reach).rounded(.down))), r1 = min(rows - 1, Int((row + reach).rounded(.up)))
+        guard c0 <= c1, r0 <= r1 else { return .nan }
+        var top = -Float.infinity
+        for r in r0...r1 {
+            for c in c0...c1 where h(r, c).isFinite { top = max(top, h(r, c)) }
+        }
+        return top.isFinite ? Double(top) : .nan
+    }
+
     /// The terrain as a mesh, using every `step`-th grid point each way (at least 1), so it
     /// can be kept to a size the GPU draws smoothly. Squares with a corner without terrain
     /// are left out, and so are squares entirely inside `hole` (map meters, lowest and
@@ -166,19 +184,64 @@ public struct TrailWalk: Sendable {
         let spot = SIMD2(target.x, target.y) - dir * (range * cos(angle))
         var eye = SIMD3(spot.x, spot.y, target.z + range * sin(angle))
         eye.z = max(eye.z, groundOr(spot, target.z) + clearance)
-        // The line from the eye to the walker must pass over the ground in between, checked
-        // every 15 m or so: by `clearance` near the camera, tapering to nothing at the walker,
-        // who stands on the ground. (A full clearance right beside the walker would hoist a
-        // low camera hundreds of meters.)
-        let start = SIMD2(spot.x, spot.y), end = SIMD2(p.x, p.y)
-        let samples = max(8, Int(Self.flat(SIMD3(end - start, 0)) / 15))
+        return (Self.raised(eye, toSee: p, clearance: clearance, ground: ground), target)
+    }
+
+    /// A camera orbiting `subject`: `distance` meters from it, in the direction `azimuth`
+    /// degrees clockwise from north and `elevation` degrees above level, as seen from it.
+    public static func orbit(around subject: SIMD3<Double>, azimuth: Double, elevation: Double,
+                             distance: Double) -> SIMD3<Double> {
+        let a = azimuth * .pi / 180, e = elevation * .pi / 180
+        return subject + distance * SIMD3(sin(a) * cos(e), cos(a) * cos(e), sin(e))
+    }
+
+    /// Where `eye` is around `subject`, as `orbit` takes it.
+    public static func orbitAngles(of eye: SIMD3<Double>, around subject: SIMD3<Double>)
+        -> (azimuth: Double, elevation: Double, distance: Double) {
+        let v = eye - subject
+        let distance = (v * v).sum().squareRoot()
+        guard distance > 1e-9 else { return (0, 90, 0) }
+        return (atan2(v.x, v.y) * 180 / .pi, asin(max(-1, min(1, v.z / distance))) * 180 / .pi, distance)
+    }
+
+    /// The lowest elevation from `elevation` up to `highest` degrees at which an eye orbiting
+    /// `subject` is clear, to a hundredth of a degree, or nil if it isn't even at `highest`.
+    /// What's returned was found clear; in between, once clear, higher is taken to be clear
+    /// too, as over a landscape.
+    public static func lowestClearElevation(around subject: SIMD3<Double>, azimuth: Double, distance: Double,
+                                            from elevation: Double, highest: Double = 89,
+                                            isClear: (SIMD3<Double>) -> Bool) -> Double? {
+        func clear(_ e: Double) -> Bool {
+            isClear(orbit(around: subject, azimuth: azimuth, elevation: e, distance: distance))
+        }
+        if clear(elevation) { return elevation }
+        guard elevation < highest, clear(highest) else { return nil }
+        var low = elevation, high = highest
+        while high - low > 0.01 {
+            let mid = (low + high) / 2
+            if clear(mid) { high = mid } else { low = mid }
+        }
+        return high
+    }
+
+    /// `eye` raised where needed so the line from it to `subject` passes over the ground in
+    /// between, checked every 15 m or so: by `clearance` near the eye, tapering to nothing at
+    /// the subject, who stands on the ground. (A full clearance right beside the subject would
+    /// hoist a low camera hundreds of meters.) `ground` gives the terrain's height at a map
+    /// position (NaN for none).
+    public static func raised(_ eye: SIMD3<Double>, toSee subject: SIMD3<Double>, clearance: Double,
+                              ground: (SIMD2<Double>) -> Double) -> SIMD3<Double> {
+        var eye = eye
+        let start = SIMD2(eye.x, eye.y), end = SIMD2(subject.x, subject.y)
+        let samples = max(8, Int(flat(SIMD3(end - start, 0)) / 15))
         for k in 1..<samples {
             let f = Double(k) / Double(samples)
-            let need = groundOr(start + (end - start) * f, -.infinity) + clearance * (1 - f)
-            // eye.z·(1−f) + p.z·f ≥ need
-            eye.z = max(eye.z, (need - p.z * f) / (1 - f))
+            let g = ground(start + (end - start) * f)
+            guard g.isFinite else { continue }
+            // eye.z·(1−f) + subject.z·f ≥ the ground + clearance·(1−f)
+            eye.z = max(eye.z, (g + clearance * (1 - f) - subject.z * f) / (1 - f))
         }
-        return (eye, target)
+        return eye
     }
 
     /// A flat band `width` meters wide along a line, laid on the ground: each edge sits `lift`

@@ -169,6 +169,78 @@ final class TrailWalkTests: XCTestCase {
         XCTAssertEqual(free.eye.z, 1_000 + 500 * sin(20 * .pi / 180), accuracy: 1e-6)
     }
 
+    /// An eye looking past a ridge at someone on the ground beyond rises to see over it; with
+    /// a clear view, or no terrain known, it stays put.
+    func testRaisedToSeeOverTheGround() {
+        let subject = SIMD3(0.0, 0, 1_000)
+        // A ridge 200 m high, halfway between, on ground at the subject's level.
+        let ridge: (SIMD2<Double>) -> Double = { p in 1_000 + 200 * max(0, 1 - abs(p.y + 300) / 50) }
+        let low = SIMD3(0.0, -600, 1_050)
+        let up = TrailWalk.raised(low, toSee: subject, clearance: 15, ground: ridge)
+        XCTAssertEqual(up.x, low.x)
+        XCTAssertEqual(up.y, low.y)
+        XCTAssertGreaterThan(up.z * 0.5 + subject.z * 0.5, 1_200, "the line passes over the crest")
+        XCTAssertEqual(TrailWalk.raised(low, toSee: subject, clearance: 15) { _ in 1_000 }, low)
+        XCTAssertEqual(TrailWalk.raised(low, toSee: subject, clearance: 15) { _ in .nan }, low)
+        // Right on top of the subject, it stays finite.
+        let on = TrailWalk.raised(SIMD3(0, 0, 1_003), toSee: SIMD3(0, 0, 1_003), clearance: 15) { _ in 1_000 }
+        XCTAssertTrue(on.z.isFinite)
+    }
+
+    /// An orbit's eye and its angles round-trip, with azimuth clockwise from north.
+    func testOrbitAngles() {
+        let subject = SIMD3(100.0, 200, 1_000)
+        let east = TrailWalk.orbit(around: subject, azimuth: 90, elevation: 0, distance: 500)
+        XCTAssertEqual(east.x, 600, accuracy: 1e-9)
+        XCTAssertEqual(east.y, 200, accuracy: 1e-9)
+        XCTAssertEqual(east.z, 1_000, accuracy: 1e-9)
+        let eye = TrailWalk.orbit(around: subject, azimuth: -135, elevation: 25, distance: 640)
+        let back = TrailWalk.orbitAngles(of: eye, around: subject)
+        XCTAssertEqual(back.azimuth, -135, accuracy: 1e-9)
+        XCTAssertEqual(back.elevation, 25, accuracy: 1e-9)
+        XCTAssertEqual(back.distance, 640, accuracy: 1e-9)
+    }
+
+    /// Orbiting into a hillside, the camera stops at the lowest angle that clears it, keeping
+    /// its distance and direction; already clear, it's left alone; never clear, there's none.
+    func testLowestClearElevationOverAHill() throws {
+        let subject = SIMD3(0.0, 0, 1_000)
+        // Ground rising 1 m per meter to the north of the subject.
+        let slope: (SIMD3<Double>) -> Bool = { eye in eye.z >= 1_000 + max(0, eye.y) + 15 }
+        let e = try XCTUnwrap(TrailWalk.lowestClearElevation(around: subject, azimuth: 0, distance: 500, from: 10, isClear: slope))
+        let eye = TrailWalk.orbit(around: subject, azimuth: 0, elevation: e, distance: 500)
+        XCTAssertTrue(slope(eye))
+        XCTAssertEqual(eye.z, 1_000 + eye.y + 15, accuracy: 0.2, "on the slope, not above it")
+        XCTAssertGreaterThan(e, 45)
+        // To the south, the ground falls away: nothing changes.
+        XCTAssertEqual(TrailWalk.lowestClearElevation(around: subject, azimuth: 180, distance: 500, from: 10, isClear: slope), 10)
+        XCTAssertNil(TrailWalk.lowestClearElevation(around: subject, azimuth: 0, distance: 500, from: 10) { _ in false })
+        // Clear only in a band in between (not a landscape): what comes back was still found clear.
+        let band: (SIMD3<Double>) -> Bool = { eye in eye.z > 1_200 && eye.z < 1_300 || eye.z > 1_490 }
+        let b = try XCTUnwrap(TrailWalk.lowestClearElevation(around: subject, azimuth: 0, distance: 500, from: 0, isClear: band))
+        XCTAssertTrue(band(TrailWalk.orbit(around: subject, azimuth: 0, elevation: b, distance: 500)))
+    }
+
+    /// The highest ground near a point takes in whole grid squares around it, never less than
+    /// the bilinear height, and is NaN off the grid or without terrain.
+    func testHighestGroundNearAPoint() {
+        // 5 × 5 points 10 m apart, flat at 100 m but for a 300 m spike at row 1, column 3
+        // (map x = 10, y = 10) and a hole at the far corner.
+        var heights = [Float](repeating: 100, count: 25)
+        heights[1 * 5 + 3] = 300
+        heights[4 * 5 + 0] = .nan
+        let grid = ReliefMap(center: LatLon(46, 7.7), cellSize: 10, rows: 5, cols: 5, heights: heights)
+        // The spike is within reach of a point inside a square it's a corner of …
+        XCTAssertEqual(grid.highest(within: 0, of: SIMD2(5, 5)), 300)
+        XCTAssertGreaterThanOrEqual(grid.highest(within: 0, of: SIMD2(5, 5)), grid.height(at: SIMD2(5, 5)))
+        // … and of one a square away once the radius takes it in, but not before.
+        XCTAssertEqual(grid.highest(within: 0, of: SIMD2(-15, -15)), 100)
+        XCTAssertEqual(grid.highest(within: 25, of: SIMD2(-15, -15)), 300)
+        XCTAssertTrue(grid.highest(within: 5, of: SIMD2(500, 0)).isNaN)
+        let empty = ReliefMap(center: LatLon(46, 7.7), cellSize: 10, rows: 3, cols: 3, heights: [Float](repeating: .nan, count: 9))
+        XCTAssertTrue(empty.highest(within: 50, of: SIMD2(0, 0)).isNaN)
+    }
+
     func testRibbonLiesOnTheSlope() {
         // Ground rising 0.5 m per meter to the east; a trail heading north.
         let slope: (SIMD2<Double>) -> Double = { 1_000 + 0.5 * $0.x }
