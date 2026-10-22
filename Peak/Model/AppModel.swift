@@ -247,8 +247,9 @@ final class AppModel {
         loadCalibration()
         Task { @MainActor in
             areas = await store.loadAreas()
-            // Areas whose download stopped partway (Peak was closed, or it failed) go on.
-            for area in areas where !area.complete { download(area) }
+            // Areas whose download stopped partway (Peak was closed, or it failed) go on,
+            // once it's known whether that would be on mobile data.
+            resumeIncompleteAreas()
         }
         locationDelegate.onLocation = { [weak self] in self?.locationChanged($0) }
         locationDelegate.onHeading = { [weak self] heading in
@@ -388,8 +389,11 @@ final class AppModel {
 
     private func networkChanged(online: Bool, wifi: Bool) {
         let back = online && !self.online
+        let joinedWiFi = wifi && !onWiFi
         self.online = online
         onWiFi = wifi
+        networkKnown = true
+        if back || joinedWiFi { resumeIncompleteAreas() }
         guard back else { return }
         // The connection came back: try again now for what failed.
         terrainBackoff.reset()
@@ -698,12 +702,16 @@ final class AppModel {
             loadState = .ready
 
             // Sharper terrain, nearest first; each pass shows when it's done.
-            let saved = areas.contains { $0.complete && $0.contains(LatLon(lat, lon)) }
-            let generous = saved || onWiFi || settings.detailOnMobile
+            // Inside a saved area, what it saved is on the phone: 120 m for all that can be
+            // seen, used whatever the network. Fetching more than that on mobile data is up
+            // to the setting.
+            let saved = Set(areas.filter { $0.complete && $0.contains(LatLon(lat, lon)) }.flatMap(\.tiles))
+            let generous = onWiFi || settings.detailOnMobile
             await sharpen(keys, lat, lon, level: 0, radius: 10_000, generation: generation)
             await sharpen(keys, lat, lon, level: 1, radius: 35_000, generation: generation)
-            await upgrade(keys, lat, lon, toLevel: 2, within: generous ? TerrainScene.radius + 50_000 : 60_000, generation: generation)
-            if generous { await sharpen(keys, lat, lon, level: 0, radius: saved || onWiFi ? 25_000 : 15_000, generation: generation) }
+            let wide = generous ? keys : keys.filter { saved.contains($0) || DataStore.distance(from: lat, lon, to: $0) < 60_000 }
+            await upgrade(wide, lat, lon, toLevel: 2, within: TerrainScene.radius + 50_000, generation: generation)
+            if generous { await sharpen(keys, lat, lon, level: 0, radius: onWiFi ? 25_000 : 15_000, generation: generation) }
             guard !superseded else { return }
             // Tiles that failed further out (the passes above only reach so far on mobile data).
             if keys.contains(where: { tiles[$0] == nil }) { scheduleTerrainRetry() } else { terrainBackoff.reset() }
@@ -883,6 +891,18 @@ final class AppModel {
         }
     }
 
+    /// The network path has been reported at least once (`online` and `onWiFi` mean something).
+    @ObservationIgnored private var networkKnown = false
+    /// Goes on with the areas whose download stopped partway (Peak was closed, or it
+    /// failed): after launch, and when the connection or Wi-Fi comes back. On mobile data
+    /// only if the sharpest terrain may be fetched on it.
+    private func resumeIncompleteAreas() {
+        guard networkKnown, online, onWiFi || settings.detailOnMobile else { return }
+        for area in areas where !area.complete && areaProgress?.id != area.id && !areaQueue.contains(area.id) {
+            download(area)
+        }
+    }
+
     /// Areas whose download ran out of time in the background.
     @ObservationIgnored private var cutShort: Set<UUID> = []
 
@@ -921,11 +941,19 @@ final class AppModel {
         do { try await store.downloadAreaPeaks(area) } catch { failed(error) }
         done += 1
         report("Hikes")
-        do { try await store.downloadAreaTrails(area) } catch { failed(error) }
+        let hikesFrom = done
+        do {
+            try await store.downloadAreaTrails(area) { boxes, total in
+                await MainActor.run {
+                    self.areaProgress = AreaProgress(id: area.id, fraction: (hikesFrom + Double(boxes) / Double(total)) / steps,
+                                                     step: total > 1 ? "Hikes \(boxes + 1) of \(total)" : "Hikes")
+                }
+            }
+        } catch { failed(error) }
         done += 1
         for (i, key) in far.enumerated() where !Task.isCancelled {
             report("Terrain \(i + 1) of \(far.count) · 120 m")
-            do { _ = try await store.tile(key, level: 2) } catch { failed(error) }
+            do { _ = try await store.tile(key, level: 2, strict: true) } catch { failed(error) }
             done += 1
         }
         for (i, key) in medium.enumerated() where !Task.isCancelled {

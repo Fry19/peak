@@ -73,7 +73,9 @@ public struct Trail: Codable, Sendable, Identifiable, Hashable {
         case path
     }
 
-    /// "r123" for a route relation, "p:" and the name for a named path.
+    /// "r123" for a route relation, "p:" and the name for a named path (and "#" and its
+    /// first way's id when ways of that name lie apart), "u" and a way's id for a path
+    /// without a name.
     public var id: String
     public var name: String
     public var kind: Kind
@@ -170,6 +172,38 @@ public struct Trail: Codable, Sendable, Identifiable, Hashable {
         let t = len2 > 0 ? max(0, min(1, -(ax * dx + ay * dy) / len2)) : 0
         let x = ax + t * dx, y = ay + t * dy
         return (x * x + y * y).squareRoot()
+    }
+
+    /// How far apart ways of the same name can be and still make one path, meters: gaps in
+    /// the mapping, or a path that crosses a road.
+    public static let pathGap = 250.0
+
+    /// Lines grouped so that each line's end comes within `gap` meters of another line of
+    /// its group, as indices into `lines`, in order of each group's first line.
+    public static func groups(_ lines: [[LatLon]], within gap: Double) -> [[Int]] {
+        var parent = Array(lines.indices)
+        func root(_ i: Int) -> Int {
+            var i = i
+            while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i] }
+            return i
+        }
+        let shapes = lines.map { Trail(id: "", name: "", kind: .path, lines: [$0]) }
+        for i in lines.indices {
+            for j in lines.indices where j > i && root(i) != root(j) {
+                let ends = [lines[i].first, lines[i].last, lines[j].first, lines[j].last]
+                let near = ends[0...1].contains { $0.map { shapes[j].distance(to: $0) <= gap } ?? false } ||
+                           ends[2...3].contains { $0.map { shapes[i].distance(to: $0) <= gap } ?? false }
+                if near { parent[root(j)] = root(i) }
+            }
+        }
+        var out: [Int: [Int]] = [:]
+        var order: [Int] = []
+        for i in lines.indices {
+            let r = root(i)
+            if out[r] == nil { order.append(r) }
+            out[r, default: []].append(i)
+        }
+        return order.map { out[$0]! }
     }
 
     /// Joins lines that share end points into as few lines as possible, longest first.
@@ -326,18 +360,30 @@ extension Overpass {
     }
 
     /// Hiking routes and named paths in a box (degrees), with their geometry clipped to it;
-    /// with a `summit`, also paths without a name near it. Boxes are what Overpass indexes,
-    /// so this is much quicker than searching around a point.
+    /// with a `summit`, also paths without a name near it, and with `everySummit`, paths
+    /// without a name near every named peak in or just outside the box (for an area saved
+    /// for offline use, so its peaks get the hikes they would online). Boxes are what
+    /// Overpass indexes, so this is much quicker than searching around a point.
     public static func trailsQuery(south: Double, west: Double, north: Double, east: Double,
-                                   summit: LatLon? = nil, summitRadius: Double = 400, timeout: Int = 25) -> String {
+                                   summit: LatLon? = nil, everySummit: Bool = false, summitRadius: Double = 400,
+                                   timeout: Int = 25) -> String {
         let box = String(format: "%.5f,%.5f,%.5f,%.5f", south, west, north, east)
-        let unnamed = summit.map {
-            String(format: "\n  way[\"highway\"~\"^(path|footway|steps|bridleway)$\"][!\"name\"](around:%.0f,%.6f,%.6f);",
-                   summitRadius, $0.latitude, $0.longitude)
+        let path = "way[\"highway\"~\"^(path|footway|steps|bridleway)$\"][!\"name\"]"
+        var summits = ""
+        var unnamed = summit.map {
+            "\n  \(path)" + String(format: "(around:%.0f,%.6f,%.6f);", summitRadius, $0.latitude, $0.longitude)
         } ?? ""
+        if everySummit {
+            // Peaks a little outside too: a path in the box can be near one.
+            let m = summitRadius / 111_000 * 2
+            let near = String(format: "%.5f,%.5f,%.5f,%.5f", south - m, west - m / max(cos(south * .pi / 180), 0.05),
+                              north + m, east + m / max(cos(north * .pi / 180), 0.05))
+            summits = "node[\"natural\"~\"^(peak|volcano)$\"][\"name\"](\(near))->.summits;\n"
+            unnamed += "\n  \(path)" + String(format: "(around.summits:%.0f)", summitRadius) + "(\(box));"
+        }
         return """
         [out:json][timeout:\(timeout)];
-        relation["route"~"^(hiking|foot)$"](\(box))->.routes;
+        \(summits)relation["route"~"^(hiking|foot)$"](\(box))->.routes;
         .routes out tags geom(\(box));
         way(r.routes)["sac_scale"];
         out tags;
@@ -428,21 +474,31 @@ extension Overpass {
                                 taggedLength: meters(tags["distance"])))
         }
 
-        // Named paths that aren't part of any route, grouped by name.
+        // Named paths that aren't part of any route: the ways of one name that meet or
+        // nearly meet (a gap in the mapping) make one trail. Ways of that name further apart
+        // ("Spur Trail" in two valleys of a large area) are trails of their own.
         var byName: [String: [Element]] = [:]
         for e in elements where e.type == "way" && e.geometry != nil && !routeWays.contains(e.id) {
             if let name = e.tags?["name"], !name.isEmpty { byName[name, default: []].append(e) }
         }
         for (name, ways) in byName {
-            let parts = ways.flatMap { pieces($0.geometry ?? []) }
-            let lines = Trail.chain(parts)
-            guard !lines.isEmpty else { continue }
-            let partial = ways.contains { $0.geometry?.contains(where: { $0 == nil }) ?? false }
-            trails.append(Trail(id: "p:" + name, name: name, kind: .path, lines: lines,
-                                difficulty: ways.compactMap { wayDifficulty[$0.id] }.max(),
-                                operatorName: ways.lazy.compactMap { $0.tags?["operator"] }.first, isPartial: partial))
+            let wayPieces = ways.flatMap { way in pieces(way.geometry ?? []).map { (way: way, piece: $0) } }
+            let chains = Trail.chainParts(wayPieces.map(\.piece))
+            var groups = Trail.groups(chains.map(\.line), within: Trail.pathGap).map { group -> (lines: [[LatLon]], ways: [Element]) in
+                var seen = Set<Int64>()
+                let members = group.flatMap { chains[$0].parts }.map { wayPieces[$0].way }.filter { seen.insert($0.id).inserted }
+                return (group.map { chains[$0].line }, members)
+            }
+            groups.sort { ($0.ways.map(\.id).min() ?? 0) < ($1.ways.map(\.id).min() ?? 0) }
+            for group in groups {
+                let id = groups.count == 1 ? "p:" + name : "p:\(name)#\(group.ways.map(\.id).min() ?? 0)"
+                let partial = group.ways.contains { $0.geometry?.contains(where: { $0 == nil }) ?? false }
+                trails.append(Trail(id: id, name: name, kind: .path, lines: group.lines,
+                                    difficulty: group.ways.compactMap { wayDifficulty[$0.id] }.max(),
+                                    operatorName: group.ways.lazy.compactMap { $0.tags?["operator"] }.first, isPartial: partial))
+            }
         }
-        // Paths without a name (fetched only near the summit), joined where they meet.
+        // Paths without a name (fetched only near summits), joined where they meet.
         let unnamed = elements.filter {
             $0.type == "way" && $0.geometry != nil && !routeWays.contains($0.id) && ($0.tags?["name"] ?? "").isEmpty
         }

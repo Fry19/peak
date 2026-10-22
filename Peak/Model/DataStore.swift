@@ -90,11 +90,14 @@ actor DataStore {
     enum Failure: LocalizedError {
         case download(String)
         case busy
+        /// The server has no such page.
+        case missing
 
         var errorDescription: String? {
             switch self {
             case let .download(what): return "Couldn't download \(what). Check your connection."
             case .busy: return "The OpenStreetMap server is busy. Try again in a minute."
+            case .missing: return "Not found."
             }
         }
     }
@@ -167,16 +170,19 @@ actor DataStore {
 
     /// The bucket said it has no such tile, not too long ago (then it's asked again).
     func isSea(_ key: Key) -> Bool {
-        let url = seaURL(key)
-        guard FileManager.default.fileExists(atPath: url.path) else { return false }
-        if age(of: url) < CopernicusBucket.seaLifetime { return true }
-        try? FileManager.default.removeItem(at: url)
-        return false
+        age(of: seaURL(key)) < CopernicusBucket.seaLifetime
+    }
+
+    /// The bucket said it has no such tile, however long ago: what to go by when it can't
+    /// be asked again (no signal), rather than having no terrain there.
+    private func wasSea(_ key: Key) -> Bool {
+        FileManager.default.fileExists(atPath: seaURL(key).path)
     }
 
     /// A whole tile at `level` or finer: from the phone if there, otherwise downloaded. Nil
-    /// for open sea, where the bucket has no tile.
-    func tile(_ key: Key, level: Level) async throws -> ElevationTile? {
+    /// for open sea, where the bucket has no tile. With `strict` (saving an area), a tile
+    /// that can't be kept on the phone (the disk is full) is a failure.
+    func tile(_ key: Key, level: Level, strict: Bool = false) async throws -> ElevationTile? {
         if isSea(key) { return nil }
         while let have = cachedLevel(key), have <= level {
             let file = tileURL(key, have)
@@ -184,7 +190,7 @@ actor DataStore {
             // Unreadable (cut short, or damaged): download it again.
             try? FileManager.default.removeItem(at: file)
         }
-        guard let layout = try await layout(key) else { return nil }
+        guard let layout = try await layout(key, strict: strict) else { return nil }
         let lvl = min(level, layout.images.count - 1)
         let range = layout.images[lvl].byteRange
         let (body, response) = try await fetch(remoteURL(key), range: range)
@@ -195,21 +201,33 @@ actor DataStore {
         case 200: tile = try GeoTIFF.decode(layout, level: lvl, bytes: [UInt8](body), base: 0)
         default: throw Failure.download("terrain (HTTP \(status))")
         }
-        // A full disk only means it isn't kept: the tile is good for now.
-        try? tile.write(to: tileURL(key, lvl))
+        // A full disk only means it isn't kept: the tile is good for now, but not for an area.
+        do { try tile.write(to: tileURL(key, lvl)) } catch { if strict { throw error } }
         return tile
     }
 
     /// The part of a tile at `level` within `radius` meters of a point, fetched block by
     /// block (blocks already on the phone aren't fetched again). Nil for open sea or when
-    /// the area misses the tile. Blocks that can't be fetched are left out, unless `strict`.
+    /// the area misses the tile. Blocks that can't be fetched are left out, unless `strict`
+    /// (saving an area), when blocks that can't be fetched or kept are a failure.
     func patch(_ key: Key, level: Level, latitude: Double, longitude: Double, radius: Double,
                strict: Bool = false) async throws -> ElevationTile? {
         if isSea(key) { return nil }
         // A whole tile at this level or finer makes a patch pointless.
         if let have = cachedLevel(key), have <= level { return nil }
-        guard let layout = try await layout(key), layout.images.indices.contains(level) else { return nil }
         let dlat = radius / 111_000, dlon = radius / (111_000 * max(cos(latitude * .pi / 180), 0.05))
+        let layout: GeoTIFF.Layout
+        do {
+            guard let found = try await self.layout(key, strict: strict), found.images.indices.contains(level) else { return nil }
+            layout = found
+        } catch {
+            // No header on the phone and no signal: the blocks that are here still do.
+            if !strict, let blocks = cachedBlocks(key, level, south: latitude - dlat, north: latitude + dlat,
+                                                  west: longitude - dlon, east: longitude + dlon) {
+                return blocks
+            }
+            throw error
+        }
         let blocks = layout.blocks(level: level, south: latitude - dlat, north: latitude + dlat,
                                    west: longitude - dlon, east: longitude + dlon)
         guard !blocks.isEmpty else { return nil }
@@ -232,7 +250,8 @@ actor DataStore {
                         guard status == 206 else { throw Failure.download("terrain (HTTP \(status))") }
                         let bytes = [UInt8](data)
                         let tile = try GeoTIFF.decode(layout, level: level, blocks: [block]) { _ in bytes[...] }
-                        try? tile.write(to: file)   // not kept if the disk is full, but good for now
+                        // Not kept if the disk is full: good for now, but not for an area.
+                        do { try tile.write(to: file) } catch { if strict { throw error } }
                         return .success(tile)
                     } catch {
                         return .failure(error)
@@ -250,20 +269,52 @@ actor DataStore {
         return ElevationTile(merging: parts)
     }
 
+    /// The blocks of a tile at `level` on the phone that overlap a box, joined; nil when
+    /// there are none. For when the tile's header (which says which blocks there are) is
+    /// missing and can't be fetched.
+    private func cachedBlocks(_ key: Key, _ level: Level, south: Double, north: Double, west: Double, east: Double) -> ElevationTile? {
+        let prefix = "\(key.name).L\(level).b"
+        let files = (try? FileManager.default.contentsOfDirectory(at: demDirectory, includingPropertiesForKeys: nil)) ?? []
+        let parts = files.filter { $0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension == "pkdem" }
+            .compactMap { try? ElevationTile(contentsOf: $0) }
+            .filter { t in
+                let top = t.originLatitude, bottom = top - Double(t.rows - 1) * t.stepLatitude
+                let left = t.originLongitude, right = left + Double(t.cols - 1) * t.stepLongitude
+                return bottom <= north && top >= south && left <= east && right >= west
+            }
+        return parts.isEmpty ? nil : ElevationTile(merging: parts)
+    }
+
     /// The tile's image directories, from the phone or the first 16 KB of the file. Nil
-    /// for open sea.
-    private func layout(_ key: Key) async throws -> GeoTIFF.Layout? {
-        if let layout = layouts[key] { return layout }
-        let file = demDirectory.appendingPathComponent(key.name + ".head")
+    /// for open sea. With `strict`, a header that can't be kept on the phone is a failure,
+    /// so a saved area never needs the network for it.
+    private func layout(_ key: Key, strict: Bool = false) async throws -> GeoTIFF.Layout? {
+        if let layout = layouts[key] {
+            if strict, !FileManager.default.fileExists(atPath: headURL(key).path) {
+                layouts[key] = nil   // read this session but not kept: fetch and keep it
+            } else {
+                return layout
+            }
+        }
+        let file = headURL(key)
         if let data = try? Data(contentsOf: file), let layout = try? GeoTIFF.layout([UInt8](data)) {
             layouts[key] = layout
             return layout
         }
-        let (head, response) = try await fetch(remoteURL(key), range: 0..<16_384)
+        let head: Data, response: HTTPURLResponse?
+        do {
+            (head, response) = try await fetch(remoteURL(key), range: 0..<16_384)
+        } catch {
+            // No signal: open sea stays sea, however long ago the bucket said so.
+            if wasSea(key) { return nil }
+            throw error
+        }
         let status = response?.statusCode ?? 0
         switch CopernicusBucket.answer(status: status, server: response?.value(forHTTPHeaderField: "Server"), body: head) {
         case .sea:
-            FileManager.default.createFile(atPath: seaURL(key).path, contents: nil)
+            if !FileManager.default.createFile(atPath: seaURL(key).path, contents: nil), strict {
+                throw CocoaError(.fileWriteOutOfSpace)
+            }
             return nil
         case .error:
             throw Failure.download("terrain (HTTP \(status))")
@@ -271,9 +322,14 @@ actor DataStore {
             break
         }
         let layout = try GeoTIFF.layout([UInt8](head.prefix(16_384)))
-        try? head.prefix(16_384).write(to: file, options: .atomic)
+        try? FileManager.default.removeItem(at: seaURL(key))
+        do { try head.prefix(16_384).write(to: file, options: .atomic) } catch { if strict { throw error } }
         layouts[key] = layout
         return layout
+    }
+
+    private func headURL(_ key: Key) -> URL {
+        demDirectory.appendingPathComponent(key.name + ".head")
     }
 
     private func remoteURL(_ key: Key) -> URL {
@@ -393,37 +449,51 @@ actor DataStore {
     }
 
     /// Named peaks from OpenStreetMap, cached for a month. Inside an area saved for offline
-    /// use, the area's peaks; when the servers can't be reached, an older cache or what saved
-    /// areas nearby have. Throws when there's none of that, so the caller can try again.
+    /// use, the area's peaks; when the servers can't be reached, an older cache, a nearby
+    /// cell's cache that reaches here, or what saved areas nearby have. Throws when there's
+    /// none of that, so the caller can try again.
     func peaks(latitude: Double, longitude: Double, radius: Double) async throws -> [Peak] {
         // Cache by a 0.25° grid cell so nearby spots share one download.
-        let cellLat = (latitude * 4).rounded() / 4, cellLon = (longitude * 4).rounded() / 4
-        // "v2": since volcanoes are fetched too, so caches without them are fetched again.
-        let cache = peakDirectory.appendingPathComponent(String(format: "%.2f_%.2f_%d_v2.json", cellLat, cellLon, Int(radius / 1000)))
+        let cell = PeakCell(latitude: latitude, longitude: longitude, radius: radius)
+        let cache = peakDirectory.appendingPathComponent(cell.fileName)
         // None at all is more likely a download gone wrong than a place without peaks, so
         // ask again after a day.
         if let peaks = cachedPeaks(cache), age(of: cache) < (peaks.isEmpty ? 86_400 : 30 * 86_400) { return peaks }
         let here = LatLon(latitude, longitude)
         if let saved = areaPeaks(around: here, radius: radius, coveredOnly: true) { return saved }
         do {
-            return try await downloadPeaks(cellLat: cellLat, cellLon: cellLon, radius: radius, to: cache)
+            return try await downloadPeaks(cell, to: cache)
         } catch {
             if let peaks = cachedPeaks(cache) { return peaks }
+            // Walked from one cell into the next with no signal: the first one's peaks reach
+            // well past it.
+            if let peaks = coveringPeaks(here, radius: radius) { return peaks }
             if let saved = areaPeaks(around: here, radius: radius, coveredOnly: false) { return saved }
             throw error
         }
+    }
+
+    /// The peaks of the cached cell nearest a point whose box has the point in it.
+    private func coveringPeaks(_ here: LatLon, radius: Double) -> [Peak]? {
+        let files = (try? FileManager.default.contentsOfDirectory(at: peakDirectory, includingPropertiesForKeys: nil)) ?? []
+        var cells = files.compactMap { file in PeakCell(fileName: file.lastPathComponent).map { (cell: $0, file: file) } }
+        while let best = PeakCell.nearestCovering(here, radius: radius, among: cells.map(\.cell)) {
+            let file = cells.first { $0.cell == best }!.file
+            if let peaks = cachedPeaks(file), !peaks.isEmpty { return peaks }
+            cells.removeAll { $0.cell == best }
+        }
+        return nil
     }
 
     /// Peak downloads under way, by cache file: a second load for the same place waits for
     /// the first instead of asking the servers again.
     private var peakDownloads: [URL: Task<[Peak], Error>] = [:]
 
-    private func downloadPeaks(cellLat: Double, cellLon: Double, radius: Double, to cache: URL) async throws -> [Peak] {
+    private func downloadPeaks(_ cell: PeakCell, to cache: URL) async throws -> [Peak] {
         if let running = peakDownloads[cache] { return try await running.value }
         // A little beyond the radius, around the cell's center, so the whole circle is covered.
-        let r = radius + 20_000
-        let dlat = r / 111_000, dlon = r / (111_000 * max(cos(cellLat * .pi / 180), 0.05))
-        let query = Overpass.peaksQuery(south: cellLat - dlat, west: cellLon - dlon, north: cellLat + dlat, east: cellLon + dlon)
+        let box = cell.box
+        let query = Overpass.peaksQuery(south: box.south, west: box.west, north: box.north, east: box.east)
         let download = Task {
             let data = try await self.overpass(query, timeout: 90)
             let peaks = try Overpass.peaks(fromJSON: data)
@@ -448,7 +518,7 @@ actor DataStore {
                 .map { Date().timeIntervalSince($0) } ?? .infinity
             if age < (trails.isEmpty ? 86_400 : 30 * 86_400) { return nearby(trails, peak) }
         }
-        if let saved = areaTrails(near: peak) { return saved }
+        if let saved = areaTrails(near: peak, whole: true) { return saved }
         do {
             let data = try await overpass(Overpass.trailsQuery(latitude: peak.latitude, longitude: peak.longitude,
                                                                radius: Self.hikeRadius))
@@ -457,13 +527,23 @@ actor DataStore {
             return nearby(trails, peak)
         } catch {
             if let data = try? Data(contentsOf: cache), let trails = try? Overpass.trails(fromJSON: data) { return nearby(trails, peak) }
+            // An area whose hikes were only partly saved: better than none.
+            if let saved = areaTrails(near: peak, whole: false) { return saved }
             throw error
         }
     }
 
+    /// The hikes within `hikeRadius` of a peak, and of the paths without a name only those
+    /// near its summit (an area has them for all its peaks).
     private func nearby(_ trails: [Trail], _ peak: Peak) -> [Trail] {
-        trails.filter { $0.distance(to: peak.position) <= Self.hikeRadius }
+        trails.filter {
+            $0.distance(to: peak.position) <= ($0.id.hasPrefix("u") ? Self.summitPathRadius : Self.hikeRadius)
+        }
     }
+
+    /// How far from a summit paths without a name are looked for (`trailsQuery`'s
+    /// `summitRadius`), with a little to spare, meters.
+    static let summitPathRadius = 450.0
 
     // MARK: Areas saved for offline use
     //
@@ -490,28 +570,70 @@ actor DataStore {
         areaDirectory.appendingPathComponent("\(area.id.uuidString).\(kind).json")
     }
 
-    /// Downloads the named peaks that can be seen from anywhere in an area.
+    /// Every file of an area's peaks and hikes, including the parts of hikes saved so far.
+    private func areaFiles(_ area: OfflineArea) -> [URL] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: areaDirectory, includingPropertiesForKeys: nil)) ?? []
+        return files.filter { $0.lastPathComponent.hasPrefix(area.id.uuidString + ".") }
+    }
+
+    /// Downloads the named peaks that can be seen from anywhere in an area, unless they're
+    /// on the phone already (resuming a download that stopped).
     func downloadAreaPeaks(_ area: OfflineArea) async throws {
+        if savedPeaks(of: area) != nil { return }
         let box = area.box(margin: TerrainScene.radius + 10_000)
         let data = try await overpass(Overpass.peaksQuery(south: box.south, west: box.west, north: box.north, east: box.east),
                                       timeout: 150)
-        areaPeakCache[area.id] = try Overpass.peaks(fromJSON: data)
+        let peaks = try Overpass.peaks(fromJSON: data)
         try data.write(to: areaFile(area, "peaks"), options: .atomic)
+        areaPeakCache[area.id] = peaks
     }
 
-    /// Downloads the hiking routes and named paths for every peak in an area.
-    func downloadAreaTrails(_ area: OfflineArea) async throws {
-        let box = area.box(margin: Self.hikeRadius)
-        let query = Overpass.trailsQuery(south: box.south, west: box.west, north: box.north, east: box.east, timeout: 180)
-        let data = try await overpass(query, timeout: 200)
-        areaTrailCache[area.id] = try Overpass.trails(fromJSON: data)
-        try data.write(to: areaFile(area, "trails"), options: .atomic)
+    /// The boxes an area's hikes are fetched in, at most 30 km across: one query for a
+    /// 50 km area in the Alps runs out of time on the server.
+    nonisolated static func trailBoxes(_ area: OfflineArea) -> [GeoBox] {
+        let box = area.box(margin: hikeRadius)
+        return GeoBox(south: box.south, west: box.west, north: box.north, east: box.east).split(side: 30_000)
+    }
+
+    /// Downloads the hiking routes and paths for every peak in an area (with the paths
+    /// without a name up to each summit, as for a single peak), box by box. Boxes already
+    /// on the phone (resuming) aren't fetched again; one that fails doesn't stop the rest.
+    /// `progress` gets the boxes done and their number.
+    func downloadAreaTrails(_ area: OfflineArea, progress: @Sendable (Int, Int) async -> Void = { _, _ in }) async throws {
+        if FileManager.default.fileExists(atPath: areaFile(area, "trails").path) { return }
+        let boxes = Self.trailBoxes(area)
+        var failure: Error?
+        for (i, box) in boxes.enumerated() {
+            await progress(i, boxes.count)
+            try Task.checkCancellation()
+            let file = areaFile(area, "trails.\(i)")
+            if FileManager.default.fileExists(atPath: file.path) { continue }
+            do {
+                let query = Overpass.trailsQuery(south: box.south, west: box.west, north: box.north, east: box.east,
+                                                 everySummit: true, timeout: 90)
+                let data = try await overpass(query, timeout: 100)
+                _ = try Overpass.trails(fromJSON: data)
+                try data.write(to: file, options: .atomic)
+                areaTrailCache[area.id] = nil   // the parts so far, read again with this one
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                failure = error
+            }
+        }
+        if let failure { throw failure }
+        let parts = boxes.indices.map { areaFile(area, "trails.\($0)") }
+        let merged = try Overpass.merge(try parts.map { try Data(contentsOf: $0) })
+        let trails = try Overpass.trails(fromJSON: merged)
+        try merged.write(to: areaFile(area, "trails"), options: .atomic)
+        for part in parts { try? FileManager.default.removeItem(at: part) }
+        areaTrailCache[area.id] = trails
     }
 
     /// Deletes an area's peaks and hikes, and the terrain no other area (and not the place
     /// you are now) uses.
     func deleteArea(_ area: OfflineArea, keeping others: [OfflineArea], near here: LatLon?) {
-        for kind in ["peaks", "trails"] { try? FileManager.default.removeItem(at: areaFile(area, kind)) }
+        for file in areaFiles(area) { try? FileManager.default.removeItem(at: file) }
         areaPeakCache[area.id] = nil
         areaTrailCache[area.id] = nil
         var kept = Set(others.flatMap(\.tiles))
@@ -529,12 +651,8 @@ actor DataStore {
         let names = Set(area.tiles.map(\.name))
         var files = (try? FileManager.default.contentsOfDirectory(at: demDirectory, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         files = files.filter { names.contains(String($0.lastPathComponent.prefix(7))) }
-        files += [areaFile(area, "peaks"), areaFile(area, "trails")]
+        files += areaFiles(area)
         return files.reduce(0) { $0 + ((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
-    }
-
-    private func savedAreas() -> [OfflineArea] {
-        loadAreas().filter(\.complete)
     }
 
     private func savedPeaks(of area: OfflineArea) -> [Peak]? {
@@ -544,21 +662,33 @@ actor DataStore {
         return peaks
     }
 
-    private func savedTrails(of area: OfflineArea) -> [Trail]? {
-        if let trails = areaTrailCache[area.id] { return trails }
-        guard let data = try? Data(contentsOf: areaFile(area, "trails")), let trails = try? Overpass.trails(fromJSON: data) else { return nil }
-        areaTrailCache[area.id] = trails
-        return trails
+    /// An area's hikes, or nil when they aren't saved. With `whole` false, those of the
+    /// boxes saved so far when the download stopped partway.
+    private func savedTrails(of area: OfflineArea, whole: Bool) -> [Trail]? {
+        let file = areaFile(area, "trails")
+        if FileManager.default.fileExists(atPath: file.path) {
+            if let trails = areaTrailCache[area.id] { return trails }
+            guard let data = try? Data(contentsOf: file), let trails = try? Overpass.trails(fromJSON: data) else { return nil }
+            areaTrailCache[area.id] = trails
+            return trails
+        }
+        guard !whole else { return nil }
+        let parts = areaFiles(area).filter { $0.lastPathComponent.contains(".trails.") }.compactMap { try? Data(contentsOf: $0) }
+        guard !parts.isEmpty, let merged = try? Overpass.merge(parts) else { return nil }
+        return try? Overpass.trails(fromJSON: merged)
     }
 
-    /// Peaks within `radius` of a point from the saved areas. With `coveredOnly`, nil unless
-    /// one area has every peak there (you're inside it); otherwise whatever they have, or nil.
+    /// Peaks within `radius` of a point from the saved areas, also those whose download
+    /// stopped partway (their peaks come first, and are often all there is offline). With
+    /// `coveredOnly`, nil unless one area has every peak there (you're inside it);
+    /// otherwise whatever they have, or nil.
     private func areaPeaks(around here: LatLon, radius: Double, coveredOnly: Bool) -> [Peak]? {
-        var areas = savedAreas()
+        var areas = loadAreas()
         if coveredOnly {
             // An area has the peaks within its radius plus `TerrainScene.radius` + 10 km.
-            guard let area = areas.first(where: { here.distance(to: $0.center) + radius <= $0.radius + TerrainScene.radius + 10_000 })
-            else { return nil }
+            guard let area = areas.first(where: {
+                here.distance(to: $0.center) + radius <= $0.radius + TerrainScene.radius + 10_000 && savedPeaks(of: $0) != nil
+            }) else { return nil }
             areas = [area]
         }
         var seen = Set<Int64>()
@@ -572,11 +702,13 @@ actor DataStore {
         return peaks.isEmpty && !coveredOnly ? nil : peaks
     }
 
-    /// Hikes near a peak in a saved area, or nil when no area has all of them.
-    private func areaTrails(near peak: Peak) -> [Trail]? {
-        guard let area = savedAreas().first(where: { peak.position.distance(to: $0.center) <= $0.radius }),
-              let trails = savedTrails(of: area) else { return nil }
-        return nearby(trails, peak)
+    /// Hikes near a peak in a saved area, or nil when no area has them (with `whole`, all
+    /// of them; otherwise also an area whose hikes were saved only partly).
+    private func areaTrails(near peak: Peak, whole: Bool) -> [Trail]? {
+        for area in loadAreas() where peak.position.distance(to: area.center) <= area.radius {
+            if let trails = savedTrails(of: area, whole: whole) { return nearby(trails, peak) }
+        }
+        return nil
     }
 
     // MARK: Wikidata and Wikipedia
@@ -590,21 +722,37 @@ actor DataStore {
         }
         do {
             var facts = PeakFacts()
+            // Some of it couldn't be fetched (no signal for the second request): shown, but
+            // kept only an hour, so it's completed soon rather than in a month.
+            var partial = false
             if let id = peak.wikidata {
                 facts = try Wikidata.facts(fromJSON: try await get(Wikidata.entityURL(id)), id: id)
                 let ids = facts.linkedIDs
-                if !ids.isEmpty, let labels = try? Wikidata.labels(fromJSON: try await get(Wikidata.labelsURL(ids))) {
-                    facts.range = facts.rangeID.flatMap { labels[$0] }
-                    facts.parent = facts.parentID.flatMap { labels[$0] }
-                    facts.countries = facts.countryIDs.compactMap { labels[$0] }
+                if !ids.isEmpty {
+                    if let labels = try? Wikidata.labels(fromJSON: try await get(Wikidata.labelsURL(ids))) {
+                        facts.range = facts.rangeID.flatMap { labels[$0] }
+                        facts.parent = facts.parentID.flatMap { labels[$0] }
+                        facts.countries = facts.countryIDs.compactMap { labels[$0] }
+                    } else {
+                        partial = true
+                    }
                 }
             }
             if let article = Wikipedia.article(facts: facts, osmTag: peak.wikipedia),
-               let url = Wikipedia.summaryURL(language: article.language, title: article.title),
-               let data = try? await get(url) {
-                try? Wikipedia.addSummary(fromJSON: data, to: &facts)
+               let url = Wikipedia.summaryURL(language: article.language, title: article.title) {
+                do {
+                    try Wikipedia.addSummary(fromJSON: try await get(url), to: &facts)
+                } catch Failure.missing {
+                    // No such article: nothing to add, now or later.
+                } catch {
+                    partial = true
+                }
             }
-            if let data = try? JSONEncoder().encode(facts) { try? data.write(to: cache, options: .atomic) }
+            if let data = try? JSONEncoder().encode(facts), (try? data.write(to: cache, options: .atomic)) != nil, partial {
+                // Dated so that it's a month old in an hour.
+                try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(3_600 - 30 * 86_400)],
+                                                       ofItemAtPath: cache.path)
+            }
             return facts
         } catch {
             if let data = try? Data(contentsOf: cache), let facts = try? JSONDecoder().decode(PeakFacts.self, from: data) {
@@ -620,7 +768,9 @@ actor DataStore {
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         bytesDownloaded += data.count
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw Failure.download("facts") }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 404 { throw Failure.missing }
+        guard status == 200 else { throw Failure.download("facts") }
         return data
     }
 
