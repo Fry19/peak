@@ -174,7 +174,7 @@ final class PhotoImportTests: XCTestCase {
         let lat = 46.05, lon = 7.95
         let observer = renderer.observer(latitude: lat, longitude: lon)
         let world = horizon(from: observer, step: 0.05)
-        let truth = Attitude(heading: awayFromNorth ? Self.farHeading(world, within: 90...270) : AlignmentTests().farHeading(world),
+        let truth = Attitude(heading: awayFromNorth ? Self.farHeading(world, within: 90...270) : AlignmentTests.farHeading(world),
                              pitch: 1.8, roll: -0.9)
         let (w, h) = orientation >= 5 ? (3024, 4032) : (4032, 3024)
         var p = properties(width: orientation >= 5 ? h : w, height: orientation >= 5 ? w : h, orientation: orientation,

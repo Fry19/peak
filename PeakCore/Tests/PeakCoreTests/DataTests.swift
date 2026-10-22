@@ -159,7 +159,7 @@ final class GeoTIFFTests: XCTestCase {
         let overview = try GeoTIFF.decode(layout, level: 1, bytes: Array(bytes[range]), base: range.lowerBound)
         XCTAssertEqual(overview.rows, 20)
         XCTAssertEqual(overview.south, 35)
-        XCTAssertEqual(overview.heightValues[3 * 20 + 4], Int16(1000 + 6 * 3 - 4 * 4))
+        XCTAssertEqual(overview.heightValues[3 * 20 + 4], 1000 + 6 * 3 - 4 * 4)
         // Blocks are found for an area of the cell, and one block decodes on its own.
         let blocks = layout.blocks(level: 0, south: 35.0, north: 35.12, west: -83.12, east: -83.0)
         XCTAssertEqual(blocks, [8])

@@ -56,7 +56,9 @@ final class LandCoverTests: XCTestCase {
     func testSlantedEdgesCoverTheirShare() {
         let triangle = ring([(-450, -450), (450, -450), (-450, 450)])
         let cover = grid().landCover([LandCoverArea(id: 1, cover: .rock, rings: [triangle])])
-        XCTAssertEqual(Double(cover.rock.reduce(0, +)) * 100 * 100, 900 * 900 / 2, accuracy: 900 * 900 / 2 * 0.01)
+        let area = Double(cover.rock.reduce(0, +)) * 100 * 100
+        let half: Double = 900 * 900 / 2
+        XCTAssertEqual(area, half, accuracy: half * 0.01)
         XCTAssertEqual(at(cover.rock, -300, -300), 1)
         XCTAssertEqual(at(cover.rock, 300, 300), 0)
         // On the diagonal: about half.

@@ -7,7 +7,7 @@ final class AlignmentTests: XCTestCase {
     static let terrain = TestTerrain.range()
     let k = CameraIntrinsics(width: 640, height: 480, horizontalFOV: 64)
 
-    func horizon(from observer: GeoPoint, step: Double = 0.1, terrain: Terrain = terrain) -> HorizonProfile {
+    static func horizon(from observer: GeoPoint, step: Double = 0.1, terrain: Terrain = terrain) -> HorizonProfile {
         var s = HorizonSettings()
         s.azimuthStep = step
         s.maxDistance = 80_000
@@ -15,7 +15,7 @@ final class AlignmentTests: XCTestCase {
     }
 
     /// A heading where the skyline is mostly far away.
-    func farHeading(_ profile: HorizonProfile) -> Double {
+    static func farHeading(_ profile: HorizonProfile) -> Double {
         let half = Int(25 / profile.azimuthStep)
         let best = stride(from: 0, to: profile.count, by: 10).max { a, b in
             func farCount(_ c: Int) -> Int {
@@ -29,14 +29,14 @@ final class AlignmentTests: XCTestCase {
     func testRecoversCompassError() {
         let renderer = HorizonRenderer(terrain: Self.terrain)
         let observer = renderer.observer(latitude: 46.05, longitude: 7.95)
-        let world = horizon(from: observer, step: 0.05)
-        let truth = Attitude(heading: farHeading(world), pitch: 2.5, roll: 1.2)
+        let world = Self.horizon(from: observer, step: 0.05)
+        let truth = Attitude(heading: Self.farHeading(world), pitch: 2.5, roll: 1.2)
         // Clear air: in thick haze the far cones fade into the sky (see the bench for that).
         var scene = SyntheticScene()
         scene.hazeDistance = 200_000
         let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth), scene: scene)
 
-        let model = horizon(from: observer)
+        let model = Self.horizon(from: observer)
         for compassError in [-14.0, 9.0] {
             var prior = truth
             prior.heading = normalizedAzimuth(truth.heading + compassError)
@@ -52,7 +52,7 @@ final class AlignmentTests: XCTestCase {
 
     func testFlatHorizonIsRejected() {
         let observer = GeoPoint(latitude: 46, longitude: 8, height: 450)
-        let world = horizon(from: observer, terrain: TestTerrain.cones([], base: 400))
+        let world = Self.horizon(from: observer, terrain: TestTerrain.cones([], base: 400))
         let truth = Attitude(heading: 75, pitch: 1)
         let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth))
         var prior = truth
@@ -66,8 +66,8 @@ final class AlignmentTests: XCTestCase {
     func testPitchAndRollStayInRange() {
         let renderer = HorizonRenderer(terrain: Self.terrain)
         let observer = renderer.observer(latitude: 46.05, longitude: 7.95)
-        let world = horizon(from: observer, step: 0.05)
-        let truth = Attitude(heading: farHeading(world), pitch: 1, roll: 3)
+        let world = Self.horizon(from: observer, step: 0.05)
+        let truth = Attitude(heading: Self.farHeading(world), pitch: 1, roll: 3)
         var scene = SyntheticScene()
         scene.hazeDistance = 200_000
         let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth), scene: scene)
@@ -75,7 +75,7 @@ final class AlignmentTests: XCTestCase {
         prior.heading = normalizedAzimuth(truth.heading + 7)
         prior.roll = 0
         let s = AlignmentSettings()
-        let a = SkylineMatcher().match(photo, intrinsics: k, prior: prior, horizon: horizon(from: observer)).alignment
+        let a = SkylineMatcher().match(photo, intrinsics: k, prior: prior, horizon: Self.horizon(from: observer)).alignment
         XCTAssertLessThanOrEqual(abs(a.pitchCorrection), s.pitchRange + 1e-9)
         XCTAssertLessThanOrEqual(abs(a.rollCorrection), s.rollRange + 1e-9)
         for rival in [a.runnerUp, a.nearRunnerUp].compactMap({ $0 }) {
@@ -87,7 +87,7 @@ final class AlignmentTests: XCTestCase {
     /// A flat horizon fits every heading: the rejection names the fit that came closest.
     func testAmbiguityReportsTheRunnerUp() throws {
         let observer = GeoPoint(latitude: 46, longitude: 8, height: 450)
-        let world = horizon(from: observer, terrain: TestTerrain.cones([], base: 400))
+        let world = Self.horizon(from: observer, terrain: TestTerrain.cones([], base: 400))
         let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: Attitude(heading: 75, pitch: 1)))
         let a = SkylineMatcher().match(photo, intrinsics: k, prior: Attitude(heading: 81, pitch: 1), horizon: world).alignment
         XCTAssertFalse(a.accepted)

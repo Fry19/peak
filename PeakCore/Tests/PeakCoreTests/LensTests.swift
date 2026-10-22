@@ -154,10 +154,9 @@ final class LensTests: XCTestCase {
     func testMatchesThroughATelephoto() {
         let renderer = HorizonRenderer(terrain: AlignmentTests.terrain)
         let observer = renderer.observer(latitude: 46.05, longitude: 7.95)
-        let tests = AlignmentTests()
-        let world = tests.horizon(from: observer, step: 0.05)
+        let world = AlignmentTests.horizon(from: observer, step: 0.05)
         let k = CameraIntrinsics(width: 540, height: 960, horizontalFOV: 8)
-        let truth = Attitude(heading: tests.farHeading(world), pitch: 1.5, roll: 0.4)
+        let truth = Attitude(heading: AlignmentTests.farHeading(world), pitch: 1.5, roll: 0.4)
         var scene = SyntheticScene()
         scene.hazeDistance = 200_000
         let photo = SyntheticPhoto.render(world, camera: Camera(intrinsics: k, attitude: truth), scene: scene)
@@ -167,7 +166,7 @@ final class LensTests: XCTestCase {
         var matcher = SkylineMatcher()
         matcher.settings.adapt(toHorizontalFOV: k.horizontalFOV)
         XCTAssertEqual(matcher.settings.minFarSpan, 2.8, accuracy: 1e-9)
-        let m = matcher.match(photo, intrinsics: k, prior: prior, horizon: tests.horizon(from: observer))
+        let m = matcher.match(photo, intrinsics: k, prior: prior, horizon: AlignmentTests.horizon(from: observer))
         XCTAssertTrue(m.alignment.accepted, m.alignment.rejectionReason ?? "")
         XCTAssertEqual(azimuthDifference(m.alignment.attitude.heading, truth.heading), 0, accuracy: 0.05)
         XCTAssertEqual(m.alignment.attitude.pitch, truth.pitch, accuracy: 0.05)
