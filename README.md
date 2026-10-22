@@ -179,6 +179,7 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
   Sources/peakbench/       The desk harness
   Tests/PeakCoreTests/     Unit tests on procedural terrain with known geometry
 Tools/fetch_dem.py         Downloads Copernicus tiles and writes .pkdem files
+Tools/make_icon.py         Renders the app icon and its tinted variant
 docs/                      Images for this README
 ```
 
