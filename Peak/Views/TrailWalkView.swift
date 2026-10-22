@@ -31,6 +31,9 @@ enum TrailTerrainStyle {
         return MapExtent(center: frame.center, width: side, height: side)
     }
 
+    /// Around a summit on its own: its ridges and the valleys below them, 7 km each way.
+    static func extent(peak: Peak) -> MapExtent { MapExtent(center: peak.position, width: 14_000, height: 14_000) }
+
     static func cellSize(for extent: MapExtent) -> Double { max(15, extent.width / 1_024) }
 }
 
@@ -52,15 +55,7 @@ struct TrailWalkView: View {
     @State private var world: WalkWorld?
     @State private var player = WalkPlayer()
     @State private var failed = false
-    /// Satellite imagery over the terrain and the ring around it, kept for a sharper
-    /// rebuild of the same ground.
-    @State private var nearImagery: MapImagery?
-    @State private var farImagery: MapImagery?
-    /// The sharper imagery around the walker, and the photos over the hills around, kept
-    /// likewise.
-    @State private var detailImagery: MapImagery?
-    @State private var midImagery: MapImagery?
-    @State private var draped = false
+    @State private var imagery = WalkImagery()
     /// Where the chip and the controls are, in window coordinates, for labels to keep clear of.
     @State private var chipFrame = CGRect.zero
     @State private var controlsFrame = CGRect.zero
@@ -70,7 +65,8 @@ struct TrailWalkView: View {
             TrailFromAboveView.background
                 .ignoresSafeArea()
             if let world {
-                WalkSceneView(world: world, player: player, you: model.tracker.youOnMap(trail.trail))
+                WalkSceneView(world: world, player: player, you: model.tracker.youOnMap(trail.trail),
+                              label: "\(trail.trail.name) in 3D")
                     .ignoresSafeArea()
                     .transition(.opacity)
             } else if failed {
@@ -81,7 +77,7 @@ struct TrailWalkView: View {
                 ProgressView()
                     .tint(.white)
             }
-            if draped {
+            if imagery.draped {
                 // Imagery is bright in places (snow, the trail up close): shade the bottom so
                 // the controls and the credits stay readable.
                 VStack(spacing: 0) {
@@ -100,7 +96,7 @@ struct TrailWalkView: View {
                     .padding(.horizontal, 12)
                 Spacer()
                 if let world {
-                    WalkControls(world: world, player: player, draped: draped,
+                    WalkControls(world: world, player: player, draped: imagery.draped,
                                  usgs: model.scene?.terrain.hasGround(under: trail.trail) == true)
                         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { controlsFrame = $0 }
                         .padding(.horizontal, 16)
@@ -116,13 +112,12 @@ struct TrailWalkView: View {
         }
         // Over satellite imagery when that's the map's style and it loads; in the terrain's own
         // colors otherwise, or until it does.
-        .task(id: DrapeKey(world: world.map(ObjectIdentifier.init), satellite: model.settings.mapStyle == .satellite,
-                           online: model.online)) {
-            await drape()
+        .task(id: WalkImagery.DrapeKey(world: world, satellite: model.settings.mapStyle == .satellite, online: model.online)) {
+            await imagery.drape(satellite: model.settings.mapStyle == .satellite)
         }
         // Sharper imagery under the part of the walk in view, once the imagery is laid.
-        .task(id: DetailKey(world: world.map(ObjectIdentifier.init), draped: draped, online: model.online)) {
-            await sharpen()
+        .task(id: WalkImagery.DetailKey(world: world, draped: imagery.draped, online: model.online)) {
+            await imagery.sharpen(player: player)
         }
         // Land cover that arrives once the walk is under way tints the terrain where it stands.
         .task(id: [model.covers[trail.trail.id]?.revision ?? -1, world == nil ? 0 : 1]) {
@@ -149,85 +144,6 @@ struct TrailWalkView: View {
         var terrain: ObjectIdentifier?
     }
 
-    private struct DrapeKey: Equatable {
-        var world: ObjectIdentifier?
-        var satellite: Bool
-        var online: Bool
-    }
-
-    private struct DetailKey: Equatable {
-        var world: ObjectIdentifier?
-        var draped: Bool
-        var online: Bool
-    }
-
-    /// Keeps sharper imagery under the part of the walk in view, loading it again as the walker
-    /// moves on: one download at a time, waiting longer after each one that fails.
-    private func sharpen() async {
-        guard let world, draped else { return }
-        if let detailImagery { world.show(detail: detailImagery) }
-        var wait = 2.0
-        while !Task.isCancelled {
-            let center = world.detailCenter(at: player.shownDistance, walking: player.playing)
-            if world.needsDetail(around: center) {
-                do {
-                    let loaded = try await world.loadDetail(around: center)
-                    guard !Task.isCancelled, self.world === world else { return }
-                    wait = 2
-                    // A slow download may finish after scrubbing back to imagery we already
-                    // have. Keep the picture nearest the part of the walk now in view.
-                    let wanted = world.detailCenter(at: player.shownDistance, walking: player.playing)
-                    if let shown = world.detail, shown.rect.width == loaded.rect.width {
-                        let previous = SIMD2<Double>(shown.rect.midX, shown.rect.midY)
-                        if simd_distance(previous, wanted) < simd_distance(center, wanted) { continue }
-                    }
-                    world.show(detail: loaded)
-                    detailImagery = loaded
-                } catch {
-                    guard !Task.isCancelled else { return }
-                    try? await Task.sleep(for: .seconds(wait))
-                    wait = min(60, wait * 2)
-                    continue
-                }
-            }
-            try? await Task.sleep(for: .milliseconds(250))
-        }
-    }
-
-    /// Loads what imagery is missing, the terrain's before the ring's, and lays each on as
-    /// it comes; a part that didn't load is tried again when the connection returns.
-    private func drape() async {
-        guard let world, model.settings.mapStyle == .satellite else { return }
-        if !world.draped {
-            if nearImagery.map({ !world.fits($0, ring: false) }) ?? true {
-                guard let loaded = await world.loadNearImagery(), !Task.isCancelled, self.world === world else { return }
-                nearImagery = loaded
-            }
-            await world.drape(near: nearImagery, far: nil)
-            guard !Task.isCancelled, self.world === world else { return }
-            draped = world.draped
-        }
-        if !world.ringDraped {
-            if farImagery.map({ !world.fits($0, ring: true) }) ?? true {
-                guard let loaded = await world.loadFarImagery(), !Task.isCancelled, self.world === world else { return }
-                // Coarse enough to be Apple's greener mosaic: in the colors of the photos nearer.
-                let near = nearImagery
-                let matched = await Task.detached(priority: .userInitiated) { near.map(loaded.matched) ?? loaded }.value
-                guard !Task.isCancelled, self.world === world else { return }
-                farImagery = matched
-            }
-            await world.drape(near: nil, far: farImagery)
-        }
-        // Then the photos over the hills around, out to where the haze thickens.
-        if world.ringDraped, !world.midShown, let rect = world.midRect {
-            if midImagery.map({ $0.rect != rect || $0.center != world.center }) ?? true {
-                guard let loaded = await world.loadMidImagery(rect), !Task.isCancelled, self.world === world else { return }
-                midImagery = loaded
-            }
-            if let midImagery { world.show(mid: midImagery) }
-        }
-    }
-
     private func build() async {
         guard let terrain = model.scene?.terrain else {
             failed = true
@@ -243,15 +159,15 @@ struct TrailWalkView: View {
         withAnimation(.easeOut(duration: 0.3)) {
             world = built
             failed = built == nil
-            draped = false
+            imagery.show(built)
         }
     }
 }
 
 // MARK: - The scene
 
-/// Everything in 3D for one trail, built off the main thread. SceneKit's axes: x east,
-/// y up, z south; map meters (x east, y north, z up) go to (x, z, −y).
+/// Everything in 3D for one trail, or for one summit on its own, built off the main thread.
+/// SceneKit's axes: x east, y up, z south; map meters (x east, y north, z up) go to (x, z, −y).
 final class WalkWorld: @unchecked Sendable {
     let scene: SCNScene
     let camera: SCNNode
@@ -265,7 +181,8 @@ final class WalkWorld: @unchecked Sendable {
     let units: AppSettings.Units
     /// The ridge crest lines, faded by how steeply the camera looks down.
     let crests: SCNNode
-    let walk: TrailWalk
+    /// The trail walked; nil around a summit on its own.
+    let walk: TrailWalk?
     let relief: ReliefMap
     /// Elevation along the walk from the terrain model, by distance, for the readout.
     let profile: TrailProfile?
@@ -291,9 +208,13 @@ final class WalkWorld: @unchecked Sendable {
     private(set) var ringDraped = false
     /// How strongly the crest lines show: fainter over imagery, which shows the ridges itself.
     private(set) var crestStrength: CGFloat = 1
+    /// Just over the summit, what the camera looks around when there's no walk; and where the
+    /// opening tilt ends then, looking at the summit (`build(peak:…)`).
+    private(set) var summitFocus: SIMD3<Double>?
+    private(set) var opening: (eye: SIMD3<Double>, target: SIMD3<Double>)?
 
     private init(scene: SCNScene, camera: SCNNode, walker: SCNNode, you: SCNNode, summit: WalkPeak?, units: AppSettings.Units,
-                 crests: SCNNode, walk: TrailWalk,
+                 crests: SCNNode, walk: TrailWalk?,
                  relief: ReliefMap, profile: TrailProfile?, overhead: (eye: SIMD3<Double>, target: SIMD3<Double>), range: Double,
                  ground: SCNNode, shades: GroundShades, coverRevision: Int?, ring: SCNNode, far: ReliefMap,
                  hole: (low: SIMD2<Double>, high: SIMD2<Double>)) {
@@ -429,7 +350,15 @@ final class WalkWorld: @unchecked Sendable {
     /// Following the walker low, near the horizon, so the slopes and the ranges ahead stand
     /// up in 3D; steep climbs tilt it down a little, and ridges in the way lift it.
     func follow(at distance: Double) -> (eye: SIMD3<Double>, target: SIMD3<Double>) {
-        walk.camera(at: distance, range: range, pitch: 9, maxPitch: 30, lead: 0.3) { [relief] in relief.height(at: $0) }
+        guard let walk else { return overhead }
+        return walk.camera(at: distance, range: range, pitch: 9, maxPitch: 30, lead: 0.3) { [relief] in relief.height(at: $0) }
+    }
+
+    /// Where the opening tilt from straight above ends: low behind the start of the walk, or
+    /// with none, looking at the summit.
+    var firstView: (eye: SIMD3<Double>, target: SIMD3<Double>) {
+        if walk == nil, let opening { return opening }
+        return follow(at: 0)
     }
 
     /// Puts the you-are-here dot at `p` on the ground.
@@ -445,17 +374,52 @@ final class WalkWorld: @unchecked Sendable {
         you.isHidden = false
     }
 
-    func walkerPosition(at distance: Double) -> SIMD3<Double> {
-        walk.point(at: distance) + SIMD3(0, 0, 3)
+    func walkerPosition(at distance: Double) -> SIMD3<Double>? {
+        walk.map { $0.point(at: distance) + SIMD3(0, 0, 3) }
+    }
+
+    /// What the camera looks around while paused: the walker, or with no walk the summit.
+    func focus(at distance: Double) -> SIMD3<Double> {
+        walkerPosition(at: distance) ?? summitFocus ?? overhead.target
     }
 
     static func build(trail: Trail, peak: Peak?, terrain: Terrain, cover: AppModel.TrailCover?,
                       units: AppSettings.Units) -> WalkWorld? {
-        guard let frame = OverheadMap.frame(trail: trail, around: peak.map { [$0.position] } ?? [], aspect: 0.46) else { return nil }
+        guard let frame = OverheadMap.frame(trail: trail, around: peak.map { [$0.position] } ?? [], aspect: 0.46),
+              let extent = TrailTerrainStyle.extent(trail: trail, peak: peak) else { return nil }
+        return build(extent: extent, frame: frame, trail: trail, peak: peak, terrain: terrain, cover: cover, units: units)
+    }
+
+    /// A summit on its own, in the middle of the sharp terrain. It opens looking at it from
+    /// the side `viewer` sees it from (from the south when that isn't known), a little above
+    /// level and a few kilometers off, or higher where a ridge would be in the way. Nil where
+    /// the terrain doesn't reach the summit; coarse terrain still shows its shape.
+    static func build(peak: Peak, seenFrom viewer: LatLon?, terrain: Terrain, cover: AppModel.TrailCover?,
+                      units: AppSettings.Units) -> WalkWorld? {
+        guard terrain.ground.height(latitude: peak.latitude, longitude: peak.longitude).isFinite else { return nil }
+        // Straight down, the opening takes in the mountain and its ridges, 2 km each way.
+        let frame = MapExtent(center: peak.position, width: 4_000, height: 4_000)
+        guard let world = build(extent: TrailTerrainStyle.extent(peak: peak), frame: frame, trail: nil, peak: peak,
+                                terrain: terrain, cover: cover, units: units),
+              let focus = world.summitFocus else { return nil }
+        let azimuth = viewer.map { p -> Double in
+            let v = world.relief.projection.point(p) - SIMD2(focus.x, focus.y)
+            return atan2(v.x, v.y) * 180 / .pi
+        } ?? 180
+        let distance = 6_000.0
+        let elevation = TrailWalk.lowestClearElevation(around: focus, azimuth: azimuth, distance: distance, from: 25,
+                                                       isClear: { world.isClear($0, seeing: focus) }) ?? 89
+        world.opening = (TrailWalk.orbit(around: focus, azimuth: azimuth, elevation: elevation, distance: distance), focus)
+        return world
+    }
+
+    /// The sharp terrain over `extent`, and the ring around it out to the haze, centered on
+    /// `frame`, which the opening view from straight above takes in; with `trail`, the walk.
+    private static func build(extent: MapExtent, frame: MapExtent, trail: Trail?, peak: Peak?, terrain: Terrain,
+                              cover: AppModel.TrailCover?, units: AppSettings.Units) -> WalkWorld? {
         // Sample the interpolated DEM at 15–25 m so projecting its geographic grid onto
         // the mesh preserves the source's narrow ridges and gullies. Bound the mesh to
         // about a million vertices; the horizon uses a separate, coarser ring.
-        guard let extent = TrailTerrainStyle.extent(trail: trail, peak: peak) else { return nil }
         let side = extent.width
         let relief = ReliefMap(terrain: terrain, extent: extent, cellSize: TrailTerrainStyle.cellSize(for: extent))
         let wide = ReliefMap(terrain: terrain, extent: MapExtent(center: frame.center, width: 70_000, height: 70_000),
@@ -465,7 +429,7 @@ final class WalkWorld: @unchecked Sendable {
         guard let low = known.min(), let high = known.max() else { return nil }
 
         // The walk: the main line from its lower end, on the ground.
-        let profile = trail.profile(on: terrain)
+        let profile = trail?.profile(on: terrain)
         var route: [SIMD3<Double>] = []
         if let profile, profile.points.count > 1 {
             route = profile.points.map { p in
@@ -473,15 +437,15 @@ final class WalkWorld: @unchecked Sendable {
                 let z = relief.height(at: xy)
                 return SIMD3(xy.x, xy.y, z.isFinite ? z : p.elevation)
             }
-        } else if let line = trail.densified(spacing: 25).max(by: { $0.count < $1.count }) {
+        } else if let line = trail?.densified(spacing: 25).max(by: { $0.count < $1.count }) {
             route = line.map { p in
                 let xy = projection.point(p)
                 return SIMD3(xy.x, xy.y, relief.height(at: xy))
             }
         }
-        let walk = TrailWalk(points: route)
-        guard walk.length > 0 else { return nil }
-        let range = min(750, max(380, walk.length * 0.15))
+        let walk = trail.map { _ in TrailWalk(points: route) }
+        if let walk, !(walk.length > 0) { return nil }
+        let range = walk.map { min(750, max(380, $0.length * 0.15)) } ?? 750
 
         let scene = SCNScene()
         scene.background.contents = haze
@@ -501,7 +465,9 @@ final class WalkWorld: @unchecked Sendable {
         let crests = SCNNode()
         for node in crestNodes(relief) + crestNodes(wide, outside: hole) { crests.addChildNode(node) }
         scene.rootNode.addChildNode(crests)
-        for node in trailNodes(trail, relief, width: max(2, range / 180)) { scene.rootNode.addChildNode(node) }
+        if let trail {
+            for node in trailNodes(trail, relief, width: max(2, range / 180)) { scene.rootNode.addChildNode(node) }
+        }
 
         // Light from the north-west, low enough to model the slopes, and a cool fill.
         let sun = SCNNode()
@@ -529,7 +495,8 @@ final class WalkWorld: @unchecked Sendable {
         glow.emission.contents = UIColor.white
         glow.emission.intensity = 2
         walker.geometry!.firstMaterial = glow
-        walker.position = scn(walk.point(at: 0))
+        walker.position = scn(walk?.point(at: 0) ?? .zero)
+        walker.isHidden = walk == nil
         scene.rootNode.addChildNode(walker)
 
         let you = SCNNode(geometry: SCNSphere(radius: 6))
@@ -543,9 +510,13 @@ final class WalkWorld: @unchecked Sendable {
         scene.rootNode.addChildNode(you)
 
         var summit: WalkPeak?
+        var summitFocus: SIMD3<Double>?
         if let peak {
             let xy = projection.point(peak.position)
             let top = summitTop(peak, relief: relief, far: wide, hole: hole) ?? SIMD3(xy.x, xy.y, peak.elevation)
+            // Over the highest ground near it too, which may stand a little apart from the
+            // mapped summit: a line of sight to it can't then graze its own top.
+            summitFocus = SIMD3(top.x, top.y, max(top.z, relief.highest(within: 50, of: xy)) + 5)
             let dot = SCNNode(geometry: SCNSphere(radius: 6))
             dot.geometry!.firstMaterial = glow
             dot.position = scn(top)
@@ -577,10 +548,12 @@ final class WalkWorld: @unchecked Sendable {
         let floor = relief.height(at: center)
         let overhead = (eye: SIMD3(center.x, center.y, (floor.isFinite ? floor : Double(high)) + altitude),
                         target: SIMD3(center.x, center.y, floor.isFinite ? floor : Double(low)))
-        return WalkWorld(scene: scene, camera: camera, walker: walker, you: you, summit: summit, units: units, crests: crests,
-                         walk: walk, relief: relief,
-                         profile: profile, overhead: overhead, range: range, ground: ground.node, shades: ground.shades,
-                         coverRevision: cover?.revision, ring: ring, far: wide, hole: hole)
+        let world = WalkWorld(scene: scene, camera: camera, walker: walker, you: you, summit: summit, units: units, crests: crests,
+                              walk: walk, relief: relief, profile: profile, overhead: overhead, range: range,
+                              ground: ground.node, shades: ground.shades, coverRevision: cover?.revision, ring: ring, far: wide,
+                              hole: hole)
+        world.summitFocus = summitFocus
+        return world
     }
 
     /// Land cover on the sharp terrain's grid. It fades out toward the terrain's edge, where
@@ -749,9 +722,9 @@ final class WalkWorld: @unchecked Sendable {
     }
 
     /// Where the sharper imagery should be centered, map meters: ahead of the walker while it
-    /// walks, on it while paused to look around.
+    /// walks, on it while paused to look around; on the summit with no walk.
     func detailCenter(at distance: Double, walking: Bool) -> SIMD2<Double> {
-        let p = walk.point(at: min(walk.length, distance + (walking ? detailLead : 0)))
+        let p = walk.map { $0.point(at: min($0.length, distance + (walking ? detailLead : 0))) } ?? focus(at: 0)
         return SIMD2(p.x, p.y)
     }
 
@@ -1048,8 +1021,8 @@ final class WalkPlayer {
 
     /// Walking speed, meters per second: a short trail takes half a minute, a long one two.
     var speed: Double {
-        guard let world else { return 100 }
-        return world.walk.length / min(120, max(30, world.walk.length / 100))
+        guard let walk = world?.walk else { return 100 }
+        return walk.length / min(120, max(30, walk.length / 100))
     }
 
     func attach(_ view: SCNView, world: WalkWorld) {
@@ -1061,8 +1034,17 @@ final class WalkPlayer {
         target = world.overhead.target
         place(eye: eye, target: target, up: SIMD3(0, 1, 0))
         mode = .intro(started: CACurrentMediaTime())
-        playing = true
+        playing = world.walk != nil
         ended = false
+        if world.walk == nil, UIAccessibility.isReduceMotionEnabled {
+            // Around a summit with Reduce Motion on, no sweep down to it: it opens looking at it.
+            let first = world.firstView
+            eye = first.eye
+            target = first.target
+            place(eye: eye, target: target, up: SIMD3(0, 0, 1))
+            mode = .free
+            pointOrbit()
+        }
         view.allowsCameraControl = false
         if gestures == nil {
             // Paused, drag to look around the walker and pinch to come closer or go further.
@@ -1094,24 +1076,30 @@ final class WalkPlayer {
     /// Sharper downloads replace the ground without restarting the walk or an orbit.
     func replaceWorld(_ world: WalkWorld, in view: SCNView) {
         guard let previous = self.world, previous !== world else { return }
-        let fraction = distance / max(1, previous.walk.length)
+        let fraction = distance / max(1, previous.walk?.length ?? 0)
         let pose = view.pointOfView?.presentation.simdWorldTransform
         self.world = world
-        distance = min(world.walk.length, fraction * world.walk.length)
+        let length = world.walk?.length ?? 0
+        distance = min(length, fraction * length)
         shownDistance = distance
         view.scene = world.scene
         view.pointOfView = world.camera
         if let pose { world.camera.simdWorldTransform = pose }
-        if case .free = mode { pointOrbit() }
+        if case .free = mode {
+            pointOrbit()
+            // The sharper ground may rise where the camera was: lift it out of the hill.
+            let p = world.camera.simdWorldPosition
+            if !world.isClear(SIMD3(Double(p.x), Double(-p.z), Double(p.y)), seeing: world.focus(at: distance)) { orbitCamera() }
+        }
         moveWalker()
     }
 
     func togglePlay() {
-        guard let world else { return }
+        guard let walk = world?.walk else { return }
         if playing {
             pause()
         } else {
-            if ended || distance >= world.walk.length - 1 { distance = 0 }
+            if ended || distance >= walk.length - 1 { distance = 0 }
             ended = false
             playing = true
             startFollowing()
@@ -1120,8 +1108,8 @@ final class WalkPlayer {
 
     /// Moves to a point along the walk (0 to 1), as the slider is dragged.
     func scrub(to fraction: Double) {
-        guard let world else { return }
-        distance = max(0, min(1, fraction)) * world.walk.length
+        guard let world, let walk = world.walk else { return }
+        distance = max(0, min(1, fraction)) * walk.length
         shownDistance = distance
         ended = false
         if case .intro = mode { mode = .follow }
@@ -1150,7 +1138,7 @@ final class WalkPlayer {
         // may still be the previous frame until SceneKit commits its transaction.
         let p = world.camera.simdWorldPosition
         let eye = SIMD3(Double(p.x), Double(-p.z), Double(p.y))
-        let o = TrailWalk.orbitAngles(of: eye, around: world.walkerPosition(at: distance))
+        let o = TrailWalk.orbitAngles(of: eye, around: world.focus(at: distance))
         orbit = (o.azimuth, min(89, max(-10, o.elevation)), min(Self.furthest, max(Self.closest, o.distance)))
         spin = .zero
     }
@@ -1194,7 +1182,7 @@ final class WalkPlayer {
     /// Where no angle is clear, it stays where it was.
     private func orbitCamera(from previous: (azimuth: Double, elevation: Double, distance: Double)? = nil) {
         guard let world else { return }
-        let walker = world.walkerPosition(at: distance)
+        let walker = world.focus(at: distance)
         guard let lowest = TrailWalk.lowestClearElevation(around: walker, azimuth: orbit.azimuth, distance: orbit.distance,
                                                           from: orbit.elevation, isClear: { world.isClear($0, seeing: walker) }) else {
             if let previous { orbit = previous }
@@ -1231,18 +1219,27 @@ final class WalkPlayer {
         case let .intro(started):
             let t = min(1, (now - started) / Self.introSeconds)
             let s = t * t * (3 - 2 * t)
-            let end = world.follow(at: 0)
+            let end = world.firstView
             // Rise a little on the way, so the tilt sweeps rather than dives.
             let lift = sin(s * .pi) * 0.15 * (world.overhead.eye.z - end.eye.z)
             eye = mix(world.overhead.eye, end.eye, s) + SIMD3(0, 0, lift)
             target = mix(world.overhead.target, end.target, s)
             place(eye: eye, target: target, up: mix(SIMD3(0, 1, 0), SIMD3(0, 0, 1), s))
-            if t >= 1 { mode = .follow }
+            if t >= 1 {
+                if world.walk == nil {
+                    // Around a summit: free to look around it from here.
+                    mode = .free
+                    pointOrbit()
+                } else {
+                    mode = .follow
+                }
+            }
         case .follow:
             if playing {
                 distance += speed * dt
-                if distance >= world.walk.length {
-                    distance = world.walk.length
+                let length = world.walk?.length ?? 0
+                if distance >= length {
+                    distance = length
                     playing = false
                     ended = true
                 }
@@ -1294,8 +1291,8 @@ final class WalkPlayer {
     }
 
     private func moveWalker() {
-        guard let world else { return }
-        let position = WalkWorld.scn(world.walkerPosition(at: distance))
+        guard let world, let walker = world.walkerPosition(at: distance) else { return }
+        let position = WalkWorld.scn(walker)
         if !SCNVector3EqualToVector3(world.walker.position, position) { world.walker.position = position }
     }
 
@@ -1317,6 +1314,26 @@ final class WalkPlayer {
             guard let player else { return link.invalidate() }
             player.tick(link)
         }
+    }
+
+    /// Looking around without dragging, for VoiceOver: a step around to either side, from
+    /// higher or lower, closer or further, while the camera is free to look around.
+    func lookAroundActions() -> [UIAccessibilityCustomAction] {
+        func action(_ name: String, _ step: @escaping (WalkPlayer) -> Void) -> UIAccessibilityCustomAction {
+            UIAccessibilityCustomAction(name: name) { [weak self] _ in
+                guard let self, case .free = self.mode else { return false }
+                step(self)
+                return true
+            }
+        }
+        // As far as a drag would turn it: 30° around, 10° up or down.
+        let around = 30 / Self.degreesPerPoint, up = 10 / Self.degreesPerPoint
+        return [action("Go around to the left") { $0.turn(by: SIMD2(around, 0)) },
+                action("Go around to the right") { $0.turn(by: SIMD2(-around, 0)) },
+                action("Look from higher") { $0.turn(by: SIMD2(0, up)) },
+                action("Look from lower") { $0.turn(by: SIMD2(0, -up)) },
+                action("Come closer") { $0.zoom(by: 1.5) },
+                action("Go further") { $0.zoom(by: 1 / 1.5) }]
     }
 
     /// Hands the look-around gestures to the player, which it holds weakly: the player keeps
@@ -1348,11 +1365,12 @@ final class WalkPlayer {
     }
 }
 
-/// The SceneKit view.
-private struct WalkSceneView: UIViewRepresentable {
+/// The SceneKit view, with `label` for VoiceOver.
+struct WalkSceneView: UIViewRepresentable {
     let world: WalkWorld
     let player: WalkPlayer
     let you: LatLon?
+    let label: String
 
     func makeUIView(context: Context) -> SCNView {
         let view = SCNView(frame: .zero, options: [SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue])
@@ -1364,6 +1382,9 @@ private struct WalkSceneView: UIViewRepresentable {
         view.preferredFramesPerSecond = 60
         view.scene = world.scene
         view.pointOfView = world.camera
+        view.isAccessibilityElement = true
+        view.accessibilityLabel = label
+        view.accessibilityCustomActions = player.lookAroundActions()
         player.attach(view, world: world)
         world.place(you: you)
         return view
@@ -1426,10 +1447,10 @@ private struct WalkChip: View {
     }
 
     private func detail(_ units: AppSettings.Units) -> String {
-        guard let world else { return "Building the terrain…" }
+        guard let walk = world?.walk else { return "Building the terrain…" }
         let d = player.shownDistance
-        var parts = ["\(Format.distance(d, units)) of \(Format.distance(world.walk.length, units))"]
-        let z = world.walk.point(at: d).z
+        var parts = ["\(Format.distance(d, units)) of \(Format.distance(walk.length, units))"]
+        let z = walk.point(at: d).z
         if z.isFinite { parts.append(Format.elevation(z, units)) }
         return parts.joined(separator: " · ")
     }
@@ -1450,7 +1471,7 @@ private struct WalkControls: View {
                             label: player.playing ? "Pause" : player.ended ? "Walk it again" : "Walk on") {
                     player.togglePlay()
                 }
-                Slider(value: Binding(get: { player.shownDistance / max(1, world.walk.length) },
+                Slider(value: Binding(get: { player.shownDistance / max(1, world.walk?.length ?? 0) },
                                       set: { player.scrub(to: $0) }))
                     .tint(TrailFromAboveView.trailColor)
                     .accessibilityLabel("Along the trail")

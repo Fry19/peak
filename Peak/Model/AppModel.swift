@@ -162,7 +162,7 @@ final class AppModel {
     var frozen: Frozen? {
         // A frozen view throws matches away, so don't make them.
         didSet {
-            corrector.paused = frozen != nil || showsFromAbove
+            corrector.paused = frozen != nil || cameraIsCovered
             if frozen != nil { land() }
         }
     }
@@ -178,7 +178,7 @@ final class AppModel {
     var photo: LabeledPhoto? {
         didSet {
             if photo != nil { land() }
-            if (photo == nil) != (oldValue == nil) { cameraCovered(photo != nil || showsFromAbove) }
+            if (photo == nil) != (oldValue == nil) { cameraCovered(cameraIsCovered) }
         }
     }
     /// That trail seen from straight above, over the ridgelines, instead of the camera (or
@@ -186,9 +186,18 @@ final class AppModel {
     var showsFromAbove = false {
         didSet {
             if showsFromAbove { land() }
-            if showsFromAbove != oldValue { cameraCovered(showsFromAbove || photo != nil) }
+            if showsFromAbove != oldValue { cameraCovered(cameraIsCovered) }
         }
     }
+    /// A peak's full-screen 3D view also rests the camera, including after returning from
+    /// the background. Kept apart from the trail's map, which RootView presents itself.
+    var showsPeakIn3D = false {
+        didSet {
+            if showsPeakIn3D { land() }
+            if showsPeakIn3D != oldValue { cameraCovered(cameraIsCovered) }
+        }
+    }
+    private var cameraIsCovered: Bool { photo != nil || showsFromAbove || showsPeakIn3D }
     /// Lining the view up by hand: the picture is paused and dragging moves the lines.
     var aligning = false {
         didSet { if aligning { land() } }
@@ -387,7 +396,7 @@ final class AppModel {
         guard started, active != self.active else { return }
         self.active = active
         if active {
-            if !showsFromAbove { startSensing() }
+            if !cameraIsCovered { startSensing() }
             locationManager.startUpdatingLocation()
             locationManager.startUpdatingHeading()
             authorizationChanged()
@@ -435,7 +444,7 @@ final class AppModel {
 
     /// What the pill's Retry does: start the camera again, or load what failed.
     func retry() {
-        if cameraState == .failed, !showsFromAbove { startCamera() }
+        if cameraState == .failed, !cameraIsCovered { startCamera() }
         if case .failed = loadState {
             terrainBackoff.reset()
             retryMissing()
@@ -451,7 +460,7 @@ final class AppModel {
         case .authorizedWhenInUse, .authorizedAlways:
             locationPermission = .granted
             // With the location known, the sensors can reference true north.
-            if active, !showsFromAbove { motion.start(trueNorth: true) }
+            if active, !cameraIsCovered { motion.start(trueNorth: true) }
             checkPrecision()
         default:
             locationPermission = .undetermined
@@ -722,8 +731,8 @@ final class AppModel {
         details[peakID]?.hikes.first { $0.id == trailID }
     }
 
-    /// Glaciers, water, bare rock and scree around a trail, which its maps and its walk in 3D
-    /// tint the terrain with.
+    /// Glaciers, water, bare rock and scree around a trail or a summit, which their maps and
+    /// views in 3D tint the terrain with.
     struct TrailCover {
         /// Where it was looked for.
         var box: GeoBox
@@ -747,27 +756,39 @@ final class AppModel {
     /// The land cover on the phone around a trail, read once. Quick: views drawing the trail
     /// wait for it, so they're drawn once with it rather than twice.
     @MainActor func savedCover(_ trail: Trail, peak: Peak?) async -> TrailCover? {
-        if let cover = covers[trail.id] { return cover }
-        guard let box = Self.coverBox(trail, peak: peak) else { return nil }
+        guard let box = covers[trail.id]?.box ?? Self.coverBox(trail, peak: peak) else { return nil }
+        return await savedCover(key: trail.id, box: box)
+    }
+
+    /// The land cover on the phone in `box`, read once and kept as `key`: a trail's id, or
+    /// one for a summit's.
+    @MainActor func savedCover(key: String, box: GeoBox) async -> TrailCover? {
+        if let cover = covers[key] { return cover }
         let saved = await store.landCover(in: box, fetch: false)
-        if let cover = covers[trail.id] { return cover }   // read meanwhile
+        if let cover = covers[key] { return cover }   // read meanwhile
         // Trails looked at a while ago go; their land cover is still on the phone.
         if covers.count >= 8 { covers.removeAll() }
-        covers[trail.id] = TrailCover(box: box, areas: saved.areas, complete: saved.complete)
-        return covers[trail.id]
+        covers[key] = TrailCover(box: box, areas: saved.areas, complete: saved.complete)
+        return covers[key]
     }
 
     /// Downloads the land cover around a trail that isn't on the phone, with a signal (none
     /// is asked for without one). `covers` changes when it arrives.
     @MainActor func fetchCover(_ trail: Trail, peak: Peak?) async {
-        guard online, !coverFetches.contains(trail.id) else { return }
-        coverFetches.insert(trail.id)
-        defer { coverFetches.remove(trail.id) }
-        guard let saved = await savedCover(trail, peak: peak), !saved.complete else { return }
+        guard let box = covers[trail.id]?.box ?? Self.coverBox(trail, peak: peak) else { return }
+        await fetchCover(key: trail.id, box: box)
+    }
+
+    /// Downloads the land cover in `box` that isn't on the phone, kept as `key`.
+    @MainActor func fetchCover(key: String, box: GeoBox) async {
+        guard online, !coverFetches.contains(key) else { return }
+        coverFetches.insert(key)
+        defer { coverFetches.remove(key) }
+        guard let saved = await savedCover(key: key, box: box), !saved.complete else { return }
         let fetched = await store.landCover(in: saved.box, fetch: true)
         guard fetched.complete || fetched.areas.count != saved.areas.count else { return }
-        covers[trail.id] = TrailCover(box: saved.box, areas: fetched.areas, complete: fetched.complete,
-                                      revision: (covers[trail.id]?.revision ?? 0) + 1)
+        covers[key] = TrailCover(box: saved.box, areas: fetched.areas, complete: fetched.complete,
+                                 revision: (covers[key]?.revision ?? 0) + 1)
     }
 
     /// Loads again the facts or hikes that failed for a peak.

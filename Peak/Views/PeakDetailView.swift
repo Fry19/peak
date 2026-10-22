@@ -100,6 +100,7 @@ struct PeakDetailView: View {
             Section {
                 PeakSunRow(model: model, peak: peak)
                 ViewshedRow(model: model, peak: peak, scene: scene, isPhoto: place != nil)
+                PeakIn3DRow(model: model, peak: peak, scene: scene, isPhoto: place != nil)
             }
             .sheetSection()
 
