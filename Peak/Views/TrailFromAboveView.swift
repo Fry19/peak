@@ -2,15 +2,16 @@ import PeakCore
 import SwiftUI
 import simd
 
-/// The trail seen from straight above, north up, over the terrain's ridgelines: a dark
-/// hillshade, faintly tinted where OpenStreetMap has glaciers, water and bare rock, the
-/// crests glowing faintly (main ridges brightest), the trail in orange, the summit and you.
-/// Drawn from the terrain already on the phone, so it works without a signal; with one,
-/// satellite imagery can go underneath instead. Pinch and drag to look around; double-tap
-/// to zoom in.
+/// The trail seen from straight above, north up: over satellite imagery while there's a
+/// connection, or over the terrain drawn in the walk in 3D's colors (tinted where
+/// OpenStreetMap has glaciers, water and bare rock, the crests glowing faintly), which works
+/// without a signal and takes over whenever the imagery can't load. The trail in orange,
+/// the summit and you. Pinch and drag to look around, out as far as where you are;
+/// double-tap to zoom in.
 struct TrailFromAboveView: View {
     let model: AppModel
     let trail: AppModel.ARTrail
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var map: OverheadMap?
     /// The trail the map was built for: a new trail starts from the whole trail again, while
@@ -26,6 +27,10 @@ struct TrailFromAboveView: View {
     @State private var imagery: MapImagery?
     @State private var closeUp: MapImagery?
     @State private var terrainDetail: OverheadMap.Detail?
+    /// Coarser terrain, and imagery, out to where you are when that's beyond the map, so
+    /// zooming out shows you and the trail together.
+    @State private var wide: OverheadMap.Detail?
+    @State private var wideImagery: MapImagery?
     @State private var imageryState = ImageryState.idle
 
     enum ImageryState: Equatable {
@@ -42,22 +47,24 @@ struct TrailFromAboveView: View {
             let full = CGSize(width: geo.size.width + safe.leading + safe.trailing, height: geo.size.height + safe.top + safe.bottom)
             // The bottom keeps clear of the bar, so arrows along it don't sit on its buttons.
             let content = EdgeInsets(top: safe.top + 84, leading: 20, bottom: safe.bottom + 84, trailing: 20)
-            let satellite = model.fromAboveSatellite
+            let satellite = model.settings.mapStyle == .satellite
             ZStack {
                 Self.background
                     .ignoresSafeArea()
                 if let map {
                     GeometryReader { screen in
-                        let viewport = Viewport(size: screen.size, map: map, content: content)
+                        let you = here(on: map)
+                        let viewport = Viewport(size: screen.size, map: map, content: content, reach: map.reach(you))
                         MapLayer(map: map, viewport: viewport, camera: camera, units: model.settings.units,
+                                 wide: wide?.mapID == map.id ? wide : nil,
                                  terrainDetail: terrainDetail?.mapID == map.id ? terrainDetail : nil,
-                                 you: model.tracker.youOnMap(trail.trail).map(map.projection.point),
-                                 trailhead: trailhead(on: map), imagery: satellite ? [imagery, closeUp].compactMap { $0 } : [],
-                                 onSummit: { model.select(trail.peakID) })
+                                 you: you, trailhead: trailhead(on: map), imagery: shownImagery(on: map),
+                                 onSummit: { model.select(trail.peakID) },
+                                 onYou: { withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.5)) { camera = viewport.both ?? camera } })
                             .contentShape(Rectangle())
                             .gesture(pan(viewport).simultaneously(with: pinch(viewport)))
                             .onTapGesture(count: 2) { location in
-                                withAnimation(.easeInOut(duration: 0.3)) { camera = viewport.zoomed(camera, by: 2, around: location) }
+                                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) { camera = viewport.zoomed(camera, by: 2, around: location) }
                             }
                     }
                     .ignoresSafeArea()
@@ -67,7 +74,7 @@ struct TrailFromAboveView: View {
                                            description: Text("The view from above is drawn from the terrain around you, once it's loaded."))
                         .environment(\.colorScheme, .dark)
                 }
-                if satellite, imagery != nil {
+                if !shownImagery(on: map).isEmpty {
                     // Imagery is bright in places (snow, glaciers): shade the edges so the
                     // scale and the credits stay readable.
                     VStack(spacing: 0) {
@@ -99,14 +106,27 @@ struct TrailFromAboveView: View {
             .task(id: CoverKey(trail: trail.trail.id, online: model.online)) {
                 await model.fetchCover(trail.trail, peak: model.peak(trail.peakID))
             }
-            .task(id: ImageryKey(on: satellite, center: map?.projection.center, rect: map?.shadeRect)) {
+            // Tried again when the connection comes back; what's loaded stays without one.
+            .task(id: ImageryKey(on: satellite, center: map?.projection.center, rect: map?.shadeRect, online: model.online)) {
                 await loadImagery(screen: full, content: content)
             }
-            .task(id: CloseUpKey(on: satellite && imagery != nil, camera: camera, width: Int(full.width), height: Int(full.height))) {
+            .task(id: CloseUpKey(on: satellite, center: map?.projection.center, imagery: shownImagery(on: map).map(\.rect),
+                                camera: camera, width: Int(full.width), height: Int(full.height), online: model.online)) {
                 await loadCloseUp(screen: full, content: content)
             }
-            .task(id: DetailKey(map: map?.id, camera: camera, satellite: satellite)) {
+            .task(id: DetailKey(map: map?.id, camera: camera, imagery: shownImagery(on: map).map(\.rect), wide: wide?.rect)) {
                 await loadTerrainDetail(screen: full, content: content)
+            }
+            // Again when you've moved a kilometer or so, in case it's now beyond what's drawn.
+            .task(id: WideKey(map: map?.id, you: map.flatMap { here(on: $0) }.map { SIMD2(Int($0.x / 1_000), Int($0.y / 1_000)) },
+                              width: Int(full.width), height: Int(full.height))) {
+                await loadWide(screen: full, content: content)
+            }
+            .task(id: ImageryKey(on: satellite, center: map?.projection.center, rect: wide?.rect, online: model.online)) {
+                await loadWideImagery(screen: full, content: content)
+            }
+            .onChange(of: satellite) { _, on in
+                if !on { imageryState = .idle }
             }
         }
         .overlay {
@@ -123,10 +143,28 @@ struct TrailFromAboveView: View {
         model.hike(trail.trail.id, peakID: trail.peakID)?.profile?.trailhead.map(map.projection.point)
     }
 
+    /// Where you are now, when the phone knows; else where the view was built.
+    private func here(on map: OverheadMap) -> SIMD2<Double>? {
+        model.tracker.youOnMap(trail.trail).map(map.projection.point) ?? map.observer
+    }
+
+    /// The satellite imagery to draw, coarse first; none for the terrain alone, or while it
+    /// hasn't loaded.
+    private func shownImagery(on map: OverheadMap?) -> [MapImagery] {
+        guard let map, model.settings.mapStyle == .satellite else { return [] }
+        return [wideImagery, imagery, closeUp].compactMap { $0 }.filter { $0.center == map.projection.center }
+    }
+
     private func bottomBar(_ viewport: Viewport) -> some View {
         VStack(spacing: 8) {
             HStack(alignment: .center) {
-                ScaleBar(pointsPerMeter: viewport.pointsPerMeter(camera), units: model.settings.units)
+                // Shorter where it's short of room, so the buttons keep theirs on a small phone.
+                let k = viewport.pointsPerMeter(camera), units = model.settings.units
+                ViewThatFits(in: .horizontal) {
+                    ScaleBar(pointsPerMeter: k, units: units)
+                    ScaleBar(pointsPerMeter: k, units: units, maxLength: 75)
+                    ScaleBar(pointsPerMeter: k, units: units, maxLength: 45)
+                }
                 Spacer(minLength: 8)
                 // The main thing to do here, so it's the one amber button.
                 Button {
@@ -134,6 +172,8 @@ struct TrailFromAboveView: View {
                 } label: {
                     Label("Walk in 3D", systemImage: "play.fill")
                         .font(.system(size: 15, weight: .semibold))
+                        .lineLimit(1)
+                        .fixedSize()
                         .imageScale(.small)
                         .foregroundStyle(.black)
                         .padding(.horizontal, 18)
@@ -145,13 +185,11 @@ struct TrailFromAboveView: View {
                 Spacer(minLength: 8)
                 if camera != MapCamera() {
                     RoundButton(systemImage: "scope", label: "Back to the whole trail") {
-                        withAnimation(.easeInOut(duration: 0.35)) { camera = MapCamera() }
+                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.35)) { camera = MapCamera() }
                     }
                     .transition(.opacity)
                 }
-                if model.online || model.fromAboveSatellite {
-                    satelliteButton
-                }
+                styleMenu
                 // North is always up: a mark, not a button.
                 VStack(spacing: 0) {
                     Image(systemName: "arrowtriangle.up.fill")
@@ -166,49 +204,61 @@ struct TrailFromAboveView: View {
                 .accessibilityLabel("North is up")
             }
             .animation(.easeInOut(duration: 0.2), value: camera == MapCamera())
-            if imageryState == .failed, model.fromAboveSatellite {
-                Text("The satellite imagery didn't load.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.7))
+            let satellite = model.settings.mapStyle == .satellite
+            let hasImagery = !shownImagery(on: map).isEmpty
+            // Without imagery the terrain shows instead; say why, quietly.
+            if satellite, !hasImagery, !model.online {
+                note("Satellite imagery needs a connection, so this is the terrain.")
+            } else if satellite, !hasImagery, imageryState == .failed {
+                note("The satellite imagery didn't load, so this is the terrain.")
             }
-            Text(model.fromAboveSatellite && imagery != nil
+            Text(hasImagery
                  ? "Imagery © Apple Maps · Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors"
                  : "Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors")
                 .font(.system(size: 9))
                 .multilineTextAlignment(.center)
-                .foregroundStyle(.white.opacity(model.fromAboveSatellite && imagery != nil ? 0.7 : 0.45))
+                .foregroundStyle(.white.opacity(hasImagery ? 0.7 : 0.45))
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 12)
     }
 
-    /// Satellite imagery under the lines, or the terrain's shading.
-    private var satelliteButton: some View {
-        let on = model.fromAboveSatellite
-        return Button {
-            model.fromAboveSatellite.toggle()
-            if !model.fromAboveSatellite { imageryState = .idle }
+    private func note(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11))
+            .multilineTextAlignment(.center)
+            .foregroundStyle(.white.opacity(0.7))
+            .shadow(color: .black.opacity(0.7), radius: 2)
+    }
+
+    /// Satellite imagery or the terrain, picked by name; the choice is kept. Its icon shows
+    /// which is on.
+    private var styleMenu: some View {
+        let style = model.settings.mapStyle
+        return Menu {
+            Picker("Map", selection: Binding(get: { model.settings.mapStyle }, set: { model.settings.mapStyle = $0 })) {
+                Label("Satellite", systemImage: "globe.europe.africa.fill").tag(AppSettings.MapStyle.satellite)
+                Label("Terrain", systemImage: "mountain.2.fill").tag(AppSettings.MapStyle.terrain)
+            }
         } label: {
             ZStack {
-                if on, imageryState == .loading {
+                if style == .satellite, imageryState == .loading {
                     ProgressView()
                         .controlSize(.mini)
-                        .tint(.black)
+                        .tint(.white)
                 } else {
-                    Image(systemName: "globe.europe.africa.fill")
+                    Image(systemName: style == .satellite ? "globe.europe.africa.fill" : "mountain.2.fill")
                         .font(.system(size: 13, weight: .semibold))
                 }
             }
-            .foregroundStyle(on ? .black : .white.opacity(0.85))
+            .foregroundStyle(.white.opacity(0.9))
             .frame(width: 30, height: 30)
-            .background {
-                if on { Circle().fill(.white.opacity(0.9)) } else { Circle().fill(.ultraThinMaterial).overlay(Circle().fill(Color.glassTint)) }
-            }
+            .background(Circle().fill(.ultraThinMaterial).overlay(Circle().fill(Color.glassTint)))
             .environment(\.colorScheme, .dark)
             .tapArea()
         }
-        .accessibilityLabel("Satellite imagery")
-        .accessibilityAddTraits(on ? .isSelected : [])
+        .accessibilityLabel("Map style")
+        .accessibilityValue(style.title)
     }
 
     private func pan(_ viewport: Viewport) -> some Gesture {
@@ -244,31 +294,54 @@ struct TrailFromAboveView: View {
         var on: Bool
         var center: LatLon?
         var rect: CGRect?
+        var online: Bool
     }
 
     private struct CloseUpKey: Equatable {
         var on: Bool
+        var center: LatLon?
+        var imagery: [CGRect]
         var camera: MapCamera
         var width: Int
         var height: Int
+        var online: Bool
     }
 
     private struct DetailKey: Equatable {
         var map: UUID?
         var camera: MapCamera
-        var satellite: Bool
+        var imagery: [CGRect]
+        var wide: CGRect?
+    }
+
+    private struct WideKey: Equatable {
+        var map: UUID?
+        var you: SIMD2<Int>?
+        var width: Int
+        var height: Int
+    }
+
+    /// Where there's terrain drawn, map meters: the map, and farther out the wide terrain.
+    private func drawn(_ map: OverheadMap) -> CGRect {
+        guard let wide, wide.mapID == map.id else { return map.shadeRect }
+        return map.shadeRect.union(wide.rect)
     }
 
     /// Keep the broad map while moving, then resample the visible ground from the DEM.
     /// Magnifying the broad hillshade alone loses small gullies and spurs on longer hikes.
+    /// Not where imagery covers the screen, which hides it; elsewhere it's what shows.
     private func loadTerrainDetail(screen: CGSize, content: EdgeInsets) async {
-        guard !model.fromAboveSatellite, let map,
-              let terrain = model.scene?.terrain else { return }
-        let seen = Viewport(size: screen, map: map, content: content).visible(camera).intersection(map.shadeRect)
+        guard let map, let terrain = model.scene?.terrain else { return }
+        let visible = Viewport(size: screen, map: map, content: content).visible(camera)
+        if shownImagery(on: map).contains(where: { $0.rect.contains(visible) }) { return }
+        let seen = visible.intersection(drawn(map))
         guard !seen.isNull, seen.width > 0, seen.height > 0 else { return }
-        let rect = seen.insetBy(dx: -seen.width * 0.15, dy: -seen.height * 0.15).intersection(map.shadeRect)
+        let rect = seen.insetBy(dx: -seen.width * 0.15, dy: -seen.height * 0.15).intersection(drawn(map))
         let cell = max(15, max(rect.width, rect.height) / 1_400)
-        guard cell < map.cellSize * 0.8 else { return }
+        // Finer than what's drawn there already, the map or, beyond it, the wide terrain.
+        let beyond = wide.flatMap { $0.mapID == map.id ? $0.cellSize : nil } ?? 0
+        let coarsest = map.shadeRect.contains(seen) ? map.cellSize : max(map.cellSize, beyond)
+        guard cell < coarsest * 0.8 else { return }
         if let detail = terrainDetail, detail.mapID == map.id,
            detail.cellSize <= cell * 1.1, detail.rect.contains(seen) { return }
         try? await Task.sleep(for: .milliseconds(250))
@@ -310,14 +383,13 @@ struct TrailFromAboveView: View {
 
     /// Imagery of the whole map, about two pixels a point with the whole trail in view.
     private func loadImagery(screen: CGSize, content: EdgeInsets) async {
-        guard model.fromAboveSatellite, let map else { return }
+        guard model.settings.mapStyle == .satellite, let map else { return }
         let rect = map.shadeRect
         if let imagery, imagery.center == map.projection.center, imagery.rect == rect { return }
         // Imagery of a map around another center would land in the wrong place.
-        if imagery?.center != map.projection.center {
-            imagery = nil
-            closeUp = nil
-        }
+        if imagery?.center != map.projection.center { imagery = nil }
+        if closeUp?.center != map.projection.center { closeUp = nil }
+        if wideImagery?.center != map.projection.center { wideImagery = nil }
         imageryState = .loading
         let k = Viewport(size: screen, map: map, content: content).pointsPerMeter(MapCamera())
         let scale = min(2 * k, 3_000 / max(rect.width, rect.height))
@@ -335,21 +407,54 @@ struct TrailFromAboveView: View {
     /// Zoomed in past what the whole map's imagery holds: once the map stops moving, sharper
     /// imagery of what's on screen.
     private func loadCloseUp(screen: CGSize, content: EdgeInsets) async {
-        guard model.fromAboveSatellite, let map, let imagery else { return }
+        guard let map, !shownImagery(on: map).isEmpty else { return }
         let viewport = Viewport(size: screen, map: map, content: content)
         let k = viewport.pointsPerMeter(camera)
-        guard Double(imagery.image.width) / imagery.rect.width < 1.5 * k else { return }
-        if let closeUp, closeUp.center == map.projection.center, Double(closeUp.image.width) / closeUp.rect.width >= 1.5 * k,
-           closeUp.rect.contains(viewport.visible(camera)) { return }
+        let seen = viewport.visible(camera)
+        // A sharp picture elsewhere on the map doesn't help the ground on screen.
+        if shownImagery(on: map).contains(where: {
+            $0.rect.contains(seen) && Double($0.image.width) / $0.rect.width >= 1.5 * k
+        }) { return }
         try? await Task.sleep(for: .milliseconds(350))
         guard !Task.isCancelled else { return }
-        let seen = viewport.visible(camera)
-        let rect = seen.insetBy(dx: -0.1 * seen.width, dy: -0.1 * seen.height).intersection(map.shadeRect)
+        let rect = seen.insetBy(dx: -0.1 * seen.width, dy: -0.1 * seen.height).intersection(drawn(map))
         guard !rect.isNull, rect.width > 1, rect.height > 1 else { return }
         let scale = min(3 * k, 3_000 / max(rect.width, rect.height))
         guard let loaded = try? await MapImagery.load(projection: map.projection, rect: rect, width: max(1, Int(rect.width * scale))),
               !Task.isCancelled, loaded.center == self.map?.projection.center else { return }
         closeUp = loaded
+    }
+
+    /// When you're farther out than the map reaches, coarser terrain for the whole screen
+    /// zoomed out to show you and the trail together, with a little room to look around.
+    private func loadWide(screen: CGSize, content: EdgeInsets) async {
+        guard let map, let terrain = model.scene?.terrain else { return }
+        let viewport = Viewport(size: screen, map: map, content: content, reach: map.reach(here(on: map)))
+        guard let both = viewport.both else { return }
+        let seen = viewport.visible(MapCamera(center: both.center, zoom: viewport.zoomRange.lowerBound))
+        let needed = seen.insetBy(dx: -0.15 * seen.width, dy: -0.15 * seen.height)
+        if map.shadeRect.contains(needed) { return }
+        if let wide, wide.mapID == map.id, wide.rect.contains(needed) { return }
+        // As finely as the map itself at most, and about a thousand points across.
+        let cell = max(map.cellSize, max(needed.width, needed.height) / 1_000)
+        let cover = model.covers[trail.trail.id]
+        let built = await Task.detached(priority: .utility) {
+            map.detail(terrain: terrain, rect: needed, cellSize: cell, cover: cover)
+        }.value
+        guard !Task.isCancelled, self.map?.id == map.id, let built else { return }
+        withAnimation(.easeOut(duration: 0.3)) { wide = built }
+    }
+
+    /// Imagery under the wide terrain, about two pixels a point zoomed all the way out.
+    private func loadWideImagery(screen: CGSize, content: EdgeInsets) async {
+        guard model.settings.mapStyle == .satellite, let map, let wide, wide.mapID == map.id else { return }
+        if let wideImagery, wideImagery.center == map.projection.center, wideImagery.rect == wide.rect { return }
+        let viewport = Viewport(size: screen, map: map, content: content, reach: map.reach(here(on: map)))
+        let k = viewport.pointsPerMeter(MapCamera(zoom: viewport.zoomRange.lowerBound))
+        let width = min(2_048, 2 * k * wide.rect.width, 2_048 * wide.rect.width / wide.rect.height)
+        guard let loaded = try? await MapImagery.load(projection: map.projection, rect: wide.rect, width: max(1, Int(width))),
+              !Task.isCancelled, loaded.center == self.map?.projection.center else { return }
+        withAnimation(.easeOut(duration: 0.3)) { wideImagery = loaded }
     }
 }
 
@@ -368,6 +473,9 @@ struct Viewport {
     let size: CGSize
     let map: OverheadMap
     let content: EdgeInsets
+    /// How far beyond the trail zooming out and panning may go: out to you
+    /// (`OverheadMap.reach`), when you're beyond the trail.
+    var reach: CGRect? = nil
 
     private var area: CGRect {
         CGRect(x: content.leading, y: content.top,
@@ -380,6 +488,23 @@ struct Viewport {
     }
 
     func pointsPerMeter(_ camera: MapCamera) -> Double { fit * camera.zoom }
+
+    /// How far zooming out reaches the trail and you together.
+    private var reachZoom: Double? {
+        reach.map { min(area.width / $0.width, area.height / $0.height) / fit }
+    }
+
+    /// Zoomed in from the whole trail (1), or out a little to look around it, or as far as
+    /// it takes to see you too.
+    var zoomRange: ClosedRange<Double> {
+        min(MapCamera.zoomRange.lowerBound, reachZoom ?? 1)...MapCamera.zoomRange.upperBound
+    }
+
+    /// Showing the trail and you together, when you're beyond the trail.
+    var both: MapCamera? {
+        guard let reach, let reachZoom else { return nil }
+        return clamped(MapCamera(center: SIMD2(reach.midX, reach.midY), zoom: min(1, reachZoom)))
+    }
 
     func screen(_ p: SIMD2<Double>, _ camera: MapCamera) -> CGPoint {
         let k = pointsPerMeter(camera)
@@ -418,17 +543,19 @@ struct Viewport {
     func zoomed(_ camera: MapCamera, by factor: Double, around anchor: CGPoint) -> MapCamera {
         let fixed = mapPoint(anchor, camera)
         var c = camera
-        c.zoom = min(MapCamera.zoomRange.upperBound, max(MapCamera.zoomRange.lowerBound, camera.zoom * factor))
+        c.zoom = min(zoomRange.upperBound, max(zoomRange.lowerBound, camera.zoom * factor))
         let k = pointsPerMeter(c)
         c.center = SIMD2(fixed.x - (anchor.x - area.midX) / k, fixed.y + (anchor.y - area.midY) / k)
         return clamped(c)
     }
 
-    /// Keeps the middle of the screen over the terrain that was drawn.
+    /// Keeps the middle of the screen over the terrain that was drawn, or between the trail
+    /// and you.
     private func clamped(_ camera: MapCamera) -> MapCamera {
         var c = camera
-        let half = map.size / 2
-        c.center = pointwiseMax(-half, pointwiseMin(half, c.center))
+        var bounds = CGRect(x: -map.size.x / 2, y: -map.size.y / 2, width: map.size.x, height: map.size.y)
+        if let reach { bounds = bounds.union(reach) }
+        c.center = SIMD2(min(max(c.center.x, bounds.minX), bounds.maxX), min(max(c.center.y, bounds.minY), bounds.maxY))
         return c
     }
 }
@@ -548,6 +675,24 @@ struct OverheadMap: @unchecked Sendable {
         return Detail(mapID: id, image: image,
                       rect: CGRect(x: center.x - size.x / 2, y: center.y - size.y / 2, width: size.x, height: size.y),
                       cellSize: cellSize)
+    }
+
+    /// The trail's frame and `you` together, with a little room, map meters: as far as
+    /// zooming out goes. Nil when you're on the frame already. Out to 120 km at most, about
+    /// as far as there's terrain around the trail; farther, the arrow still points your way.
+    func reach(_ you: SIMD2<Double>?) -> CGRect? {
+        let trail = CGRect(x: -frame.x / 2, y: -frame.y / 2, width: frame.x, height: frame.y)
+        guard let you, !trail.contains(CGPoint(x: you.x, y: you.y)) else { return nil }
+        var r = trail.union(CGRect(x: you.x, y: you.y, width: 0, height: 0))
+        let most = 120_000.0
+        // Bound the padding too: padding an overseas location before clipping could move
+        // the entire capped rectangle beyond the trail. Leave room for the trail itself.
+        let dx = min(0.08 * min(most, r.width), max(0, (most - trail.width) / 2))
+        let dy = min(0.08 * min(most, r.height), max(0, (most - trail.height) / 2))
+        r = r.insetBy(dx: -dx, dy: -dy)
+        if r.width > most { r = CGRect(x: you.x > 0 ? r.minX : r.maxX - most, y: r.minY, width: most, height: r.height) }
+        if r.height > most { r = CGRect(x: r.minX, y: you.y > 0 ? r.minY : r.maxY - most, width: r.width, height: most) }
+        return r
     }
 
     /// The area to fit on screen: the trail, plus the summit and you where they're close by.
@@ -673,6 +818,8 @@ private struct MapLayer: View, Animatable {
     let viewport: Viewport
     var camera: MapCamera
     let units: AppSettings.Units
+    /// Coarser terrain beyond the map, out to you, and sharper terrain where you've zoomed in.
+    var wide: OverheadMap.Detail? = nil
     var terrainDetail: OverheadMap.Detail? = nil
     /// Where you are now, when the phone knows; else where the view was built.
     let you: SIMD2<Double>?
@@ -681,6 +828,8 @@ private struct MapLayer: View, Animatable {
     /// Satellite imagery to draw over the shading, coarse first; none for the shading alone.
     let imagery: [MapImagery]
     let onSummit: () -> Void
+    /// Tapping the arrow to you, when you're off the map.
+    var onYou: (() -> Void)? = nil
 
     var animatableData: AnimatablePair<AnimatablePair<Double, Double>, Double> {
         get { AnimatablePair(AnimatablePair(camera.center.x, camera.center.y), log(camera.zoom)) }
@@ -696,37 +845,30 @@ private struct MapLayer: View, Animatable {
         let t = viewport.transform(camera)
         let shadeRect = map.shadeRect.applying(t)
         ZStack {
-            Image(decorative: map.shade, scale: 1)
-                .resizable()
-                .interpolation(.high)
-                .frame(width: shadeRect.width, height: shadeRect.height)
-                .position(x: shadeRect.midX, y: shadeRect.midY)
-            if let detail = terrainDetail, imagery.isEmpty {
-                let r = detail.rect.applying(t)
-                Image(decorative: detail.image, scale: 1)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: r.width, height: r.height)
-                    .position(x: r.midX, y: r.midY)
+            if let wide {
+                picture(wide.image, wide.rect.applying(t))
             }
-            // Toned down a little to sit with the dark interface, and the orange trail stands out.
-            ForEach(Array(imagery.enumerated()), id: \.offset) { _, picture in
-                let r = picture.rect.applying(t)
-                Image(decorative: picture.image, scale: 1)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: r.width, height: r.height)
-                    .position(x: r.midX, y: r.midY)
+            picture(map.shade, shadeRect)
+            // Where imagery covers it, it's hidden anyway; imagery may cover only part.
+            if let detail = terrainDetail {
+                picture(detail.image, detail.rect.applying(t))
+            }
+            // Its darkest shadows lifted a little and its colors muted, to sit with the dark
+            // interface and let the orange trail stand out.
+            ForEach(Array(sharpEnough.enumerated()), id: \.offset) { _, picture in
+                self.picture(picture.image, picture.rect.applying(t))
                     .saturation(0.8)
-                    .brightness(-0.07)
+                    .contrast(0.9)
+                    .brightness(-0.01)
             }
             Canvas { context, _ in
                 // Faint ridges first and the main ones over them; under each line a wide faint
-                // stroke makes the glow. Over imagery, which shows the ridges itself, fainter.
-                let ridges = imagery.isEmpty ? 0.45 : 0.2
+                // stroke makes the glow. Over imagery, which shows the ridges itself, faint
+                // lines without the glow.
+                let ridges = imagery.isEmpty ? 0.45 : 0.12
                 for band in map.bands.reversed() {
                     let path = band.path.applying(t)
-                    if band.glow > 0 {
+                    if band.glow > 0, imagery.isEmpty {
                         context.stroke(path, with: .color(Self.tint.opacity(band.opacity * 0.2 * ridges)),
                                        style: StrokeStyle(lineWidth: band.glow, lineCap: .round, lineJoin: .round))
                     }
@@ -776,6 +918,28 @@ private struct MapLayer: View, Animatable {
         }
     }
 
+    /// The imagery to draw, coarse first, up to the first that's sharp enough here. Apple's
+    /// imagery at another scale can be from another season, so a sharper picture drawn over
+    /// one that doesn't need it would show as a square of another color (and Apple's logo
+    /// at its corner).
+    private var sharpEnough: [MapImagery] {
+        let k = viewport.pointsPerMeter(camera)
+        let visible = viewport.visible(camera)
+        guard let i = imagery.firstIndex(where: {
+            $0.rect.contains(visible) && Double($0.image.width) / $0.rect.width >= 1.5 * k
+        }) else { return imagery }
+        return Array(imagery[...i])
+    }
+
+    /// A picture laid over `rect`, screen points.
+    private func picture(_ image: CGImage, _ rect: CGRect) -> some View {
+        Image(decorative: image, scale: 1)
+            .resizable()
+            .interpolation(.high)
+            .frame(width: rect.width, height: rect.height)
+            .position(x: rect.midX, y: rect.midY)
+    }
+
     /// The summit and you, where they're off the map.
     private var offMap: [EdgeArrows.Item] {
         var items: [EdgeArrows.Item] = []
@@ -783,7 +947,7 @@ private struct MapLayer: View, Animatable {
             items.append(EdgeArrows.Item(title: peak.name, color: .white, at: summit, action: onSummit))
         }
         if let observer = you ?? map.observer, !viewport.inner.contains(viewport.screen(observer, camera)) {
-            items.append(EdgeArrows.Item(title: "You", color: Color(red: 0.45, green: 0.72, blue: 1), at: observer, action: nil))
+            items.append(EdgeArrows.Item(title: "You", color: Color(red: 0.45, green: 0.72, blue: 1), at: observer, action: onYou))
         }
         return items
     }
@@ -933,18 +1097,23 @@ private struct EdgeArrows: View {
         .environment(\.colorScheme, .dark)
         .fixedSize()
         .contentShape(Capsule())
+        .tapArea()
         .onTapGesture { item.action?() }
+        .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(item.title), \(Format.distance(distance, units)) away, off the map")
+        .accessibilityAddTraits(item.action == nil ? [] : .isButton)
+        .accessibilityAction { item.action?() }
     }
 }
 
-/// A thin bar of a round length, about a hundred points long.
+/// A thin bar of a round length, up to about a hundred points long.
 struct ScaleBar: View {
     let pointsPerMeter: Double
     let units: AppSettings.Units
+    var maxLength = 110.0
 
     var body: some View {
-        let (meters, label) = Self.length(upTo: 110 / pointsPerMeter, units)
+        let (meters, label) = Self.length(upTo: maxLength / pointsPerMeter, units)
         VStack(alignment: .leading, spacing: 3) {
             Text(label)
                 .font(.system(size: 10, weight: .medium))

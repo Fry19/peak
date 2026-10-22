@@ -9,6 +9,16 @@ struct AppSettings: Codable, Equatable {
         var title: String { self == .metric ? "Meters" : "Feet" }
     }
 
+    /// How the map from above draws the ground.
+    enum MapStyle: String, Codable, CaseIterable, Identifiable {
+        /// Apple's satellite imagery, while there's a connection; the terrain without one.
+        case satellite
+        /// Drawn from the terrain itself, in the walk in 3D's colors. Works offline.
+        case terrain
+        var id: String { rawValue }
+        var title: String { rawValue.capitalized }
+    }
+
     enum LabelDensity: String, Codable, CaseIterable, Identifiable {
         case fewer, normal, more
         var id: String { rawValue }
@@ -34,6 +44,8 @@ struct AppSettings: Codable, Equatable {
     var showDiagnostics = false
     /// Today's sun path, dotted across the sky in the camera view.
     var showSunPath = false
+    /// The map from above: satellite imagery or the terrain's own shading.
+    var mapStyle: MapStyle = .satellite
     /// The peak to remind about 20 minutes before alpenglow (last light on its summit).
     var alpenglow: Peak?
 
@@ -64,6 +76,7 @@ extension AppSettings {
         detailOnMobile = try c.decodeIfPresent(Bool.self, forKey: .detailOnMobile) ?? detailOnMobile
         showDiagnostics = try c.decodeIfPresent(Bool.self, forKey: .showDiagnostics) ?? showDiagnostics
         showSunPath = try c.decodeIfPresent(Bool.self, forKey: .showSunPath) ?? showSunPath
+        mapStyle = try c.decodeIfPresent(MapStyle.self, forKey: .mapStyle) ?? mapStyle
         alpenglow = try c.decodeIfPresent(Peak.self, forKey: .alpenglow)
     }
 }

@@ -172,9 +172,6 @@ final class AppModel {
     var showsFromAbove = false {
         didSet { if showsFromAbove != oldValue { cameraCovered(showsFromAbove || photo != nil) } }
     }
-    /// The view from above shows satellite imagery under the lines (while there's a
-    /// connection) instead of the terrain's shading. Starts off each time Peak opens.
-    var fromAboveSatellite = false
     /// Lining the view up by hand: the picture is paused and dragging moves the lines.
     var aligning = false
     /// How far the picture and the lines are zoomed in, 1 to `maxZoom`.
