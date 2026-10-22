@@ -23,7 +23,7 @@ struct TrailWalkView: View {
             TrailFromAboveView.background
                 .ignoresSafeArea()
             if let world {
-                WalkSceneView(world: world, player: player)
+                WalkSceneView(world: world, player: player, you: model.tracker.youOnMap(trail.trail))
                     .ignoresSafeArea()
                     .transition(.opacity)
             } else if failed {
@@ -75,6 +75,8 @@ final class WalkWorld: @unchecked Sendable {
     let scene: SCNScene
     let camera: SCNNode
     let walker: SCNNode
+    /// You, where the phone puts you, in blue; hidden when not known or off the terrain.
+    let you: SCNNode
     let label: SCNNode?
     /// The ridge crest lines, faded by how steeply the camera looks down.
     let crests: SCNNode
@@ -87,11 +89,12 @@ final class WalkWorld: @unchecked Sendable {
     /// How far from the walker the camera follows, meters.
     let range: Double
 
-    private init(scene: SCNScene, camera: SCNNode, walker: SCNNode, label: SCNNode?, crests: SCNNode, walk: TrailWalk,
+    private init(scene: SCNScene, camera: SCNNode, walker: SCNNode, you: SCNNode, label: SCNNode?, crests: SCNNode, walk: TrailWalk,
                  relief: ReliefMap, profile: TrailProfile?, overhead: (eye: SIMD3<Double>, target: SIMD3<Double>), range: Double) {
         self.scene = scene
         self.camera = camera
         self.walker = walker
+        self.you = you
         self.label = label
         self.crests = crests
         self.walk = walk
@@ -117,6 +120,19 @@ final class WalkWorld: @unchecked Sendable {
     /// up in 3D; steep climbs tilt it down a little, and ridges in the way lift it.
     func follow(at distance: Double) -> (eye: SIMD3<Double>, target: SIMD3<Double>) {
         walk.camera(at: distance, range: range, pitch: 9, maxPitch: 30, lead: 0.3) { [relief] in relief.height(at: $0) }
+    }
+
+    /// Puts the you-are-here dot at `p` on the ground.
+    func place(you p: LatLon?) {
+        let xy = p.map { relief.projection.point($0) }
+        let z = xy.map { relief.height(at: $0) } ?? .nan
+        guard let xy, z.isFinite else {
+            you.isHidden = true
+            return
+        }
+        let position = Self.scn(SIMD3(xy.x, xy.y, z + 3))
+        if !SCNVector3EqualToVector3(you.position, position) { you.position = position }
+        you.isHidden = false
     }
 
     func walkerPosition(at distance: Double) -> SIMD3<Double> {
@@ -203,6 +219,16 @@ final class WalkWorld: @unchecked Sendable {
         walker.position = scn(walk.point(at: 0))
         scene.rootNode.addChildNode(walker)
 
+        let you = SCNNode(geometry: SCNSphere(radius: 6))
+        let blue = SCNMaterial()
+        blue.lightingModel = .constant
+        blue.diffuse.contents = UIColor(red: 0.3, green: 0.62, blue: 1, alpha: 1)
+        blue.emission.contents = UIColor(red: 0.3, green: 0.62, blue: 1, alpha: 1)
+        blue.emission.intensity = 1.6
+        you.geometry!.firstMaterial = blue
+        you.isHidden = true
+        scene.rootNode.addChildNode(you)
+
         var label: SCNNode?
         if let peak {
             let xy = projection.point(peak.position)
@@ -240,7 +266,7 @@ final class WalkWorld: @unchecked Sendable {
         let floor = relief.height(at: center)
         let overhead = (eye: SIMD3(center.x, center.y, (floor.isFinite ? floor : Double(high)) + altitude),
                         target: SIMD3(center.x, center.y, floor.isFinite ? floor : Double(low)))
-        return WalkWorld(scene: scene, camera: camera, walker: walker, label: label, crests: crests, walk: walk, relief: relief,
+        return WalkWorld(scene: scene, camera: camera, walker: walker, you: you, label: label, crests: crests, walk: walk, relief: relief,
                          profile: profile, overhead: overhead, range: range)
     }
 
@@ -651,6 +677,7 @@ final class WalkPlayer {
 private struct WalkSceneView: UIViewRepresentable {
     let world: WalkWorld
     let player: WalkPlayer
+    let you: LatLon?
 
     func makeUIView(context: Context) -> SCNView {
         let view = SCNView(frame: .zero, options: [SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue])
@@ -663,10 +690,13 @@ private struct WalkSceneView: UIViewRepresentable {
         view.scene = world.scene
         view.pointOfView = world.camera
         player.attach(view, world: world)
+        world.place(you: you)
         return view
     }
 
-    func updateUIView(_ view: SCNView, context: Context) {}
+    func updateUIView(_ view: SCNView, context: Context) {
+        world.place(you: you)
+    }
 
     static func dismantleUIView(_ view: SCNView, coordinator: ()) {
         view.scene = nil

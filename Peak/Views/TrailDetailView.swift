@@ -68,6 +68,8 @@ struct TrailDetailView: View {
                 }
             }
 
+            if place == nil { TrailLiveSection(model: model, hike: hike) }
+
             if let profile = hike.profile, profile.points.count > 2 {
                 Section("Elevation") {
                     ProfileChart(profile: profile, units: units)

@@ -36,6 +36,7 @@ struct TrailFromAboveView: View {
                     GeometryReader { screen in
                         let viewport = Viewport(size: screen.size, map: map, content: content)
                         MapLayer(map: map, viewport: viewport, camera: camera, units: model.settings.units,
+                                 you: model.tracker.youOnMap(trail.trail).map(map.projection.point),
                                  onSummit: { model.select(trail.peakID) })
                             .contentShape(Rectangle())
                             .gesture(pan(viewport).simultaneously(with: pinch(viewport)))
@@ -265,6 +266,7 @@ struct OverheadMap: @unchecked Sendable {
     let summit: SIMD2<Double>?
     let peak: Peak?
     let observer: SIMD2<Double>?
+    let projection: MapProjection
     /// Climb along the trail, meters.
     let gain: Double?
 
@@ -315,6 +317,7 @@ struct OverheadMap: @unchecked Sendable {
                            summit: peak.map { projection.point($0.position) },
                            peak: peak,
                            observer: observer.map(projection.point),
+                           projection: projection,
                            gain: profile?.gain)
     }
 
@@ -362,6 +365,8 @@ private struct MapLayer: View, Animatable {
     let viewport: Viewport
     var camera: MapCamera
     let units: AppSettings.Units
+    /// Where you are now, when the phone knows; else where the view was built.
+    let you: SIMD2<Double>?
     let onSummit: () -> Void
 
     var animatableData: AnimatablePair<AnimatablePair<Double, Double>, Double> {
@@ -419,7 +424,7 @@ private struct MapLayer: View, Animatable {
                         .onTapGesture(perform: onSummit)
                 }
             }
-            if let observer = map.observer {
+            if let observer = you ?? map.observer {
                 You(viewport: viewport, camera: camera, at: observer, units: units)
             }
         }

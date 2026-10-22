@@ -57,6 +57,9 @@ final class OverlayCanvas: UIView {
     private let trailGlow = OverlayCanvas.stroke(OverlayCanvas.trailColor.withAlphaComponent(0.3), width: 8)
     private let trailLine = OverlayCanvas.stroke(OverlayCanvas.trailColor, width: 2.5)
     private let hiddenTrailLine = OverlayCanvas.stroke(OverlayCanvas.trailColor.withAlphaComponent(0.6), width: 1.8)
+    /// The part of the trail you've walked, and where you are on it, without Metal.
+    private let walkedTrailLine = OverlayCanvas.stroke(OverlayCanvas.trailColor.withAlphaComponent(0.32), width: 2)
+    private let youLayer = OverlayCanvas.stroke(UIColor.white.withAlphaComponent(0.85), width: 1.5)
     /// Today's sun path, without Metal.
     private let sunLayer: CAShapeLayer = {
         let l = CAShapeLayer()
@@ -161,7 +164,7 @@ final class OverlayCanvas: UIView {
         if let renderer {
             layer.addSublayer(renderer.layer)
         } else {
-            for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, trailGlow, trailLine, sunLayer, dotLayer] { layer.addSublayer(l) }
+            for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, walkedTrailLine, trailGlow, trailLine, youLayer, sunLayer, dotLayer] { layer.addSublayer(l) }
         }
         layer.addSublayer(hourContainer)
         layer.addSublayer(labelContainer)
@@ -269,7 +272,8 @@ final class OverlayCanvas: UIView {
         // Dashes keep their size on the mountain while zooming, halving at each doubling,
         // so they're 9 to 18 points apart on screen.
         let dashScale = camera.intrinsics.fx / model.zoom * pow(2, floor(log2(max(1, model.zoom)))) * .pi / 180
-        layoutTrail(model.arTrail?.runs, projector, xRay: settings.trailXRay, pointsPerDegree: dashScale)
+        layoutTrail(model.arTrail, progress: model.tracker.progress, terrain: scene.terrain, projector,
+                    xRay: settings.trailXRay, pointsPerDegree: dashScale)
         layoutSunPath(settings.showSunPath ? model.sun.path(scene: scene) : nil, projector)
         let placed = layoutLabels(scene, projector, heading: camera.attitude.heading, reach: reach, model: model, at: now)
         renderer?.draw(lines: lineSegments, overlay: overlaySegments, halo: contrast ? 0.5 : 0.28,
@@ -283,7 +287,7 @@ final class OverlayCanvas: UIView {
     }
 
     private func clear() {
-        for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, trailGlow, trailLine, sunLayer, dotLayer] { l.path = nil }
+        for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, walkedTrailLine, trailGlow, trailLine, youLayer, sunLayer, dotLayer] { l.path = nil }
         layoutSunPath(nil, nil)
         renderer?.draw(lines: [], size: bounds.size, scale: displayScale)
         for id in Array(slots.keys) { fade(id, in: false) }
@@ -349,6 +353,9 @@ final class OverlayCanvas: UIView {
     private static let trailGlowStyle = Style(color: SIMD4(1.0, 0.72, 0.28, 0), width: 2.5, glow: 6, glowAlpha: 0.38)
     private static let trailStyle = Style(color: SIMD4(1.0, 0.72, 0.28, 1), width: 2.5, glow: 0, glowAlpha: 0)
     private static let hiddenTrailStyle = Style(color: SIMD4(1.0, 0.72, 0.28, 0.6), width: 1.8, glow: 3, glowAlpha: 0.14)
+    /// Walking the trail: the part behind you, quieter.
+    private static let walkedTrailStyle = Style(color: SIMD4(1.0, 0.72, 0.28, 0.32), width: 2, glow: 0, glowAlpha: 0)
+    private static let youStyle = Style(color: SIMD4(1, 1, 1, 0.85), width: 1.5, glow: 3, glowAlpha: 0.2)
     /// A hidden stretch's dashes: `dashOn` points drawn of every `dashPeriod`, before the
     /// round caps.
     private static let dashPeriod: CGFloat = 9
@@ -431,16 +438,21 @@ final class OverlayCanvas: UIView {
     /// The trail laid on the slope: solid where it's in sight and, seeing through ridges
     /// (`xRay`), fainter and dashed where nearer terrain hides it. Dashes are spaced along
     /// the trail by angle, `pointsPerDegree`, not along the screen, so they stay put on the
-    /// mountain as the phone turns.
-    private func layoutTrail(_ runs: [[DrapedPoint]]?, _ projector: Camera.Projector, xRay: Bool, pointsPerDegree: CGFloat) {
-        guard let runs else {
+    /// mountain as the phone turns. Walking it (`progress`), the part of the main line behind
+    /// you is quieter, and a small ring marks where you are on it.
+    private func layoutTrail(_ trail: AppModel.ARTrail?, progress: TrailProgress?, terrain: Terrain,
+                             _ projector: Camera.Projector, xRay: Bool, pointsPerDegree: CGFloat) {
+        guard let runs = trail?.runs else {
             trailGlow.path = nil
             trailLine.path = nil
             hiddenTrailLine.path = nil
+            walkedTrailLine.path = nil
+            youLayer.path = nil
             return
         }
         let gpu = renderer != nil
         var solid = Polyline()
+        var walked = Polyline()
         let dashes = CGMutablePath()
         let area = bounds.insetBy(dx: -20, dy: -20)
         // The dashes along a→b, which spans s0 to s1 of the pattern.
@@ -480,7 +492,13 @@ final class OverlayCanvas: UIView {
                     continue
                 }
                 if let last {
-                    if last.inSight && p.isInSight {
+                    if last.inSight && p.isInSight, let progress, p.line == 0, progress.isBehind(Double(p.along)) {
+                        if gpu {
+                            overlaySegments.append(Self.walkedTrailStyle.segment(last.point, q))
+                        } else {
+                            walked.add(last.point, q)
+                        }
+                    } else if last.inSight && p.isInSight {
                         if gpu {
                             lineSegments.append(Self.trailGlowStyle.segment(last.point, q))
                             overlaySegments.append(Self.trailStyle.segment(last.point, q))
@@ -494,9 +512,34 @@ final class OverlayCanvas: UIView {
                 last = (q, p.isInSight, along)
             }
         }
+        // Where you are on the trail, seen from where the trail was laid out from: a ring on
+        // the ground, if it's in view.
+        let ring = CGMutablePath()
+        if let progress, let observer = trail?.observer {
+            let at = progress.position
+            let ground = terrain.height(latitude: at.latitude, longitude: at.longitude)
+            let look = LocalFrame(origin: observer).look(at: GeoPoint(latitude: at.latitude, longitude: at.longitude,
+                                                                      height: ground.isFinite ? ground + 0.3 : observer.height - 1.6))
+            if look.distance > 3, let q = point(projector, look.azimuth, look.elevation), bounds.contains(q) {
+                let r: CGFloat = 6
+                if gpu {
+                    var previous = CGPoint(x: q.x + r, y: q.y)
+                    for k in 1...16 {
+                        let a = CGFloat(k) / 16 * 2 * .pi
+                        let next = CGPoint(x: q.x + r * cos(a), y: q.y + r * sin(a))
+                        overlaySegments.append(Self.youStyle.segment(previous, next))
+                        previous = next
+                    }
+                } else {
+                    ring.addEllipse(in: CGRect(x: q.x - r, y: q.y - r, width: 2 * r, height: 2 * r))
+                }
+            }
+        }
         guard !gpu else { return }
         trailGlow.path = solid.path
         trailLine.path = solid.path
+        walkedTrailLine.path = walked.path
+        youLayer.path = ring
         hiddenTrailLine.path = xRay ? dashes : nil
     }
 

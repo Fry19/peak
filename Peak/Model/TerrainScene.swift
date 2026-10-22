@@ -95,9 +95,23 @@ struct TerrainScene: @unchecked Sendable {
     }
 
     /// A trail laid on the terrain as seen from here, with the stretches behind nearer
-    /// ridges marked, so they can be hidden or seen through.
-    func drape(_ trail: Trail) -> [[DrapedPoint]] {
-        HorizonRenderer(terrain: terrain).drape(trail.lines, from: observer, horizon: horizon, includeHidden: true)
+    /// ridges marked, so they can be hidden or seen through. Its main line comes first (line
+    /// 0), as the profile has it when there is one, so distances along it match those of a
+    /// `TrailMatcher` on that profile. Seen from `here` when given (where you are now,
+    /// walking the trail) rather than from where the view was built; the trail within 120 m
+    /// of it is drawn on the ground in any case.
+    func drape(_ trail: Trail, profile: TrailProfile?, from here: LatLon? = nil) -> (runs: [[DrapedPoint]], observer: GeoPoint) {
+        let renderer = HorizonRenderer(terrain: terrain)
+        let main = profile.map { $0.points.map(\.position) }.flatMap { $0.count > 1 ? $0 : nil } ?? trail.mainLine
+        var others = trail.lines
+        if let i = others.firstIndex(of: trail.mainLine) { others.remove(at: i) }
+        var eye = observer
+        if let here, here.distance(to: position) < 2_000 {
+            let e = renderer.observer(latitude: here.latitude, longitude: here.longitude)
+            if e.height.isFinite, terrain.height(latitude: here.latitude, longitude: here.longitude).isFinite { eye = e }
+        }
+        let runs = renderer.drape([main] + others, from: eye, horizon: horizon, minDistance: 12, clearDistance: 120, includeHidden: true)
+        return (runs, eye)
     }
 
     var position: LatLon { LatLon(observer.latitude, observer.longitude) }

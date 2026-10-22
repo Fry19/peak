@@ -255,7 +255,8 @@ private struct TrailChip: View {
                     .lineLimit(1)
                 Text(status)
                     .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.7))
+                    .monospacedDigit()
+                    .foregroundStyle(model.tracker.strayed != nil ? Color(red: 1, green: 0.84, blue: 0.6) : .white.opacity(0.7))
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
@@ -307,6 +308,14 @@ private struct TrailChip: View {
     private var xRay: Bool { model.settings.trailXRay }
 
     private var status: String {
+        // Walking it: how far is left, or how far off it you've wandered.
+        let tracker = model.tracker
+        if tracker.trailID == trail.trail.id {
+            if let off = tracker.strayed { return TrailLive.strayed(off, units: model.settings.units) }
+            if let p = tracker.progress {
+                return TrailLive.summary(p, top: TrailLive.top(trail.trail, peak: model.peak(trail.peakID)), units: model.settings.units)
+            }
+        }
         guard trail.runs != nil else { return "Laying it on the terrain…" }
         switch (trail.someInSight, trail.someHidden) {
         case (true, true): return xRay ? "Dashed where ridges hide it" : "Drawn where it's in sight"

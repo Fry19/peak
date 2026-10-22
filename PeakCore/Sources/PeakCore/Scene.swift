@@ -85,6 +85,9 @@ public struct DrapedPoint: Sendable {
     public var distance: Float
     /// In sight, rather than behind nearer terrain.
     public var isInSight = true
+    /// Which of the lines draped it lies on, and how far along that line, meters.
+    public var line: Int32 = 0
+    public var along: Float = 0
 }
 
 extension HorizonProfile {
@@ -120,32 +123,41 @@ extension HorizonRenderer {
     /// of points about `spacing` meters apart and `lift` meters above the ground. Stretches
     /// hidden behind nearer terrain are left out, or with `includeHidden` kept and marked
     /// not in sight, for seeing through the ridge. Stretches outside the terrain or within
-    /// `minDistance` of the observer are always left out.
+    /// `minDistance` of the observer are always left out. Points within `clearDistance`
+    /// count as in sight: that near, the terrain model is too coarse to say what hides them,
+    /// and it's the trail you're standing on.
     public func drape(_ lines: [[LatLon]], from observer: GeoPoint, horizon: HorizonProfile,
                       spacing: Double = 15, lift: Double = 2, minDistance: Double = 30,
-                      includeHidden: Bool = false) -> [[DrapedPoint]] {
+                      clearDistance: Double = 0, includeHidden: Bool = false) -> [[DrapedPoint]] {
         let frame = LocalFrame(origin: observer)
         let here = LatLon(observer.latitude, observer.longitude)
         var runs: [[DrapedPoint]] = []
-        for line in lines {
+        for (index, line) in lines.enumerated() {
             var run: [DrapedPoint] = []
             func endRun() {
                 if run.count >= 2 { runs.append(run) }
                 run = []
             }
+            var along = 0.0
+            var last: LatLon?
             for p in Trail.densify(line, spacing: spacing) {
+                if let last { along += last.distance(to: p) }
+                last = p
                 let ground = terrain.height(latitude: p.latitude, longitude: p.longitude)
                 let horizontal = here.distance(to: p)
                 guard ground.isFinite, horizontal >= minDistance else { endRun(); continue }
-                let look = frame.look(at: GeoPoint(latitude: p.latitude, longitude: p.longitude, height: ground + lift),
+                // Near points lie on the ground: lifted, they'd rise to eye level at your feet.
+                let near = horizontal <= clearDistance
+                let look = frame.look(at: GeoPoint(latitude: p.latitude, longitude: p.longitude, height: ground + (near ? min(lift, 0.3) : lift)),
                                       refraction: horizon.settings.refraction)
-                let inSight = horizon.isInSight(azimuth: look.azimuth, elevation: look.elevation, distance: horizontal)
+                let inSight = near ||
+                    horizon.isInSight(azimuth: look.azimuth, elevation: look.elevation, distance: horizontal)
                 guard inSight || includeHidden else {
                     endRun()
                     continue
                 }
                 run.append(DrapedPoint(azimuth: Float(look.azimuth), elevation: Float(look.elevation),
-                                       distance: Float(horizontal), isInSight: inSight))
+                                       distance: Float(horizontal), isInSight: inSight, line: Int32(index), along: Float(along)))
             }
             endRun()
         }

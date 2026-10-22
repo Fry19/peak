@@ -120,7 +120,11 @@ final class AppModel {
         var trail: Trail
         var peakID: Int64
         /// The trail laid on the terrain, stretches behind ridges marked, once worked out.
+        /// Line 0 is the main line, as `profile` has it.
         var runs: [[DrapedPoint]]?
+        var profile: TrailProfile?
+        /// Where the runs are seen from.
+        var observer: GeoPoint?
 
         /// Some of it is in sight, and some of it is behind nearer ridges.
         var someInSight: Bool { runs?.contains { $0.contains(where: \.isInSight) } ?? false }
@@ -204,6 +208,8 @@ final class AppModel {
     let baseLayer: BaseLayer? = Bundle.main.url(forResource: "World", withExtension: "pkbase")
         .flatMap { try? BaseLayer(contentsOf: $0) }
     let sun = SunService()
+    /// Where you are on the trail drawn on the mountain.
+    let tracker = TrailTracker()
     private let corrector = SkylineCorrector()
     private let mailbox = FrameMailbox()
     private let locationManager = CLLocationManager()
@@ -248,6 +254,8 @@ final class AppModel {
     @ObservationIgnored private(set) var lastBuildSeconds = 0.0
     @ObservationIgnored private(set) var bytesDownloaded = 0
     @ObservationIgnored private var details: [Int64: PeakDetails] = [:]
+    @ObservationIgnored private var draping = false
+    @ObservationIgnored private var drapeAgain = false
 
     /// Corrections to apply to the motion sensors for a pose: their north (magnetic or
     /// true) plus what skyline matching or lining up by hand found.
@@ -662,6 +670,8 @@ final class AppModel {
         showsFromAbove = false
         if arTrail?.trail.id != trail.id || arTrail?.peakID != peakID {
             arTrail = ARTrail(trail: trail, peakID: peakID, runs: nil)
+            tracker.follow(trail, profile: nil)
+            followTrailClosely(true)
             drapeTrail()
         }
     }
@@ -676,14 +686,56 @@ final class AppModel {
     func clearTrail() {
         arTrail = nil
         showsFromAbove = false
+        tracker.stop()
+        followTrailClosely(false)
     }
 
+    /// Lays the trail on the terrain, seen from where you are when you're on it. Calls while
+    /// one is under way are folded into one more afterwards.
     private func drapeTrail() {
         guard let trail = arTrail?.trail, let scene else { return }
-        Task { @MainActor in
-            let runs = await Task.detached(priority: .utility) { scene.drape(trail) }.value
-            if arTrail?.trail.id == trail.id { arTrail?.runs = runs }
+        if draping {
+            drapeAgain = true
+            return
         }
+        draping = true
+        let known = arTrail?.profile
+        let here = tracker.progress != nil ? tracker.here : nil
+        Task { @MainActor in
+            let (profile, draped) = await Task.detached(priority: .utility) {
+                let profile = known ?? trail.profile(on: scene.terrain)
+                return (profile, scene.drape(trail, profile: profile, from: here))
+            }.value
+            draping = false
+            if arTrail?.trail.id == trail.id {
+                arTrail?.profile = profile
+                arTrail?.runs = draped.runs
+                arTrail?.observer = draped.observer
+                tracker.follow(trail, profile: profile)
+            }
+            if drapeAgain {
+                drapeAgain = false
+                drapeTrail()
+            }
+        }
+    }
+
+    /// With a trail shown, the best fixes the phone can give, each as it comes, for placing
+    /// you on it; otherwise the usual. (Only while Peak is open: no background location.)
+    private func followTrailClosely(_ on: Bool) {
+        locationManager.desiredAccuracy = on ? kCLLocationAccuracyBestForNavigation : kCLLocationAccuracyBest
+        locationManager.distanceFilter = on ? kCLDistanceFilterNone : 10
+        locationManager.activityType = on ? .fitness : .other
+    }
+
+    /// Places you on the trail shown, and lays it on the terrain again from where you are
+    /// every 15 m or so while you walk it.
+    private func followTrail(_ location: CLLocation) {
+        guard arTrail != nil else { return }
+        tracker.update(location)
+        guard tracker.progress != nil, let here = tracker.here, !draping else { return }
+        let seenFrom = arTrail?.observer.map { LatLon($0.latitude, $0.longitude) }
+        if seenFrom.map({ $0.distance(to: here) > 15 }) ?? true { drapeTrail() }
     }
 
     // MARK: Terrain and peaks
@@ -692,6 +744,7 @@ final class AppModel {
         // Starting updates first hands over the fix the phone kept from earlier, which may be
         // from somewhere you've since left.
         guard new.horizontalAccuracy >= 0, new.timestamp.timeIntervalSinceNow > -60 else { return }
+        followTrail(new)
         if let old = location, new.timestamp.timeIntervalSince(old.timestamp) < 60, old.horizontalAccuracy < new.horizontalAccuracy,
            new.distance(from: old) < old.horizontalAccuracy { return }
         location = new
