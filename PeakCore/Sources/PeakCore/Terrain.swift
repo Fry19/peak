@@ -23,6 +23,9 @@ public final class ElevationTile: @unchecked Sendable {
     /// From the worldwide base layer (`BaseLayer`): kilometers between pixels, so good for
     /// far skylines but not for what's near.
     public internal(set) var isCoarse = false
+    /// Grid nodes raised into sharp tips. Kept on the tile because scene rebuilds reuse
+    /// already raised tiles, for which `raiseSummits` correctly reports no further changes.
+    private(set) var summitTipIndices = Set<Int>()
 
     public convenience init(south: Int, west: Int, rows: Int, cols: Int,
                             originLatitude: Double, originLongitude: Double,
@@ -437,6 +440,18 @@ public final class Terrain: @unchecked Sendable {
 }
 
 extension Terrain {
+    /// Exact grid positions worth sampling in addition to the horizon's regular rays.
+    /// These are hints: the renderer reads the current blended height here, since a finer
+    /// patch may have replaced or softened a tip in an underlying tile.
+    var summitTips: [GeoPoint] {
+        (tiles + detail).flatMap { tile in
+            tile.summitTipIndices.sorted().map { i in
+                GeoPoint(latitude: tile.originLatitude - Double(i / tile.cols) * tile.stepLatitude,
+                         longitude: tile.originLongitude + Double(i % tile.cols) * tile.stepLongitude)
+            }
+        }
+    }
+
     /// The finest tile or patch with data at a point.
     func finestTile(latitude: Double, longitude: Double) -> ElevationTile? {
         let south = Int(latitude.rounded(.up)) - 1, west = Int(longitude.rounded(.down))
@@ -611,6 +626,7 @@ extension ElevationTile {
             // A tip that skims a long, gentle top past its reach is tried steeper.
             if ranPast, attempt + 1 < Self.tipMargins.count { continue }
             for cell in raised { heights[cell.index] = cell.height }
+            if !raised.isEmpty { summitTipIndices.insert(r0 * cols + c0) }
             return !raised.isEmpty
         }
         return false
