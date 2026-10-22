@@ -64,7 +64,7 @@ struct SettingsView: View {
             Section("About") {
                 LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
                 Text("Terrain: Copernicus DEM GLO-30 © DLR e.V. 2010–2014 and © Airbus Defence and Space GmbH 2014–2018, provided under COPERNICUS by the European Union and ESA.")
-                Text("Ground under trails in the United States: U.S. Geological Survey, 3D Elevation Program (public domain).")
+                Text("Ground near you and under trails in the United States: U.S. Geological Survey, 3D Elevation Program (public domain).")
                 Text("Peaks and trails: © OpenStreetMap contributors, under the Open Database License.")
                 Text("Facts: Wikidata (CC0) and Wikipedia (CC BY-SA).")
                 Link("Source code", destination: URL(string: "https://github.com/Fry19/peak")!)

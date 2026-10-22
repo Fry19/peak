@@ -384,4 +384,91 @@ final class HorizonTests: XCTestCase {
         XCTAssertEqual(seen.withNearGround().elevations, ground.elevations)
         XCTAssertEqual(seen.withNearGround().distances, ground.distances)
     }
+
+    /// Seen from 45.5°N 8.25°E: bare ground at 300 m with a mountain 20 km north; the surface
+    /// model (1″, like Copernicus) has a 20 m canopy over all of it and a building 55 m high
+    /// 300 m north; the bare ground (⅓″, like USGS 3DEP, a patch around the eye) has a knoll
+    /// 600 m east whose surveyed top is 25 m above it.
+    private func canopyScene() -> (terrain: Terrain, observer: GeoPoint, mountain: GeoPoint, knoll: Peak) {
+        let lat0 = 45.5, lon0 = 8.25, step = 1.0 / 3600
+        let origin = GeoPoint(latitude: lat0, longitude: lon0, height: 0)
+        let peak = destination(from: origin, azimuth: 0, distance: 20_000)
+        let building = destination(from: origin, azimuth: 0, distance: 300)
+        let knollAt = destination(from: origin, azimuth: 90, distance: 600)
+        func cone(_ lat: Double, _ lon: Double, _ c: (latitude: Double, longitude: Double), _ height: Double, _ radius: Double) -> Double {
+            height * max(0, 1 - hypot((lat - c.latitude) * 111_320, (lon - c.longitude) * 111_320 * cos(lat * .pi / 180)) / radius)
+        }
+        func grid(north: Double, south: Double, west: Double, east: Double, step: Double = step,
+                  _ height: (Double, Double) -> Double) -> ElevationTile {
+            let rows = Int(((north - south) / step).rounded()) + 1, cols = Int(((east - west) / step).rounded()) + 1
+            var heights = [Int16](repeating: 0, count: rows * cols)
+            for r in 0..<rows {
+                for c in 0..<cols { heights[r * cols + c] = Int16(height(north - Double(r) * step, west + Double(c) * step).rounded()) }
+            }
+            return ElevationTile(south: 45, west: 8, rows: rows, cols: cols, originLatitude: north, originLongitude: west,
+                                 stepLatitude: step, stepLongitude: step, heights: heights)
+        }
+        let bare = { (lat: Double, lon: Double) in 300 + cone(lat, lon, peak, 400, 4_000) }
+        let surface = grid(north: 45.8, south: 45.4, west: 8.0, east: 8.5) { lat, lon in
+            bare(lat, lon) + 20 + cone(lat, lon, building, 35, 40)
+        }
+        let ground = grid(north: 45.56, south: 45.44, west: 8.17, east: 8.33, step: step / 3) { lat, lon in
+            bare(lat, lon) + cone(lat, lon, knollAt, 15, 150)
+        }
+        let terrain = Terrain(tiles: [surface], ground: [ground], missingIsSea: false)
+        let knoll = Peak(id: 7, name: "Knoll", latitude: knollAt.latitude, longitude: knollAt.longitude, elevation: 325)
+        return (terrain, HorizonRenderer(terrain: terrain).observer(latitude: lat0, longitude: lon0),
+                GeoPoint(latitude: peak.latitude, longitude: peak.longitude, height: 720), knoll)
+    }
+
+    /// The view stands on bare ground near the eye: a building in the surface model no longer
+    /// hides the mountain behind it, while matching's surface still has it. The eye stays on
+    /// the surface model, so the canopy past the bare ground makes no skyline; from the bare
+    /// ground it would, all around. The bare ground under trails is kept whole, and summits
+    /// raised near the eye change only the copy.
+    func testViewWithBareGroundNearTheEye() {
+        let (terrain, observer, mountain, knoll) = canopyScene()
+        XCTAssertEqual(observer.height, 321.6, accuracy: 0.01, "on the canopy, as before")
+        let land = try! XCTUnwrap(terrain.withGround(within: 1_000, latitude: 45.5, longitude: 8.25))
+        func at(_ azimuth: Double, _ distance: Double) -> Double {
+            let p = destination(from: observer, azimuth: azimuth, distance: distance)
+            return land.height(latitude: p.latitude, longitude: p.longitude)
+        }
+        XCTAssertEqual(at(0, 300), 300, accuracy: 0.5, "no building")
+        XCTAssertEqual(at(180, 900), 300, accuracy: 0.5)
+        XCTAssertEqual(at(45, 1_300), 300, accuracy: 0.5, "a box: farther along the diagonal")
+        XCTAssertEqual(at(180, 2_000), 320, accuracy: 0.5, "the canopy past it")
+        // Blended into the surface over the box's last 240 m (1,000–1,240 m), without a step.
+        let ramp = stride(from: 950.0, through: 1_300, by: 10).map { at(180, $0) }
+        XCTAssertEqual(ramp.first!, 300, accuracy: 0.5)
+        XCTAssertEqual(ramp.last!, 320, accuracy: 0.5)
+        XCTAssertTrue((300.0...318.0).contains(at(180, 1_150)) && at(180, 1_150) > 302, "\(at(180, 1_150))")
+        for (a, b) in zip(ramp, ramp.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(b, a - 0.3)
+            XCTAssertLessThan(b - a, 2)
+        }
+        XCTAssertEqual(land.ground.height(latitude: 45.45, longitude: 8.25), 300, accuracy: 0.5, "all the bare ground kept")
+        XCTAssertEqual(land.groundPatches.count, terrain.groundPatches.count)
+        XCTAssertNil(Terrain(tiles: terrain.tiles, missingIsSea: false).withGround(within: 1_000, latitude: 45.5, longitude: 8.25))
+        XCTAssertNil(terrain.withGround(within: 1_000, latitude: 45.75, longitude: 8.25), "no bare ground there")
+
+        var settings = HorizonSettings()
+        settings.maxDistance = 25_000
+        settings.azimuthStep = 1
+        settings.nearAllowance = 10
+        XCTAssertFalse(HorizonRenderer(terrain: terrain).visibility(of: mountain, from: observer, settings: settings).isVisible)
+        XCTAssertTrue(HorizonRenderer(terrain: land).visibility(of: mountain, from: observer, settings: settings).isVisible)
+        let view = HorizonRenderer(terrain: land).render(from: observer, settings: settings)
+        XCTAssertGreaterThan(Double(view.distances[0]), 15_000, "the mountain is the skyline north")
+        XCTAssertFalse(view.distances.contains { $0 < 1_500 }, "nothing near makes a skyline")
+        let lowEye = HorizonRenderer(terrain: land).observer(latitude: 45.5, longitude: 8.25)
+        let fromBare = HorizonRenderer(terrain: land).render(from: lowEye, settings: settings)
+        XCTAssertGreaterThan(fromBare.distances.filter { $0 < 1_500 }.count, 180, "the canopy's edge, most of the way round")
+
+        // A summit near the eye is raised on the copy, not on the bare ground under trails.
+        XCTAssertEqual(land.raiseSummits([knoll]), 1)
+        let under = terrain.ground.height(latitude: knoll.latitude, longitude: knoll.longitude)
+        XCTAssertEqual(under, 315, accuracy: 1.5)
+        XCTAssertGreaterThan(land.height(latitude: knoll.latitude, longitude: knoll.longitude), under + 8)
+    }
 }

@@ -19,12 +19,29 @@ struct TerrainScene: @unchecked Sendable {
     }
 
     let observer: GeoPoint
+    /// The terrain all around, as downloaded: for hikes, maps, the sun on summits and the
+    /// heights of the trail drawn on the mountain.
     let terrain: Terrain
+    /// The terrain the view is drawn from: `terrain`, but with bare ground within a
+    /// kilometer of you where there is some (USGS 3DEP in the United States), so the
+    /// buildings and trees in Copernicus's surface model around you neither hide the
+    /// mountains nor make skylines of their own. The eye stays on the surface model as before,
+    /// so trees all around at its height don't rise into a skyline where the bare ground
+    /// ends, unless the bare ground is higher (a summit's top, which a surface model blunts).
+    /// Lines, labels, what's hidden and the views from above use it.
+    let viewTerrain: Terrain
+    /// Whether the view has bare ground near you (`viewTerrain`), to credit it.
+    let standsOnGround: Bool
     /// The view, drawn and labeled from up to `nearAllowance` above the eye as far as the
     /// ground near you goes.
     let horizon: HorizonProfile
-    /// The skyline as the ground near you stands, which is what the camera sees from it and
-    /// where the sun really goes: skyline matching and today's sun times use this one.
+    /// The view on the surface model alone, from the eye on it, as it was before bare ground
+    /// near you: the trail drawn on the mountain, whose heights are the surface model's, is
+    /// laid against it. The same as `horizon` without bare ground near you.
+    let surfaceHorizon: HorizonProfile
+    /// The skyline as the surface near you stands, from the eye on it: what the camera sees,
+    /// treetops and roofs included, and where the sun really goes. Skyline matching and
+    /// today's sun times use this one.
     let matchingHorizon: HorizonProfile
     /// Ridge segments bucketed by whole degree of azimuth, for drawing only what's in view.
     let segments: [[RidgeSegment]]
@@ -73,7 +90,23 @@ struct TerrainScene: @unchecked Sendable {
         settings.maxDistance = radius
         settings.nearAllowance = nearAllowance
         if isCoarse, let altitude { observer.height = altitude }
-        return view(from: observer, terrain: terrain, peaks: peaks, settings: settings, isCoarse: isCoarse)
+        // Bare ground within a kilometer, where it's in (`viewTerrain`).
+        guard !isCoarse, let land = terrain.withGround(within: settings.nearRange, latitude: latitude, longitude: longitude) else {
+            return view(from: observer, terrain: terrain, viewTerrain: terrain, peaks: peaks, settings: settings, isCoarse: isCoarse)
+        }
+        // Summits near you get their tips on the copy of the bare ground too (the rest are
+        // in the tiles it shares, raised above).
+        let reach = settings.nearRange + 2_000
+        let here = LatLon(latitude, longitude)
+        terrainWrites.lock()
+        land.raiseSummits(peaks.filter { $0.position.distance(to: here) < reach })
+        terrainWrites.unlock()
+        let ground = HorizonRenderer(terrain: land).observer(latitude: latitude, longitude: longitude, accuracy: accuracy)
+        let eye = ground.height > observer.height ? ground : observer
+        // The trail and matching keep the surface and the eye on it, as the camera sees it.
+        let surface = renderer.render(from: observer, settings: settings)
+        return view(from: eye, terrain: terrain, viewTerrain: land, peaks: peaks, settings: settings, isCoarse: isCoarse,
+                    surface: surface)
     }
 
     /// The view from `lift` meters above this one's eye, for seeing over the ridges in front
@@ -84,12 +117,12 @@ struct TerrainScene: @unchecked Sendable {
         eye.height += lift
         Self.terrainWrites.lock()
         defer { Self.terrainWrites.unlock() }
-        let view = Self.view(from: eye, terrain: terrain, peaks: allPeaks.values.map(\.peak), settings: horizon.settings,
-                             isCoarse: isCoarse)
+        let view = Self.view(from: eye, terrain: terrain, viewTerrain: viewTerrain, peaks: allPeaks.values.map(\.peak),
+                             settings: horizon.settings, isCoarse: isCoarse)
         let slim = view.horizon.withoutDepth()
-        return TerrainScene(observer: eye, terrain: terrain, horizon: slim, matchingHorizon: slim, segments: view.segments,
-                            peaks: view.peaks, scores: view.scores, allPeaks: view.allPeaks, uncertain: view.uncertain,
-                            prominent: view.prominent, isCoarse: isCoarse)
+        return TerrainScene(observer: eye, terrain: terrain, viewTerrain: viewTerrain, standsOnGround: standsOnGround, horizon: slim,
+                            surfaceHorizon: slim, matchingHorizon: slim, segments: view.segments, peaks: view.peaks, scores: view.scores,
+                            allPeaks: view.allPeaks, uncertain: view.uncertain, prominent: view.prominent, isCoarse: isCoarse)
     }
 
     /// The terrain around this view's eye as triangles, out to its horizon's reach, for
@@ -100,16 +133,18 @@ struct TerrainScene: @unchecked Sendable {
         settings.refraction = horizon.settings.refraction
         Self.terrainWrites.lock()
         defer { Self.terrainWrites.unlock() }
-        return PanoramaMesh.build(terrain: terrain, from: observer, settings: settings)
+        return PanoramaMesh.build(terrain: viewTerrain, from: observer, settings: settings)
     }
 
     /// Held while summits are raised in the shared tiles (`build`) and while a view from above
     /// reads them (`risen`, `panorama`): the live view's rebuild may raise new ones as tiles arrive.
     private static let terrainWrites = NSLock()
 
-    private static func view(from observer: GeoPoint, terrain: Terrain, peaks: [Peak], settings: HorizonSettings,
-                             isCoarse: Bool) -> TerrainScene {
-        let renderer = HorizonRenderer(terrain: terrain)
+    /// The view from `observer` over `viewTerrain`; `surface` is the view on the surface model
+    /// alone (`surfaceHorizon`) when that isn't this one.
+    private static func view(from observer: GeoPoint, terrain: Terrain, viewTerrain: Terrain, peaks: [Peak],
+                             settings: HorizonSettings, isCoarse: Bool, surface: HorizonProfile? = nil) -> TerrainScene {
+        let renderer = HorizonRenderer(terrain: viewTerrain)
         let horizon = renderer.render(from: observer, settings: settings)
         var buckets = [[RidgeSegment]](repeating: [], count: 360)
         for s in horizon.ridgeSegments() {
@@ -119,10 +154,10 @@ struct TerrainScene: @unchecked Sendable {
         // ridges in front can't be told apart: they get dots, as if in sight, but no label.
         var found: [VisiblePeak] = []
         var uncertain = Set<Int64>()
-        if terrain.hasCoarse {
+        if viewTerrain.hasCoarse {
             let here = LatLon(observer.latitude, observer.longitude)
             for (p, v) in renderer.sightlines(peaks, from: observer, maxDistance: radius, settings: settings) {
-                let unsure = terrain.isCoarse(between: here, and: p.position) &&
+                let unsure = viewTerrain.isCoarse(between: here, and: p.position) &&
                     CoarseSight.isUncertain(distance: v.distance, clearance: v.clearance)
                 if unsure { uncertain.insert(p.id) }
                 if v.isVisible || unsure {
@@ -148,8 +183,10 @@ struct TerrainScene: @unchecked Sendable {
             }
         }
         for v in visible where !uncertain.contains(v.id) { all[v.id]?.isVisible = true }
-        return TerrainScene(observer: observer, terrain: terrain, horizon: horizon, matchingHorizon: horizon.withNearGround(),
-                            segments: buckets, peaks: visible, scores: scores, allPeaks: all, uncertain: uncertain,
+        return TerrainScene(observer: observer, terrain: terrain, viewTerrain: viewTerrain, standsOnGround: viewTerrain !== terrain,
+                            horizon: horizon, surfaceHorizon: surface ?? horizon,
+                            matchingHorizon: (surface ?? horizon).withNearGround(), segments: buckets,
+                            peaks: visible, scores: scores, allPeaks: all, uncertain: uncertain,
                             prominent: all.values.filter { $0.peak.prominence != nil }.count, isCoarse: isCoarse)
     }
 
@@ -164,12 +201,15 @@ struct TerrainScene: @unchecked Sendable {
         let main = profile.map { $0.points.map(\.position) }.flatMap { $0.count > 1 ? $0 : nil } ?? trail.mainLine
         var others = trail.lines
         if let i = others.firstIndex(of: trail.mainLine) { others.remove(at: i) }
-        var eye = observer
+        // On the surface model from the eye on it, the trail's heights' own (the view's eye may
+        // stand on higher bare ground), as before bare ground near you.
+        var eye = surfaceHorizon.observer
         if let here, here.distance(to: position) < 2_000 {
             let e = renderer.observer(latitude: here.latitude, longitude: here.longitude)
             if e.height.isFinite, terrain.height(latitude: here.latitude, longitude: here.longitude).isFinite { eye = e }
         }
-        let runs = renderer.drape([main] + others, from: eye, horizon: horizon, minDistance: 12, clearDistance: 120, includeHidden: true)
+        let runs = renderer.drape([main] + others, from: eye, horizon: surfaceHorizon, minDistance: 12, clearDistance: 120,
+                                  includeHidden: true)
         return (runs, eye)
     }
 

@@ -283,9 +283,27 @@ public final class Terrain: @unchecked Sendable {
     /// The ground itself, for trails, their climbs and the maps: the bare-ground patches
     /// over this terrain where there are any, blended into it at their edges. Elsewhere,
     /// and with none, the same as this terrain. Skylines and lines of sight stay on this
-    /// terrain: Copernicus heights take in much of the trees on a forested ridge, which is
-    /// the outline the camera sees, while a bare-ground ridge would sit below it.
+    /// terrain beyond the ground near the eye (`withGround(within:)`): Copernicus heights take
+    /// in much of the trees on a forested ridge, which is the outline the camera sees, while
+    /// a bare-ground ridge would sit below it.
     public var ground: Terrain { groundTerrain ?? self }
+
+    /// This terrain with its bare ground (`groundPatches`) within `radius` meters of a point
+    /// (a box, so a little farther diagonally), blended into it beyond over
+    /// `patchBlendMeters`: for a view from there, so the buildings and trees around it in a
+    /// surface model neither hide what's behind them nor make a skyline of their own. The
+    /// bare ground near the point is a copy, so raising summits on it (`raiseSummits`)
+    /// leaves the bare ground under trails as it is; `ground` is still all of it. Nil when
+    /// there's no bare ground there.
+    public func withGround(within radius: Double, latitude: Double, longitude: Double) -> Terrain? {
+        let reach = radius + Self.patchBlendMeters
+        let dlat = reach / 111_320, dlon = reach / (111_320 * max(cos(latitude * .pi / 180), 0.05))
+        let near = groundPatches.compactMap {
+            $0.cropped(south: latitude - dlat, north: latitude + dlat, west: longitude - dlon, east: longitude + dlon)
+        }.filter { $0.heights.contains { $0 != ElevationTile.noData } }
+        guard !near.isEmpty else { return nil }
+        return Terrain(tiles: tiles, detail: detail + near, ground: groundPatches, missingIsSea: missing == 0)
+    }
 
     /// Whether bare ground (`groundPatches`) covers a point, for crediting its source.
     public func hasGround(latitude: Double, longitude: Double) -> Bool {

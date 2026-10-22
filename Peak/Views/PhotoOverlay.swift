@@ -46,7 +46,7 @@ struct PhotoOverlay {
     /// pixels, whatever the context's scale (1 when saving at full size).
     var deviceScale: CGFloat = 1
 
-    static let attribution = "© OpenStreetMap contributors, Copernicus DEM"
+    var attribution: String { "© OpenStreetMap contributors, Copernicus DEM" + (scene.standsOnGround ? ", USGS 3DEP" : "") }
 
     var size: CGSize { CGSize(width: camera.intrinsics.width, height: camera.intrinsics.height) }
     var unit: CGFloat { max(0.5, (size.width * size.height).squareRoot() / 560) }
@@ -116,7 +116,7 @@ struct PhotoOverlay {
     }
 
     private var attributionText: NSAttributedString {
-        NSAttributedString(string: Self.attribution, attributes: [
+        NSAttributedString(string: attribution, attributes: [
             .font: UIFont.systemFont(ofSize: 8.5 * unit, weight: .medium),
             .foregroundColor: UIColor.white.withAlphaComponent(0.62),
             .kern: 0.2 * unit,

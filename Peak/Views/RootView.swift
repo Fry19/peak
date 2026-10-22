@@ -91,7 +91,8 @@ struct RootView: View {
                             }
                         }
                     }
-                    Text("Terrain © Copernicus DEM (DLR, Airbus), NOAA ETOPO · Map data © OpenStreetMap contributors")
+                    Text("Terrain © Copernicus DEM (DLR, Airbus)" + (model.scene?.standsOnGround == true ? ", USGS 3DEP" : "") +
+                         ", NOAA ETOPO · Map data © OpenStreetMap contributors")
                         .font(.system(size: 10))
                         // Over the lit terrain from above, fuller, with a darker halo.
                         .foregroundStyle(.white.opacity(model.rise.level > 0 ? 0.9 : 0.6))
