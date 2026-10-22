@@ -41,6 +41,11 @@ peakbench: desk test harness for skyline matching.
       The terrain seen from above around a point, as the app draws it under a trail:
       hillshade and ridge crests. Prints how long each step takes and what it found.
 
+  peakbench sun --dem DIR --lat L --lon L [--date YYYY-MM-DD] [--tz ZONE]
+                [--peak-lat L --peak-lon L --peak-ele M]
+      When the sun comes into and goes out of sight over the real terrain, against the
+      flat-horizon almanac, and with --peak-*, when it reaches and leaves that summit.
+
   peakbench facts ENTITY.json --id Q [--labels LABELS.json] [--summary SUMMARY.json]
       Read a peak's facts from Wikidata and Wikipedia responses.
 
@@ -713,6 +718,7 @@ do {
     case "scene": try sceneCommand(args)
     case "trails": try trailsCommand(args)
     case "facts": try factsCommand(args)
+    case "sun": try sunCommand(args)
     case "relief": try reliefCommand(args)
     case "case": try caseCommand(args)
     case "help", "-h", "--help": print(usage)
@@ -723,4 +729,63 @@ do {
 } catch {
     log("error: \(error)")
     exit(1)
+}
+
+// MARK: - sun
+
+func sunCommand(_ args: Arguments) throws {
+    let terrain = try loadTerrain(args.string("dem"))
+    let renderer = HorizonRenderer(terrain: terrain)
+    let lat = try args.required("lat"), lon = try args.required("lon")
+    let zone = args.string("tz").flatMap(TimeZone.init(identifier:)) ?? .current
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = zone
+    let date: Date
+    if let text = args.string("date") {
+        let parts = text.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3, let d = calendar.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2], hour: 12))
+        else { throw HarnessError("--date YYYY-MM-DD") }
+        date = d
+    } else {
+        date = Date()
+    }
+    let day = DateInterval.day(containing: date, in: zone)
+    let time = DateFormatter()
+    time.timeZone = zone
+    time.dateFormat = "HH:mm:ss"
+    func line(_ c: SunDay.Crossing) -> String {
+        "\(time.string(from: c.date))  \(c.rising ? "comes out" : "goes behind") at azimuth \(f(c.azimuth, 1))°, " +
+            "terrain \(f(c.elevation))° and \(f(c.distance / 1000, 1)) km away"
+    }
+
+    let observer = renderer.observer(latitude: lat, longitude: lon)
+    let horizon = timed("Horizon from the observer") { renderer.render(from: observer, settings: HorizonSettings()) }
+    let almanac = SunDay.astronomical(latitude: lat, longitude: lon, interval: day)
+    let seen = timed("Sun over the terrain") { SunDay(horizon: horizon, interval: day) }
+    print("\(f(lat, 4)), \(f(lon, 4)) at \(f(observer.height, 0)) m on \(calendar.component(.year, from: date))-" +
+          "\(calendar.component(.month, from: date))-\(calendar.component(.day, from: date)) (\(zone.identifier))")
+    print("Almanac (flat horizon): sunrise \(almanac.firstLight.map { time.string(from: $0.date) } ?? "–"), " +
+          "sunset \(almanac.lastLight.map { time.string(from: $0.date) } ?? "–"), \(f(almanac.duration / 3600, 2)) h")
+    print("Over the terrain (first and last light):")
+    for c in seen.crossings { print("  " + line(c)) }
+    if seen.alwaysInSight { print("  in sight all day") }
+    if seen.neverInSight { print("  never in sight") }
+    print("  \(f(seen.duration / 3600, 2)) h of sun")
+    if let a = almanac.lastLight, let s = seen.lastLight {
+        print("Sun leaves you \(f(a.date.timeIntervalSince(s.date) / 60, 1)) min before the almanac sunset; " +
+              "reaches you \(f(seen.firstLight.map { $0.date.timeIntervalSince(almanac.firstLight!.date) / 60 } ?? 0, 1)) min after sunrise")
+    }
+
+    if let plat = args.double("peak-lat"), let plon = args.double("peak-lon"), let ele = args.double("peak-ele") {
+        let summit = timed("Horizon from the summit") { renderer.summitHorizon(latitude: plat, longitude: plon, height: ele) }
+        let light = timed("Summit light") { renderer.summitLight(horizon: summit, day: day, ceiling: 4_900) }
+        let flat = SunDay.astronomical(latitude: plat, longitude: plon, interval: day)
+        print("Summit \(f(plat, 4)), \(f(plon, 4)) at \(f(ele, 0)) m:")
+        for c in light.day.crossings { print("  " + line(c)) }
+        print("  first light \(light.firstLight.map(time.string) ?? "–"), last light \(light.lastLight.map(time.string) ?? "–")" +
+              " (almanac sunset \(flat.lastLight.map { time.string(from: $0.date) } ?? "–"))")
+        if let r = light.reachAtLastLight { print("  terrain toward last light ends at \(f(r / 1000, 0)) km") }
+        if let r = light.reachAtFirstLight { print("  terrain toward first light ends at \(f(r / 1000, 0)) km") }
+        if light.rangeLimited { print("  range limited: farther terrain could change these") }
+    }
 }

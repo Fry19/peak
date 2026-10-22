@@ -75,6 +75,10 @@ struct PeakDetailView: View {
                 .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             }
 
+            Section {
+                PeakSunRow(model: model, peak: peak)
+            }
+
             if let summary = facts?.summary {
                 Section("About") {
                     Text(summary)

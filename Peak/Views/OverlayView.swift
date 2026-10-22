@@ -50,6 +50,17 @@ final class OverlayCanvas: UIView {
     private let trailGlow = OverlayCanvas.stroke(OverlayCanvas.trailColor.withAlphaComponent(0.3), width: 8)
     private let trailLine = OverlayCanvas.stroke(OverlayCanvas.trailColor, width: 2.5)
     private let hiddenTrailLine = OverlayCanvas.stroke(OverlayCanvas.trailColor.withAlphaComponent(0.6), width: 1.8)
+    /// Today's sun path, without Metal.
+    private let sunLayer: CAShapeLayer = {
+        let l = CAShapeLayer()
+        l.fillColor = UIColor(red: 1, green: 0.86, blue: 0.5, alpha: 0.7).cgColor
+        l.strokeColor = UIColor(red: 1, green: 0.86, blue: 0.5, alpha: 0.8).cgColor
+        l.lineWidth = 1.2
+        return l
+    }()
+    /// The sun path's hour numbers, reused frame to frame.
+    private let hourContainer = CALayer()
+    private var hourLayers: [CATextLayer] = []
     private let dotLayer: CAShapeLayer = {
         let l = CAShapeLayer()
         l.fillColor = UIColor.white.withAlphaComponent(0.55).cgColor
@@ -143,8 +154,9 @@ final class OverlayCanvas: UIView {
         if let renderer {
             layer.addSublayer(renderer.layer)
         } else {
-            for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, trailGlow, trailLine, dotLayer] { layer.addSublayer(l) }
+            for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, trailGlow, trailLine, sunLayer, dotLayer] { layer.addSublayer(l) }
         }
+        layer.addSublayer(hourContainer)
         layer.addSublayer(labelContainer)
         layer.addSublayer(arrowLayer)
         layer.addSublayer(arrowHead)
@@ -247,6 +259,7 @@ final class OverlayCanvas: UIView {
         // so they're 9 to 18 points apart on screen.
         let dashScale = camera.intrinsics.fx / model.zoom * pow(2, floor(log2(max(1, model.zoom)))) * .pi / 180
         layoutTrail(model.arTrail?.runs, projector, xRay: settings.trailXRay, pointsPerDegree: dashScale)
+        layoutSunPath(settings.showSunPath ? model.sun.path(scene: scene) : nil, projector)
         let placed = layoutLabels(scene, projector, heading: camera.attitude.heading, reach: reach, model: model, at: now)
         renderer?.draw(lines: lineSegments, overlay: overlaySegments, halo: contrast ? 0.5 : 0.28,
                        size: bounds.size, scale: displayScale)
@@ -256,7 +269,8 @@ final class OverlayCanvas: UIView {
     }
 
     private func clear() {
-        for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, trailGlow, trailLine, dotLayer] { l.path = nil }
+        for l in bandGlow + bandLine + [skyGlow, skyLine, hiddenTrailLine, trailGlow, trailLine, sunLayer, dotLayer] { l.path = nil }
+        layoutSunPath(nil, nil)
         renderer?.draw(lines: [], size: bounds.size, scale: displayScale)
         for id in Array(slots.keys) { fade(id, in: false) }
         labeled = []
@@ -468,6 +482,76 @@ final class OverlayCanvas: UIView {
         trailGlow.path = solid.path
         trailLine.path = solid.path
         hiddenTrailLine.path = xRay ? dashes : nil
+    }
+
+    private static let sunDotStyle = Style(color: SIMD4(1, 0.86, 0.5, 0.7), width: 2.2, glow: 0, glowAlpha: 0)
+    private static let sunTickStyle = Style(color: SIMD4(1, 0.86, 0.5, 0.8), width: 1.2, glow: 0, glowAlpha: 0)
+
+    /// Today's sun path, if turned on: a dotted line where the sun is above the terrain, a
+    /// dot every two minutes, with a tick and the hour at each whole hour. Nothing shows
+    /// unless the path is in the frame.
+    private func layoutSunPath(_ points: [SunService.PathPoint]?, _ projector: Camera.Projector?) {
+        var used = 0
+        defer {
+            for (i, l) in hourLayers.enumerated() { l.isHidden = i >= used }
+        }
+        guard let points, let projector else {
+            sunLayer.path = nil
+            return
+        }
+        let gpu = renderer != nil
+        let path = CGMutablePath()
+        let area = bounds.insetBy(dx: -10, dy: -10)
+        let projected: [CGPoint?] = points.map { p in
+            p.inSight ? point(projector, p.azimuth, p.elevation).flatMap { area.contains($0) ? $0 : nil } : nil
+        }
+        for (i, p) in points.enumerated() {
+            guard let q = projected[i] else { continue }
+            if gpu {
+                overlaySegments.append(Self.sunDotStyle.segment(q, q))
+            } else {
+                path.addEllipse(in: CGRect(x: q.x - 1.1, y: q.y - 1.1, width: 2.2, height: 2.2))
+            }
+            guard let hour = p.hour else { continue }
+            // Across the path, from its neighbors' direction.
+            let before = i > 0 ? point(projector, points[i - 1].azimuth, points[i - 1].elevation) : nil
+            let after = i + 1 < points.count ? point(projector, points[i + 1].azimuth, points[i + 1].elevation) : nil
+            let a = before ?? q, b = after ?? q
+            guard hypot(b.x - a.x, b.y - a.y) > 0.1 else { continue }
+            let len = hypot(b.x - a.x, b.y - a.y)
+            var normal = CGPoint(x: -(b.y - a.y) / len, y: (b.x - a.x) / len)
+            // The hour goes on the side away from the ground.
+            if normal.x * worldUp.x + normal.y * worldUp.y < 0 { normal = CGPoint(x: -normal.x, y: -normal.y) }
+            let t0 = CGPoint(x: q.x - normal.x * 4, y: q.y - normal.y * 4), t1 = CGPoint(x: q.x + normal.x * 4, y: q.y + normal.y * 4)
+            if gpu {
+                overlaySegments.append(Self.sunTickStyle.segment(t0, t1))
+            } else {
+                path.move(to: t0)
+                path.addLine(to: t1)
+            }
+            if used == hourLayers.count {
+                let l = CATextLayer()
+                l.fontSize = 10
+                l.font = UIFont.systemFont(ofSize: 10, weight: .medium)
+                l.foregroundColor = UIColor(red: 1, green: 0.9, blue: 0.65, alpha: 0.85).cgColor
+                l.alignmentMode = .center
+                l.contentsScale = displayScale
+                l.shadowColor = UIColor.black.cgColor
+                l.shadowOpacity = 0.6
+                l.shadowRadius = 2
+                l.shadowOffset = .zero
+                l.bounds = CGRect(x: 0, y: 0, width: 24, height: 13)
+                hourContainer.addSublayer(l)
+                hourLayers.append(l)
+            }
+            let l = hourLayers[used]
+            used += 1
+            let text = String(hour)
+            if (l.string as? String) != text { l.string = text }
+            l.position = CGPoint(x: q.x + normal.x * 13, y: q.y + normal.y * 13)
+            l.setAffineTransform(CGAffineTransform(rotationAngle: upAngle))
+        }
+        sunLayer.path = gpu ? nil : path
     }
 
     private static func attributes(size: CGFloat, weight: UIFont.Weight, color: UIColor) -> [NSAttributedString.Key: Any] {

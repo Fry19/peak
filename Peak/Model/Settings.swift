@@ -32,6 +32,10 @@ struct AppSettings: Codable, Equatable {
     /// Fetch the sharpest terrain on mobile data too, not just on Wi-Fi.
     var detailOnMobile = true
     var showDiagnostics = false
+    /// Today's sun path, dotted across the sky in the camera view.
+    var showSunPath = false
+    /// The peak to remind about 20 minutes before alpenglow (last light on its summit).
+    var alpenglow: Peak?
 
     private static let key = "settings"
 
@@ -59,6 +63,8 @@ extension AppSettings {
         trailXRay = try c.decodeIfPresent(Bool.self, forKey: .trailXRay) ?? trailXRay
         detailOnMobile = try c.decodeIfPresent(Bool.self, forKey: .detailOnMobile) ?? detailOnMobile
         showDiagnostics = try c.decodeIfPresent(Bool.self, forKey: .showDiagnostics) ?? showDiagnostics
+        showSunPath = try c.decodeIfPresent(Bool.self, forKey: .showSunPath) ?? showSunPath
+        alpenglow = try c.decodeIfPresent(Peak.self, forKey: .alpenglow)
     }
 }
 

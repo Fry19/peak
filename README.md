@@ -23,6 +23,8 @@ The overlay costs the main thread about a millisecond a frame: the lines are dra
 
 **Tap a label or a dot** for the peak's card: elevation, prominence, distance, bearing, how far above you it is, its range, first ascent and a Wikipedia summary and picture, and the **hikes nearby**: OpenStreetMap hiking routes and named paths within 8 km of the summit, plus unnamed paths up to it, with length, climb, difficulty on the SAC scale (T1–T6) and how far the start is from you. Those that reach the summit come first. A hike's card has a satellite map, an elevation profile and directions to the start. **Show on the mountain** lays the trail on the real slope in the camera view, leaving out the parts hidden behind nearer terrain.
 
+**The sun, over the real terrain.** A peak's card says when the sun first reaches its summit and when it leaves it today (the last light that makes alpenglow, worked out from the summit's own horizon), and when the sun goes behind the ridge for you, named after the peak it sets behind when there is one. An optional reminder comes 20 minutes before alpenglow on a peak you pick. A hike's card estimates the walking time up and back (DIN 33466), says when the sun leaves the top and the start, and suggests a turnaround time when the hike won't fit in the light left. Times are in the place's own time zone. In Settings, **Today's sun path** dots the sun's path across the sky in the camera view, with hour ticks.
+
 The **list button** (bottom left) lists every peak around you, those in view first, with search; picking one highlights it in the view, with an arrow at the edge when it's out of frame. **Settings** (bottom right): meters or feet, how many labels, ridges, the haptic tick, terrain on mobile data, **offline areas**, and storage.
 
 ### Staying lined up
@@ -116,6 +118,8 @@ swift build -c release
 .build/release/peakbench synth --dem ../DEM --lat 45.9837 --lon 7.7856 --heading 262 --compass-error 8 --out matterhorn
 .build/release/peakbench align matterhorn.json --dem ../DEM --debug aligned.png
 .build/release/peakbench bench --dem ../DEM --lat 45.9837 --lon 7.7856 --runs 30
+.build/release/peakbench sun --dem ../DEM --lat 45.9837 --lon 7.7856 --date 2026-10-21 --tz Europe/Zurich \
+    --peak-lat 45.9763 --peak-lon 7.6586 --peak-ele 4478
 ```
 
 `fetch_dem.py` downloads Copernicus GLO-30 tiles from the public AWS bucket (about 40 MB per 1° tile; 8 tiles for 100 km in the Alps) and converts them to `.pkdem` files. Use a release build of `peakbench`: debug builds are 10–35× slower. On Linux, images are read and written as `.ppm`.
@@ -166,6 +170,9 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
     Peaks.swift            Peaks from OpenStreetMap's Overpass API
     Trails.swift           Hiking routes and paths: parsing, joining ways, elevation profiles
     PeakFacts.swift        Facts from Wikidata and Wikipedia
+    Sun.swift              Sun position (NOAA/Meeus) and refraction matched to the horizon's
+    SunTimes.swift         When the sun crosses the terrain: real sunrise and sunset, summit light,
+                           DIN 33466 walking times
     UprightFrame.swift     Turns sideways camera frames so the sky is up
     SyntheticPhoto.swift   Fake photos with a known camera, for testing
     Image.swift            RGB images, PPM files, drawing

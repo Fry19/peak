@@ -171,6 +171,7 @@ final class AppModel {
     let motion = MotionTracker()
     @ObservationIgnored weak var screen: CameraScreenView?
     let store = DataStore()
+    let sun = SunService()
     private let corrector = SkylineCorrector()
     private let mailbox = FrameMailbox()
     private let locationManager = CLLocationManager()
@@ -990,6 +991,7 @@ final class AppModel {
             guard let now = self.center, now.distance(from: center) < Self.reloadDistance else { continue }
             scene = built
             sceneAccuracy = center.horizontalAccuracy
+            refreshAlpenglow()
             updateCorrector()
             if arTrail != nil { drapeTrail() }
         } while rebuildAgain

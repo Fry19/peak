@@ -69,6 +69,8 @@ struct TrailDetailView: View {
                 }
             }
 
+            HikeDaylightSection(model: model, hike: hike)
+
             if let d = trail.difficulty {
                 Section("Difficulty") {
                     HStack(alignment: .top, spacing: 10) {
