@@ -54,8 +54,10 @@ struct TrailWalkView: View {
     /// rebuild of the same ground.
     @State private var nearImagery: MapImagery?
     @State private var farImagery: MapImagery?
-    /// The sharper imagery around the walker, kept likewise.
+    /// The sharper imagery around the walker, and the photos over the hills around, kept
+    /// likewise.
     @State private var detailImagery: MapImagery?
+    @State private var midImagery: MapImagery?
     @State private var draped = false
 
     var body: some View {
@@ -155,7 +157,7 @@ struct TrailWalkView: View {
                     // A slow download may finish after scrubbing back to imagery we already
                     // have. Keep the picture nearest the part of the walk now in view.
                     let wanted = world.detailCenter(at: player.shownDistance, walking: player.playing)
-                    if let shown = world.detail {
+                    if let shown = world.detail, shown.rect.width == loaded.rect.width {
                         let previous = SIMD2<Double>(shown.rect.midX, shown.rect.midY)
                         if simd_distance(previous, wanted) < simd_distance(center, wanted) { continue }
                     }
@@ -188,9 +190,21 @@ struct TrailWalkView: View {
         if !world.ringDraped {
             if farImagery.map({ !world.fits($0, ring: true) }) ?? true {
                 guard let loaded = await world.loadFarImagery(), !Task.isCancelled, self.world === world else { return }
-                farImagery = loaded
+                // Coarse enough to be Apple's greener mosaic: in the colors of the photos nearer.
+                let near = nearImagery
+                let matched = await Task.detached(priority: .userInitiated) { near.map(loaded.matched) ?? loaded }.value
+                guard !Task.isCancelled, self.world === world else { return }
+                farImagery = matched
             }
             await world.drape(near: nil, far: farImagery)
+        }
+        // Then the photos over the hills around, out to where the haze thickens.
+        if world.ringDraped, !world.midShown, let rect = world.midRect {
+            if midImagery.map({ $0.rect != rect || $0.center != world.center }) ?? true {
+                guard let loaded = await world.loadMidImagery(rect), !Task.isCancelled, self.world === world else { return }
+                midImagery = loaded
+            }
+            if let midImagery { world.show(mid: midImagery) }
         }
     }
 
@@ -607,15 +621,15 @@ final class WalkWorld: @unchecked Sendable {
     // MARK: Sharper imagery near the walker
 
     /// One picture for the whole terrain is 3–9 m a pixel, a smear on the ground in front of
-    /// the camera. A sharper one, about 1.5 m a pixel, covers this square around the part of
-    /// the walk in view, and follows it.
-    static let detailSide = 3_000.0
+    /// the camera. A sharper one covers a square around the part of the walk in view, and
+    /// follows it: four times as wide as the camera follows from, 1.6 to 3 km, so about 0.8 m
+    /// a pixel on short hikes, where the camera comes closest, and 1.5 m on long ones.
+    var detailSide: Double { min(3_000, max(1_600, 4 * range)) }
     static let detailPixels = 2_048
-    /// Ahead of the walker while it walks, so the window covers the ground ahead and still
-    /// the ground below the camera, behind it.
-    static let detailLead = 500.0
-    /// How far the wanted window moves before it's loaded again.
-    static let detailStep = 500.0
+    /// Ahead of the walker while it walks, a sixth of the square, so it covers the ground ahead
+    /// and still the ground below the camera, behind it; and how far the wanted square moves
+    /// before it's loaded again.
+    var detailLead: Double { detailSide / 6 }
 
     /// The sharper imagery shown, if any (changed on the main thread only).
     private(set) var detail: MapImagery?
@@ -664,19 +678,19 @@ final class WalkWorld: @unchecked Sendable {
     /// Where the sharper imagery should be centered, map meters: ahead of the walker while it
     /// walks, on it while paused to look around.
     func detailCenter(at distance: Double, walking: Bool) -> SIMD2<Double> {
-        let p = walk.point(at: min(walk.length, distance + (walking ? Self.detailLead : 0)))
+        let p = walk.point(at: min(walk.length, distance + (walking ? detailLead : 0)))
         return SIMD2(p.x, p.y)
     }
 
     /// Whether the imagery shown is too far from `center`, or there's none yet.
     func needsDetail(around center: SIMD2<Double>) -> Bool {
-        guard let detail, detail.center == relief.projection.center else { return true }
-        return simd_distance(SIMD2(detail.rect.midX, detail.rect.midY), center) > Self.detailStep
+        guard let detail, detail.center == relief.projection.center, detail.rect.width == detailSide else { return true }
+        return simd_distance(SIMD2(detail.rect.midX, detail.rect.midY), center) > detailLead
     }
 
     @MainActor func loadDetail(around center: SIMD2<Double>) async throws -> MapImagery {
-        let half = Self.detailSide / 2
-        let rect = CGRect(x: center.x - half, y: center.y - half, width: Self.detailSide, height: Self.detailSide)
+        let side = detailSide
+        let rect = CGRect(x: center.x - side / 2, y: center.y - side / 2, width: side, height: side)
         return try await MapImagery.load(projection: relief.projection, rect: rect, width: Self.detailPixels)
     }
 
@@ -685,6 +699,42 @@ final class WalkWorld: @unchecked Sendable {
         guard draped, imagery.center == relief.projection.center, let material = ground.geometry?.firstMaterial else { return }
         Self.setDetail(imagery, on: material)
         detail = imagery
+    }
+
+    // MARK: The hills around
+
+    /// Where the scene is centered.
+    var center: LatLon { far.projection.center }
+
+    /// How fine the imagery over the hills around is: as coarse as Apple's aerial photos go,
+    /// drawn a pixel a point, since the ring's own picture, coarser, is its greener mosaic.
+    var midMetersPerPixel: Double { MapImagery.aerialMetersPerPoint(at: center.latitude) }
+
+    /// Where the photos over the hills around go: past the sharp terrain out to where the haze
+    /// thickens, 8 km beyond each of its edges, at most 3,072 pixels across. Nil where they
+    /// wouldn't reach well past the sharp terrain once blended in over their own edges (8%).
+    var midRect: CGRect? {
+        let sharp = Self.imageryRect(relief).width
+        let side = min(sharp + 16_000, 3_072 * midMetersPerPixel)
+        guard side * (0.5 - 0.08) > sharp / 2 + 1_000 else { return nil }
+        return CGRect(x: -side / 2, y: -side / 2, width: side, height: side)
+    }
+
+    @MainActor func loadMidImagery(_ rect: CGRect) async -> MapImagery? {
+        try? await MapImagery.load(projection: far.projection, rect: rect,
+                                   width: min(3_072, Int((rect.width / midMetersPerPixel).rounded(.up))), scale: 1)
+    }
+
+    /// Whether the photos over the hills around are laid (changed on the main thread only).
+    private(set) var midShown = false
+
+    /// Lays the photos over the ring's coarse imagery, nearer the middle, blending into it over
+    /// their edges.
+    @MainActor func show(mid imagery: MapImagery) {
+        guard ringDraped, !midShown, imagery.center == center, imagery.rect == midRect,
+              let material = ring.geometry?.firstMaterial else { return }
+        Self.setDetail(imagery, on: material)
+        midShown = true
     }
 
     private static func textureCoordinates(_ vertices: SCNGeometrySource, rect: CGRect) -> SCNGeometrySource {

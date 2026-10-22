@@ -31,6 +31,8 @@ struct TrailFromAboveView: View {
     /// zooming out shows you and the trail together.
     @State private var wide: OverheadMap.Detail?
     @State private var wideImagery: MapImagery?
+    /// The wide imagery as it loaded, before it's put in the map imagery's colors.
+    @State private var wideLoaded: MapImagery?
     @State private var imageryState = ImageryState.idle
 
     enum ImageryState: Equatable {
@@ -124,6 +126,10 @@ struct TrailFromAboveView: View {
             }
             .task(id: ImageryKey(on: satellite, center: map?.projection.center, rect: wide?.rect, online: model.online)) {
                 await loadWideImagery(screen: full, content: content)
+            }
+            // Again when the map's own imagery arrives after it.
+            .task(id: [wideLoaded.map { ObjectIdentifier($0.image) }, imagery.map { ObjectIdentifier($0.image) }]) {
+                await matchWideImagery()
             }
             .onChange(of: satellite) { _, on in
                 if !on { imageryState = .idle }
@@ -393,6 +399,7 @@ struct TrailFromAboveView: View {
         if imagery?.center != map.projection.center { imagery = nil }
         if closeUp?.center != map.projection.center { closeUp = nil }
         if wideImagery?.center != map.projection.center { wideImagery = nil }
+        if wideLoaded?.center != map.projection.center { wideLoaded = nil }
         imageryState = .loading
         let k = Viewport(size: screen, map: map, content: content).pointsPerMeter(MapCamera())
         let scale = min(2 * k, 3_000 / max(rect.width, rect.height))
@@ -451,13 +458,30 @@ struct TrailFromAboveView: View {
     /// Imagery under the wide terrain, about two pixels a point zoomed all the way out.
     private func loadWideImagery(screen: CGSize, content: EdgeInsets) async {
         guard model.settings.mapStyle == .satellite, let map, let wide, wide.mapID == map.id else { return }
-        if let wideImagery, wideImagery.center == map.projection.center, wideImagery.rect == wide.rect { return }
+        if let wideLoaded, wideLoaded.center == map.projection.center, wideLoaded.rect == wide.rect { return }
         let viewport = Viewport(size: screen, map: map, content: content, reach: map.reach(here(on: map)))
         let k = viewport.pointsPerMeter(MapCamera(zoom: viewport.zoomRange.lowerBound))
         let width = min(2_048, 2 * k * wide.rect.width, 2_048 * wide.rect.width / wide.rect.height)
         guard let loaded = try? await MapImagery.load(projection: map.projection, rect: wide.rect, width: max(1, Int(width))),
               !Task.isCancelled, loaded.center == self.map?.projection.center else { return }
-        withAnimation(.easeOut(duration: 0.3)) { wideImagery = loaded }
+        wideLoaded = loaded
+    }
+
+    /// The wide imagery is coarse enough to be Apple's greener mosaic, which beside the map's
+    /// aerial photos reads as ground half loaded: it's shown in their colors where they overlap,
+    /// as it loaded until they have.
+    private func matchWideImagery() async {
+        guard let loaded = wideLoaded else { return }
+        var shown = loaded
+        if let reference = imagery, reference.center == loaded.center {
+            shown = await Task.detached(priority: .utility) { loaded.matched(to: reference) }.value
+            guard !Task.isCancelled, wideLoaded?.image === loaded.image else { return }
+        }
+        if wideImagery == nil {
+            withAnimation(.easeOut(duration: 0.3)) { wideImagery = shown }
+        } else {
+            wideImagery = shown
+        }
     }
 }
 
