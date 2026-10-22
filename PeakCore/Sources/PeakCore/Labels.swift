@@ -109,8 +109,12 @@ public struct LabelLayout: Sendable {
         public var enterClear = 8.0
         public var keepClear = 0.0
         /// The rank a shown label is given on top of its score: a new label bumps it only by
-        /// ranking that much higher.
-        public var stickiness = 1.0
+        /// ranking that much higher. Scores only change when the view is rebuilt, so this
+        /// needs only to outlast small changes then; the gaps and margins above keep labels
+        /// from blinking as the phone moves. A full point (one step that matters, see
+        /// `PeakRanking`) let Blanket Mountain hold its label against Kuwohi behind it,
+        /// 0.83 higher, as long as both stayed in view.
+        public var stickiness = 0.4
         /// A dot this close to a labeled peak's dot is left out.
         public var dotClearance = 10.0
         /// The selected peak's label keeps this far inside the edges.

@@ -17,7 +17,7 @@ Peak opens straight into the camera. The lines and labels stay on the mountains 
 The first time you use it somewhere, it downloads the terrain and the named peaks for 80 km around you and keeps them, so the same area works offline afterwards. Then it draws:
 
 - the skyline and the ridges in front of it as thin glowing lines, nearer ones brighter and farther ones fading;
-- labels (name and height) for the highest peaks you can actually see (6, 10 or 18, in Settings), and a small dot on every other peak in sight. Peaks hidden behind a nearer ridge aren't shown. Peaks OpenStreetMap has no elevation for show the terrain's, marked "≈".
+- labels (name and height) for the highest peaks you can actually see (6, 10 or 18, in Settings), and a small dot on every other peak in sight. Peaks hidden behind a nearer ridge aren't shown, but ground within a kilometer that rises less than 10 m above your eye doesn't hide anything: from a valley or a town the mountains may stand only a degree or two up, and a gentle rise a few meters high a few hundred meters off would hide the whole range, though from a floor up, a deck or a step uphill it's in sight (skyline matching, and when the sun sets for you, still go by that ground as it stands). A label stays until a peak ranked clearly higher needs its place. Peaks OpenStreetMap has no elevation for show the terrain's, marked "≈".
 
 **Pinch** to zoom in on the picture and the lines together, up to 6× (zoomed in past 2×, the camera switches to 4K where the phone can, so the picture stays sharp); more labels fit as the peaks spread apart. Tap the zoom chip at the top to zoom back out.
 

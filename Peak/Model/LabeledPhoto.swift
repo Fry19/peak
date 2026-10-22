@@ -160,7 +160,7 @@ final class LabeledPhoto: Identifiable {
     /// there; keeps the lines where they were if it doesn't find a clear match.
     @MainActor private func match(near: Attitude? = nil) async {
         guard let image, let small, let photoCamera, let scene else { return }
-        let horizon = scene.horizon
+        let horizon = scene.matchingHorizon
         let m = await Task.detached(priority: .userInitiated) { photoCamera.match(small, horizon: horizon, near: near) }.value
         let a = m.alignment
         if a.accepted {

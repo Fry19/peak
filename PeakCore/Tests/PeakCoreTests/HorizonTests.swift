@@ -191,4 +191,197 @@ final class HorizonTests: XCTestCase {
             XCTAssertEqual(env.last!.elevation, profile.elevations[i])
         }
     }
+
+    /// Flat ground at 300 m on a 1 arc-second grid, seen from 45.5°N 8.25°E: north, a rise
+    /// 8 m high 370 m away (6.4 m above the eye) in front of a mountain 25 km off; east, a
+    /// rise 25 m high in front of another; south-west, a mountain in the open; west, a rise
+    /// 8 m high 120 m away, then a strip of missing data from 200 m. Each mountain has a summit just off the grid, 30 m above its cone.
+    private func nearRiseScene() -> (terrain: Terrain, observer: GeoPoint, peaks: [Peak]) {
+        let observer = GeoPoint(latitude: 45.5, longitude: 8.25, height: 301.6)
+        let step = 1.0 / 3600, north = 45.8, west = 8.0, rows = 1_801, cols = 2_161
+        struct Cone { var center: (latitude: Double, longitude: Double); var height: Double; var radius: Double }
+        func at(_ azimuth: Double, _ distance: Double) -> (latitude: Double, longitude: Double) {
+            destination(from: observer, azimuth: azimuth, distance: distance)
+        }
+        let cones = [Cone(center: at(0, 370), height: 8, radius: 250), Cone(center: at(90, 400), height: 25, radius: 250),
+                     Cone(center: at(0, 25_000), height: 400, radius: 4_000), Cone(center: at(90, 25_000), height: 400, radius: 4_000),
+                     Cone(center: at(225, 20_000), height: 400, radius: 4_000), Cone(center: at(270, 120), height: 8, radius: 60)]
+        let gap = at(270, 200)
+        var heights = [Int16](repeating: 0, count: rows * cols)
+        for r in 0..<rows {
+            let lat = north - Double(r) * step
+            for c in 0..<cols {
+                let lon = west + Double(c) * step
+                var h = 300.0
+                for cone in cones {
+                    let d = hypot((lat - cone.center.latitude) * 111_320, (lon - cone.center.longitude) * 111_320 * cos(lat * .pi / 180))
+                    h = max(h, 300 + cone.height * max(0, 1 - d / cone.radius))
+                }
+                let missing = lon < gap.longitude && abs(lat - observer.latitude) < 0.0015
+                heights[r * cols + c] = missing ? ElevationTile.noData : Int16(h.rounded())
+            }
+        }
+        let tile = ElevationTile(south: 45, west: 8, rows: rows, cols: cols, originLatitude: north, originLongitude: west,
+                                 stepLatitude: step, stepLongitude: step, heights: heights)
+        let peaks = cones[2..<5].enumerated().map { i, cone in
+            Peak(id: Int64(i + 1), name: "Summit \(i + 1)", latitude: cone.center.latitude + 0.37 * step,
+                 longitude: cone.center.longitude - 0.41 * step, elevation: 730)
+        }
+        return (Terrain(tiles: [tile], missingIsSea: false), observer, peaks)
+    }
+
+    /// Ground near the eye only a few meters above it hides nothing with an allowance: the
+    /// mountain behind the low rise comes into sight, as its skyline and as a peak, while the
+    /// one behind the high rise stays hidden. A smaller allowance or range keeps the low rise,
+    /// and without one nothing changes.
+    func testLowRiseNearTheEyeHidesNothingWithAnAllowance() {
+        let (terrain, observer, peaks) = nearRiseScene()
+        XCTAssertEqual(terrain.raiseSummits(peaks), 3)
+        let renderer = HorizonRenderer(terrain: terrain)
+        var strict = HorizonSettings()
+        strict.maxDistance = 30_000
+        strict.azimuthStep = 1
+        var relaxed = strict
+        relaxed.nearAllowance = 10
+        func inSight(_ peak: Peak, _ settings: HorizonSettings) -> Bool {
+            renderer.visibility(of: peak.point, from: observer, settings: settings).isVisible
+        }
+        XCTAssertEqual(peaks.map { inSight($0, strict) }, [false, false, true])
+        XCTAssertEqual(peaks.map { inSight($0, relaxed) }, [true, false, true])
+        var small = relaxed
+        small.nearAllowance = 5
+        XCTAssertFalse(inSight(peaks[0], small), "the rise is 6.4 m above the eye")
+        var short = relaxed
+        short.nearRange = 300
+        XCTAssertFalse(inSight(peaks[0], short), "the rise is 370 m away")
+
+        let ground = renderer.render(from: observer, settings: strict)
+        let seen = renderer.render(from: observer, settings: relaxed)
+        XCTAssertEqual(Double(ground.distances[0]), 370, accuracy: 15)
+        XCTAssertEqual(Double(seen.distances[0]), 25_000, accuracy: 100)
+        XCTAssertEqual(Double(seen.distances[90]), Double(ground.distances[90]), accuracy: 1, "a 23 m rise still hides")
+        XCTAssertEqual(seen.distances[225], ground.distances[225])
+        // The mountain's crest is drawn, and the low rise isn't in the depth map.
+        XCTAssertTrue(seen.ridgeSegments().contains { $0.isSkyline && $0.azimuth0 == 0 && $0.distance > 20_000 })
+        XCTAssertGreaterThan(Double(seen.envelope(ofRay: 0).first!.distance), 1_000)
+        XCTAssertNil(ground.withNearGround().nearGround, "nothing let through without an allowance")
+    }
+
+    /// What skyline matching gets, the relaxed view with the near ground put back, is the
+    /// skyline a march without the allowance finds, ray for ray, summit tips and missing data
+    /// included.
+    func testSkylineWithNearGroundIsTheStrictOne() {
+        let (terrain, observer, peaks) = nearRiseScene()
+        terrain.raiseSummits(peaks)
+        let renderer = HorizonRenderer(terrain: terrain)
+        var strict = HorizonSettings()
+        strict.maxDistance = 30_000
+        strict.azimuthStep = 0.25
+        var relaxed = strict
+        relaxed.nearAllowance = 10
+        let ground = renderer.render(from: observer, settings: strict)
+        let seen = renderer.render(from: observer, settings: relaxed)
+        let matched = seen.withNearGround()
+        XCTAssertNotEqual(seen.elevations, ground.elevations)
+        XCTAssertEqual(matched.elevations, ground.elevations)
+        XCTAssertEqual(matched.distances, ground.distances)
+        XCTAssertEqual(matched.settings.nearAllowance, 0)
+        XCTAssertEqual(matched.coarseRays, ground.coarseRays)
+        // The tips in sight are raised, off the grid between rays.
+        for peak in [peaks[0], peaks[2]] {
+            let look = LocalFrame(origin: observer).look(at: peak.point, refraction: strict.refraction)
+            XCTAssertEqual(seen.elevation(atAzimuth: look.azimuth), look.elevation, accuracy: 0.02)
+        }
+        // West, the data ends 200 m out: nothing beyond is seen, and the ground before it
+        // stays the skyline.
+        let west = Int(270 / strict.azimuthStep)
+        XCTAssertEqual(seen.elevations[west], ground.elevations[west])
+        XCTAssertEqual(seen.envelope(ofRay: west).count, 1)
+        XCTAssertLessThan(Double(seen.distances[west]), 250)
+        // A summit out there, lower than the rise before the gap, is hidden as that skyline says.
+        let out = destination(from: observer, azimuth: 270, distance: 5_000)
+        let beyond = GeoPoint(latitude: out.latitude, longitude: out.longitude, height: 450)
+        XCTAssertLessThan(LocalFrame(origin: observer).look(at: beyond, refraction: strict.refraction).elevation,
+                          Double(seen.elevations[west]))
+        XCTAssertFalse(renderer.visibility(of: beyond, from: observer, settings: relaxed).isVisible)
+        XCTAssertFalse(renderer.visibility(of: beyond, from: observer, settings: strict).isVisible)
+    }
+
+    /// Flat ground at 300 m on a 1 arc-second grid seen from 45.5°N 8.25°E, with a bump of
+    /// `bump` meters (a cone of `bumpRadius`, centered on a grid node) about `bumpDistance`
+    /// away on `bumpBearing`, and a mountain `mountain` meters high 20 km away on `tipBearing`
+    /// (the bump's own bearing when nil) whose summit OpenStreetMap puts 33 m above its cone.
+    private func tipBehindBump(bumpBearing: Double, bumpDistance: Double, bump height: Double, bumpRadius: Double = 25,
+                               tipBearing: Double? = nil, mountain: Double = 170) -> (terrain: Terrain, peak: Peak, observer: GeoPoint) {
+        let observer = GeoPoint(latitude: 45.5, longitude: 8.25, height: 301.6)
+        let step = 1.0 / 3600, north = 45.8, west = 8.0, rows = 1_261, cols = 1_261
+        let rough = destination(from: observer, azimuth: bumpBearing, distance: bumpDistance)
+        let bump = (latitude: north - ((north - rough.latitude) / step).rounded() * step,
+                    longitude: west + ((rough.longitude - west) / step).rounded() * step)
+        let bearing = tipBearing ?? LocalFrame(origin: observer).look(at: GeoPoint(latitude: bump.latitude, longitude: bump.longitude,
+                                                                                   height: 300), refraction: 0).azimuth
+        let summit = destination(from: observer, azimuth: bearing, distance: 20_000)
+        var heights = [Int16](repeating: 0, count: rows * cols)
+        for r in 0..<rows {
+            let lat = north - Double(r) * step
+            for c in 0..<cols {
+                let lon = west + Double(c) * step
+                func cone(_ center: (latitude: Double, longitude: Double), _ height: Double, _ radius: Double) -> Double {
+                    let d = hypot((lat - center.latitude) * 111_320, (lon - center.longitude) * 111_320 * cos(lat * .pi / 180))
+                    return height * max(0, 1 - d / radius)
+                }
+                heights[r * cols + c] = Int16((300 + max(cone(bump, height, bumpRadius), cone(summit, mountain, 3_000))).rounded())
+            }
+        }
+        let tile = ElevationTile(south: 45, west: 8, rows: rows, cols: cols, originLatitude: north, originLongitude: west,
+                                 stepLatitude: step, stepLongitude: step, heights: heights)
+        let peak = Peak(id: 1, name: "Tip", latitude: summit.latitude, longitude: summit.longitude, elevation: 300 + mountain + 33)
+        return (Terrain(tiles: [tile], missingIsSea: false), peak, observer)
+    }
+
+    /// A summit tip between two rays whose own bearing passes a low bump 600 m away that the
+    /// nearest ray misses: the bump hides the tip, so without the allowance the tip isn't
+    /// raised, and what matching gets must not keep it either.
+    func testTipHiddenByGroundLetThroughOnlyOnItsOwnBearing() {
+        let (terrain, peak, observer) = tipBehindBump(bumpBearing: 4, bumpDistance: 600, bump: 8)
+        XCTAssertEqual(terrain.raiseSummits([peak]), 1)
+        let renderer = HorizonRenderer(terrain: terrain)
+        var strict = HorizonSettings()
+        strict.maxDistance = 25_000
+        strict.azimuthStep = 10
+        var relaxed = strict
+        relaxed.nearAllowance = 10
+        let tip = LocalFrame(origin: observer).look(at: peak.point, refraction: strict.refraction).elevation
+        let ground = renderer.render(from: observer, settings: strict)
+        let seen = renderer.render(from: observer, settings: relaxed)
+        XCTAssertEqual(Double(seen.elevations[0]), tip, accuracy: 0.02, "raised past the bump")
+        XCTAssertLessThan(Double(ground.elevations[0]), tip - 0.2, "hidden by the bump without the allowance")
+        XCTAssertEqual(seen.withNearGround().elevations, ground.elevations)
+        XCTAssertEqual(seen.withNearGround().distances, ground.distances)
+        XCTAssertTrue(renderer.visibility(of: peak.point, from: observer, settings: relaxed).isVisible)
+        XCTAssertFalse(renderer.visibility(of: peak.point, from: observer, settings: strict).isVisible)
+    }
+
+    /// The other way round: the bump stands on the nearest ray, higher than the tip, and the
+    /// tip's own bearing passes beside it. Without the allowance that ray's skyline is the
+    /// bump, so the tip is never tried, flanks and all; what matching gets must agree.
+    func testTipBelowGroundLetThroughOnItsNearestRay() {
+        let (terrain, peak, observer) = tipBehindBump(bumpBearing: 0, bumpDistance: 950, bump: 11, bumpRadius: 35,
+                                                      tipBearing: 2.4, mountain: 80)
+        XCTAssertEqual(terrain.raiseSummits([peak]), 1)
+        let renderer = HorizonRenderer(terrain: terrain)
+        var strict = HorizonSettings()
+        strict.maxDistance = 25_000
+        strict.azimuthStep = 5
+        var relaxed = strict
+        relaxed.nearAllowance = 10
+        let tip = LocalFrame(origin: observer).look(at: peak.point, refraction: strict.refraction).elevation
+        let ground = renderer.render(from: observer, settings: strict)
+        let seen = renderer.render(from: observer, settings: relaxed)
+        XCTAssertGreaterThan(Double(ground.elevations[0]), tip, "the bump, on the nearest ray")
+        XCTAssertLessThan(Double(ground.distances[0]), 1_000)
+        XCTAssertEqual(Double(seen.elevations[0]), tip, accuracy: 0.02, "raised, seen past the bump")
+        XCTAssertEqual(seen.withNearGround().elevations, ground.elevations)
+        XCTAssertEqual(seen.withNearGround().distances, ground.distances)
+    }
 }

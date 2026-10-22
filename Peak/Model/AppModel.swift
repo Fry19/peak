@@ -309,7 +309,7 @@ final class AppModel {
         upright.heading += north
         sideways.heading += north
         // Matching against the horizon from a rough fix would lock onto the wrong one.
-        let horizon = sceneAccuracy < LocationQuality.matchingAccuracy ? scene?.horizon : nil
+        let horizon = sceneAccuracy < LocationQuality.matchingAccuracy ? scene?.matchingHorizon : nil
         // How far you may be from where the horizon was rendered: near ridges count for less.
         var uncertainty = LocationQuality.positionUncertainty(accuracy: sceneAccuracy, moved: 0)
         if let scene, let location {

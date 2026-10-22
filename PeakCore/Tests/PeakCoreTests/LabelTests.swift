@@ -66,17 +66,20 @@ final class LabelTests: XCTestCase {
         XCTAssertFalse(toggles(layout, start: [], id: 7, candidates: frame).shownAtEnd)
     }
 
-    /// A shown label gives way only to one that ranks clearly higher.
+    /// A shown label gives way only to one that ranks clearly higher, and does give way to
+    /// one well above it: Kuwohi (1.73) behind Blanket Mountain (0.90), seen from Alcoa.
     func testBumpOnlyForClearlyHigherRank() {
         let layout = LabelLayout(bounds: screen, limit: 10)
         func place(newScore: Double) -> LabelLayout.Result {
             layout.place([LabelLayout.Candidate(id: 1, x: 200, y: 400, score: 3, box: box),
                           LabelLayout.Candidate(id: 2, x: 240, y: 400, score: newScore, box: box)], previous: [1])
         }
-        XCTAssertEqual(place(newScore: 3.5).labels, [1])
-        XCTAssertEqual(place(newScore: 3.5).dots, [2])
-        XCTAssertEqual(place(newScore: 4.5).labels, [2])
-        XCTAssertEqual(place(newScore: 4.5).dots, [1])
+        XCTAssertEqual(place(newScore: 3.3).labels, [1])
+        XCTAssertEqual(place(newScore: 3.3).dots, [2])
+        XCTAssertEqual(place(newScore: 3.5).labels, [2])
+        XCTAssertEqual(place(newScore: 3.5).dots, [1])
+        XCTAssertEqual(layout.place([LabelLayout.Candidate(id: 1, x: 200, y: 400, score: 0.90, box: box),
+                                     LabelLayout.Candidate(id: 2, x: 210, y: 398, score: 1.73, box: box)], previous: [1]).labels, [2])
         // From scratch, the higher one wins.
         XCTAssertEqual(layout.place([LabelLayout.Candidate(id: 1, x: 200, y: 400, score: 3, box: box),
                                      LabelLayout.Candidate(id: 2, x: 240, y: 400, score: 3.5, box: box)], previous: []).labels, [2])
@@ -90,8 +93,8 @@ final class LabelTests: XCTestCase {
              LabelLayout.Candidate(id: 2, x: 300, y: 200, score: 2.2, box: box),
              LabelLayout.Candidate(id: 3, x: 200, y: 500, score: c, box: box)]
         }
-        XCTAssertEqual(layout.place(candidates(2.5), previous: [1, 2]).labeled, [1, 2])
-        XCTAssertEqual(layout.place(candidates(3.5), previous: [1, 2]).labeled, [2, 3])
+        XCTAssertEqual(layout.place(candidates(2.3), previous: [1, 2]).labeled, [1, 2])
+        XCTAssertEqual(layout.place(candidates(2.5), previous: [1, 2]).labeled, [2, 3])
     }
 
     /// Labels stand upright in the world: with the phone on its side, two dots one above the

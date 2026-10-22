@@ -140,7 +140,9 @@ final class SunService {
         if let here, here.observer == observer, here.day.interval == day { return here }
         let key = "here \(observer.latitude),\(observer.longitude) \(day.start.timeIntervalSince1970)"
         enqueue(key) { [weak self] in
-            let sun = SunDay(horizon: scene.horizon, interval: day)
+            // When the sun really goes for you: behind the ground near you as it stands, as the
+            // hikes' daylight has it at a trailhead, even where the view sees over it.
+            let sun = SunDay(horizon: scene.matchingHorizon, interval: day)
             let behind = sun.lastLight.flatMap { Self.peak(behind: $0, in: scene) }
             DispatchQueue.main.async { self?.here = Here(observer: observer, day: sun, setsBehind: behind) }
         }

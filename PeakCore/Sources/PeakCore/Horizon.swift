@@ -12,6 +12,13 @@ public struct HorizonSettings: Sendable {
     public var relativeStep = 0.001
     /// Atmospheric refraction coefficient k (0.13 is the standard atmosphere).
     public var refraction = 0.13
+    /// Ground within `nearRange` meters that rises less than this above the eye hides
+    /// nothing, meters (0: all ground counts). That close, a few meters are within the
+    /// terrain's error and where you really stand: a floor up, a deck, a step uphill. From
+    /// a valley the far mountains can be only a degree or two up, and a rise 5 m above the
+    /// eye 200 m away would hide them all. Higher ground still does.
+    public var nearAllowance = 0.0
+    public var nearRange = 1_000.0
 
     public init() {}
 
@@ -51,6 +58,15 @@ public struct HorizonProfile: Sendable {
     public internal(set) var coarseRays: [Bool] = []
     let envelopeStart: [Int]
     let envelope: [EnvelopePoint]
+    /// The skyline with the near ground `HorizonSettings.nearAllowance` let through put
+    /// back; nil when it let none through that rises above the skyline.
+    var nearGround: NearGround?
+
+    struct NearGround: Sendable {
+        var elevations: [Float]
+        var distances: [Float]
+        var coarseRays: [Bool]
+    }
 
     public var count: Int { elevations.count }
     public var azimuthStep: Double { settings.azimuthStep }
@@ -94,6 +110,20 @@ public struct HorizonProfile: Sendable {
         var profile = HorizonProfile(observer: observer, settings: settings, elevations: elevations, distances: distances,
                                      envelopeStart: [Int](repeating: 0, count: count + 1), envelope: [])
         profile.coarseRays = coarseRays
+        return profile
+    }
+
+    /// The skyline as the ground near the eye really stands, with what `nearAllowance` let
+    /// through put back, and no depth map: what skyline matching compares camera frames
+    /// against, since the camera sees that ground. This profile itself when nothing was.
+    public func withNearGround() -> HorizonProfile {
+        guard let near = nearGround else { return self }
+        var settings = settings
+        settings.nearAllowance = 0
+        var profile = HorizonProfile(observer: observer, settings: settings, elevations: near.elevations,
+                                     distances: near.distances, envelopeStart: [Int](repeating: 0, count: count + 1),
+                                     envelope: [])
+        profile.coarseRays = near.coarseRays
         return profile
     }
 
@@ -157,21 +187,28 @@ public final class HorizonRenderer: @unchecked Sendable {
         var elevations = [Float](repeating: -90, count: rayCount)
         var distances = [Float](repeating: 0, count: rayCount)
         var perRay = [[HorizonProfile.EnvelopePoint]](repeating: [], count: rayCount)
+        // The highest near ground `nearAllowance` let through on each ray, if any.
+        var nearGround = [(elevation: Float, distance: Float)?](repeating: nil, count: settings.nearAllowance > 0 ? rayCount : 0)
 
         elevations.withUnsafeMutableBufferPointer { elev in
             distances.withUnsafeMutableBufferPointer { dist in
                 perRay.withUnsafeMutableBufferPointer { env in
-                    let chunk = 16
-                    DispatchQueue.concurrentPerform(iterations: (rayCount + chunk - 1) / chunk) { block in
-                        for i in block * chunk..<min(rayCount, (block + 1) * chunk) {
-                            let azimuth = Double(i) * settings.azimuthStep
-                            var points: [HorizonProfile.EnvelopePoint] = []
-                            points.reserveCapacity(128)
-                            march.run(terrain: terrain, azimuth: azimuth, upTo: settings.maxDistance, envelope: &points)
-                            env[i] = points
-                            if let last = points.last {
-                                elev[i] = last.elevation
-                                dist[i] = last.distance
+                    nearGround.withUnsafeMutableBufferPointer { near in
+                        let chunk = 16
+                        DispatchQueue.concurrentPerform(iterations: (rayCount + chunk - 1) / chunk) { block in
+                            for i in block * chunk..<min(rayCount, (block + 1) * chunk) {
+                                let azimuth = Double(i) * settings.azimuthStep
+                                var points: [HorizonProfile.EnvelopePoint] = []
+                                points.reserveCapacity(128)
+                                let passed = march.run(terrain: terrain, azimuth: azimuth, upTo: settings.maxDistance, envelope: &points)
+                                env[i] = points
+                                if let last = points.last {
+                                    elev[i] = last.elevation
+                                    dist[i] = last.distance
+                                }
+                                if let passed, !near.isEmpty {
+                                    near[i] = (Float(atan(passed.tan) * 180 / .pi), Float(passed.distance))
+                                }
                             }
                         }
                     }
@@ -179,18 +216,43 @@ public final class HorizonRenderer: @unchecked Sendable {
             }
         }
 
-        refineSummitTips(from: observer, march: march, elevations: &elevations,
-                         distances: &distances, perRay: &perRay)
+        let tipsSeeNearGround = refineSummitTips(from: observer, march: march, elevations: &elevations,
+                                                 distances: &distances, perRay: &perRay,
+                                                 nearGround: nearGround.map { $0?.elevation ?? -90 })
 
         var start = [Int](repeating: 0, count: rayCount + 1)
         for i in 0..<rayCount { start[i + 1] = start[i] + perRay[i].count }
         var profile = HorizonProfile(observer: observer, settings: settings, elevations: elevations,
                                      distances: distances, envelopeStart: start, envelope: perRay.flatMap { $0 })
+        func isCoarse(_ i: Int, _ distance: Float) -> Bool {
+            let p = destination(from: observer, azimuth: Double(i) * settings.azimuthStep, distance: Double(distance))
+            return terrain.isCoarse(latitude: p.latitude, longitude: p.longitude)
+        }
         if terrain.hasCoarse {
-            profile.coarseRays = (0..<rayCount).map { i in
-                let p = destination(from: observer, azimuth: Double(i) * settings.azimuthStep, distance: Double(distances[i]))
-                return terrain.isCoarse(latitude: p.latitude, longitude: p.longitude)
+            profile.coarseRays = (0..<rayCount).map { isCoarse($0, distances[$0]) }
+        }
+        // With ground let through about as high as a summit tip, on its nearest ray or its own
+        // marches, the tip and its flanks might not be raised without the allowance: then the
+        // skyline as it stands is marched again without it. That's rare.
+        if tipsSeeNearGround {
+            var strict = settings
+            strict.nearAllowance = 0
+            let ground = render(from: observer, settings: strict)
+            profile.nearGround = HorizonProfile.NearGround(elevations: ground.elevations, distances: ground.distances,
+                                                           coarseRays: ground.coarseRays)
+            return profile
+        }
+        // Elsewhere, where the ground let through rises above everything beyond it, it is the
+        // skyline as it stands: the highest of all the ground, as a march without it finds.
+        if nearGround.contains(where: { $0 != nil }) {
+            var near = HorizonProfile.NearGround(elevations: elevations, distances: distances, coarseRays: profile.coarseRays)
+            for (i, n) in nearGround.enumerated() {
+                guard let n, n.elevation > elevations[i] else { continue }
+                near.elevations[i] = n.elevation
+                near.distances[i] = n.distance
+                if !near.coarseRays.isEmpty { near.coarseRays[i] = isCoarse(i, n.distance) }
             }
+            if near.elevations != elevations { profile.nearGround = near }
         }
         return profile
     }
@@ -201,32 +263,41 @@ public final class HorizonRenderer: @unchecked Sendable {
     /// A summit hidden on its own bearing, or past missing data, is never added. The tips
     /// are worked out in parallel against the regular rays, and each ray then keeps the
     /// highest skyline any of them gives it, so the order doesn't matter.
+    ///
+    /// `nearGround` is the highest ground `nearAllowance` let through on each regular ray
+    /// (empty without one). Returns whether some tip that raises anything might go
+    /// otherwise without the allowance: ground let through at least as high as the tip on
+    /// its nearest ray, or as what one of its own marches raises.
     private func refineSummitTips(from observer: GeoPoint, march: March,
                                   elevations: inout [Float], distances: inout [Float],
-                                  perRay: inout [[HorizonProfile.EnvelopePoint]]) {
+                                  perRay: inout [[HorizonProfile.EnvelopePoint]], nearGround: [Float] = []) -> Bool {
         let tips = terrain.summitTips
-        guard !tips.isEmpty else { return }
+        guard !tips.isEmpty else { return false }
         let frame = LocalFrame(origin: observer)
-        var found = [[(ray: Int, points: [HorizonProfile.EnvelopePoint])]](repeating: [], count: tips.count)
+        var found = [(rays: [(ray: Int, points: [HorizonProfile.EnvelopePoint])], overNearGround: Bool)](
+            repeating: ([], false), count: tips.count)
         elevations.withUnsafeBufferPointer { elev in
             perRay.withUnsafeBufferPointer { env in
-                found.withUnsafeMutableBufferPointer { out in
-                    let chunk = 16
-                    DispatchQueue.concurrentPerform(iterations: (tips.count + chunk - 1) / chunk) { block in
-                        for t in block * chunk..<min(tips.count, (block + 1) * chunk) {
-                            out[t] = rays(through: tips[t], from: observer, frame: frame, march: march,
-                                          elevations: elev, envelopes: env)
+                nearGround.withUnsafeBufferPointer { near in
+                    found.withUnsafeMutableBufferPointer { out in
+                        let chunk = 16
+                        DispatchQueue.concurrentPerform(iterations: (tips.count + chunk - 1) / chunk) { block in
+                            for t in block * chunk..<min(tips.count, (block + 1) * chunk) {
+                                out[t] = rays(through: tips[t], from: observer, frame: frame, march: march,
+                                              elevations: elev, envelopes: env, nearGround: near)
+                            }
                         }
                     }
                 }
             }
         }
-        for (ray, points) in found.joined() {
+        for (ray, points) in found.flatMap(\.rays) {
             guard let top = points.last, top.elevation > elevations[ray] else { continue }
             perRay[ray] = points
             elevations[ray] = top.elevation
             distances[ray] = top.distance
         }
+        return found.contains { !$0.rays.isEmpty && $0.overNearGround }
     }
 
     /// How far in front of a tip its flanks are marched again, meters: past where any raised
@@ -234,17 +305,20 @@ public final class HorizonRenderer: @unchecked Sendable {
     static let flankDepth = 1_000.0
 
     /// The rays one summit tip raises above the regular `elevations`: its apex in the nearest
-    /// ray, then that ray's neighbors eased onto its flanks. Empty when it raises none.
+    /// ray, then that ray's neighbors eased onto its flanks. Empty when it raises none. Also
+    /// whether near ground let through stands at least as high as the tip on its nearest ray
+    /// (`nearGround`), or as the top of one of its own marches: without the allowance the
+    /// tip, and so its flanks, might not be raised.
     private func rays(through tip: GeoPoint, from observer: GeoPoint, frame: LocalFrame, march: March,
                       elevations: UnsafeBufferPointer<Float>,
-                      envelopes: UnsafeBufferPointer<[HorizonProfile.EnvelopePoint]>)
-        -> [(ray: Int, points: [HorizonProfile.EnvelopePoint])] {
+                      envelopes: UnsafeBufferPointer<[HorizonProfile.EnvelopePoint]>, nearGround: UnsafeBufferPointer<Float>)
+        -> (rays: [(ray: Int, points: [HorizonProfile.EnvelopePoint])], overNearGround: Bool) {
         let settings = march.settings
         var tip = tip
         let distance = groundDistance(from: observer, to: tip)
-        guard distance >= settings.minDistance, distance <= settings.maxDistance else { return [] }
+        guard distance >= settings.minDistance, distance <= settings.maxDistance else { return ([], false) }
         tip.height = terrain.height(latitude: tip.latitude, longitude: tip.longitude)
-        guard tip.height.isFinite else { return [] }
+        guard tip.height.isFinite else { return ([], false) }
         // Invert the same conformal sphere as the march, so the extra sample lands
         // on the grid node itself, even on a very steep tip.
         let chi = ConformalSphere.conformalLatitude(tip.latitude * .pi / 180)
@@ -254,13 +328,19 @@ public final class HorizonRenderer: @unchecked Sendable {
         let azimuth = normalizedAzimuth(atan2(east, north) * 180 / .pi)
         let i = Int((azimuth / settings.azimuthStep).rounded()) % elevations.count
         // Usually only a handful of tips can raise the existing skyline.
-        guard frame.look(at: tip, refraction: settings.refraction).elevation > Double(elevations[i]) else { return [] }
+        let tipElevation = frame.look(at: tip, refraction: settings.refraction).elevation
+        guard tipElevation > Double(elevations[i]) else { return ([], false) }
+        var overNearGround = !nearGround.isEmpty && Double(nearGround[i]) >= tipElevation
         // The tip's rays end at it: everything the regular rays saw is below the tip, so
         // whatever lies beyond is out of sight.
+        func isOver(_ passed: (tan: Double, distance: Double)?, _ top: HorizonProfile.EnvelopePoint) -> Bool {
+            passed.map { atan($0.tan) * 180 / .pi >= Double(top.elevation) } ?? false
+        }
         var apex: [HorizonProfile.EnvelopePoint] = []
-        march.sampling(from: 0, nearerThan: distance, then: [distance])
+        let apexPassed = march.sampling(from: 0, nearerThan: distance, then: [distance])
             .run(terrain: terrain, azimuth: azimuth, upTo: distance, envelope: &apex)
-        guard let top = apex.last, top.distance == Float(distance), top.elevation > elevations[i] else { return [] }
+        guard let top = apex.last, top.distance == Float(distance), top.elevation > elevations[i] else { return ([], false) }
+        overNearGround = overNearGround || isOver(apexPassed, top)
         var raised = [(ray: i, points: apex)]
 
         // Ease the half-ray rounding back to the original grid over four neighbors,
@@ -287,12 +367,15 @@ public final class HorizonRenderer: @unchecked Sendable {
             let nearer = envelopes[j].prefix { Double($0.distance) < start }
             let inSight = envelopes[j].dropFirst(nearer.count).first.map { !$0.startsSegment } ?? false
             var flank = Array(nearer)
-            march.sampling(from: start, nearerThan: window[0], then: window)
+            let flankPassed = march.sampling(from: start, nearerThan: window[0], then: window)
                 .run(terrain: terrain, azimuth: flankAzimuth, upTo: window[window.count - 1],
                      envelope: &flank, inSight: inSight)
-            if let top = flank.last, top.elevation > elevations[j] { raised.append((j, flank)) }
+            if let top = flank.last {
+                overNearGround = overNearGround || isOver(flankPassed, top)
+                if top.elevation > elevations[j] { raised.append((j, flank)) }
+            }
         }
-        return raised
+        return (raised, overNearGround)
     }
 
     /// Highest apparent elevation angle of the terrain along one azimuth, out to `distance`.
@@ -377,14 +460,21 @@ struct March {
     ///
     /// A non-empty `envelope` is what's been seen nearer, and the march carries on from it;
     /// `inSight` says whether the terrain just before the first sample was in sight.
+    ///
+    /// Near ground that `nearAllowance` lets through is left out, as if it weren't there;
+    /// the highest of it (tan of its elevation angle, and its distance) is returned. If the
+    /// data ends before anything else is seen, the highest of it stays, as the skyline.
+    @discardableResult
     func run(terrain: Terrain, azimuth: Double, upTo maxDistance: Double,
-             envelope: inout [HorizonProfile.EnvelopePoint], inSight: Bool = false) {
+             envelope: inout [HorizonProfile.EnvelopePoint], inSight: Bool = false) -> (tan: Double, distance: Double)? {
         let ray = GreatCircleRay(sphere: sphere, longitude: observer.longitude, azimuth: azimuth)
         // Refraction as a larger effective Earth: R' = R / (1 − k).
         let radius = WGS84.radius(latitude: observer.latitude * .pi / 180, azimuth: azimuth * .pi / 180)
         let effectiveRadius = radius / (1 - settings.refraction)
         let observerRadius = effectiveRadius + observer.height
         let elevationResolution = 0.01
+        let passUnder = settings.nearAllowance > 0 ? observer.height + settings.nearAllowance : -Double.infinity
+        var passed: (tan: Double, distance: Double)?
 
         var best = -Double.infinity            // tan of the highest elevation angle so far
         var lastKept = -Double.infinity        // elevation (degrees) of the last kept point
@@ -400,7 +490,13 @@ struct March {
             if d > maxDistance { break }
             let p = ray.point(cosDelta: cosDelta[k], sinDelta: sinDelta[k])
             let h = terrain.height(latitude: p.latitude, longitude: p.longitude)
-            if h.isNaN { break }
+            if h.isNaN {
+                if envelope.isEmpty, let passed {
+                    envelope.append(.init(elevation: Float(atan(passed.tan) * 180 / .pi), distance: Float(passed.distance),
+                                          startsSegment: false))
+                }
+                break
+            }
             // Elevation angle on the effective sphere, with θ = d / R'.
             let theta = d / effectiveRadius
             let t2 = theta * theta
@@ -409,6 +505,10 @@ struct March {
             let r = effectiveRadius + h
             let tanElevation = (cosT * r - observerRadius) / (sinT * r)
 
+            if h < passUnder, d <= settings.nearRange {
+                if tanElevation > passed?.tan ?? -.infinity { passed = (tanElevation, d) }
+                continue
+            }
             if tanElevation > best {
                 best = tanElevation
                 let e = atan(tanElevation) * 180 / .pi
@@ -436,5 +536,6 @@ struct March {
         if let (e, dist) = pending {
             envelope.append(.init(elevation: Float(e), distance: Float(dist), startsSegment: false))
         }
+        return passed
     }
 }

@@ -20,7 +20,12 @@ struct TerrainScene: @unchecked Sendable {
 
     let observer: GeoPoint
     let terrain: Terrain
+    /// The view, drawn and labeled from up to `nearAllowance` above the eye as far as the
+    /// ground near you goes.
     let horizon: HorizonProfile
+    /// The skyline as the ground near you stands, which is what the camera sees from it and
+    /// where the sun really goes: skyline matching and today's sun times use this one.
+    let matchingHorizon: HorizonProfile
     /// Ridge segments bucketed by whole degree of azimuth, for drawing only what's in view.
     let segments: [[RidgeSegment]]
     /// Visible peaks, the most worth a label first (`PeakRanking`): prominent summits that
@@ -34,6 +39,13 @@ struct TerrainScene: @unchecked Sendable {
     let uncertain: Set<Int64>
     /// You're standing on the base layer's coarse terrain (nothing finer is in yet).
     let isCoarse: Bool
+
+    /// Ground within a kilometer that rises less than this above your eye doesn't hide what's
+    /// behind it, meters (`HorizonSettings.nearAllowance`). From a valley or a town the
+    /// mountains may stand only a degree or two up, and a gentle rise a few meters above
+    /// the eye a few hundred meters away would hide them all, though from a floor up, a
+    /// deck or a step uphill they're in sight. Real hills still hide them.
+    static let nearAllowance = 10.0
 
     /// `accuracy` is the fix's horizontal accuracy, meters: the eye stands on the highest
     /// ground within it (up to 30 m), so a fix just off a crest doesn't hide the view.
@@ -54,6 +66,7 @@ struct TerrainScene: @unchecked Sendable {
         // On coarse ground the first few kilometers are left out (`HorizonSettings.coarse`).
         var settings = isCoarse ? HorizonSettings.coarse : HorizonSettings()
         settings.maxDistance = radius
+        settings.nearAllowance = nearAllowance
         if isCoarse, let altitude { observer.height = altitude }
         return view(from: observer, terrain: terrain, peaks: peaks, settings: settings, isCoarse: isCoarse)
     }
@@ -68,7 +81,8 @@ struct TerrainScene: @unchecked Sendable {
         defer { Self.terrainWrites.unlock() }
         let view = Self.view(from: eye, terrain: terrain, peaks: allPeaks.values.map(\.peak), settings: horizon.settings,
                              isCoarse: isCoarse)
-        return TerrainScene(observer: eye, terrain: terrain, horizon: view.horizon.withoutDepth(), segments: view.segments,
+        let slim = view.horizon.withoutDepth()
+        return TerrainScene(observer: eye, terrain: terrain, horizon: slim, matchingHorizon: slim, segments: view.segments,
                             peaks: view.peaks, scores: view.scores, allPeaks: view.allPeaks, uncertain: view.uncertain,
                             isCoarse: isCoarse)
     }
@@ -118,8 +132,9 @@ struct TerrainScene: @unchecked Sendable {
             }
         }
         for v in visible where !uncertain.contains(v.id) { all[v.id]?.isVisible = true }
-        return TerrainScene(observer: observer, terrain: terrain, horizon: horizon, segments: buckets, peaks: visible,
-                            scores: scores, allPeaks: all, uncertain: uncertain, isCoarse: isCoarse)
+        return TerrainScene(observer: observer, terrain: terrain, horizon: horizon, matchingHorizon: horizon.withNearGround(),
+                            segments: buckets, peaks: visible, scores: scores, allPeaks: all, uncertain: uncertain,
+                            isCoarse: isCoarse)
     }
 
     /// A trail laid on the terrain as seen from here, with the stretches behind nearer
