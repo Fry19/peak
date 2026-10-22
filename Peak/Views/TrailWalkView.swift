@@ -54,6 +54,8 @@ struct TrailWalkView: View {
     /// rebuild of the same ground.
     @State private var nearImagery: MapImagery?
     @State private var farImagery: MapImagery?
+    /// The sharper imagery around the walker, kept likewise.
+    @State private var detailImagery: MapImagery?
     @State private var draped = false
 
     var body: some View {
@@ -109,6 +111,10 @@ struct TrailWalkView: View {
                            online: model.online)) {
             await drape()
         }
+        // Sharper imagery under the part of the walk in view, once the imagery is laid.
+        .task(id: DetailKey(world: world.map(ObjectIdentifier.init), draped: draped, online: model.online)) {
+            await sharpen()
+        }
         // Land cover that arrives once the walk is under way tints the terrain where it stands.
         .task(id: [model.covers[trail.trail.id]?.revision ?? -1, world == nil ? 0 : 1]) {
             if let world, let cover = model.covers[trail.trail.id] { await world.tint(with: cover) }
@@ -125,6 +131,45 @@ struct TrailWalkView: View {
         var world: ObjectIdentifier?
         var satellite: Bool
         var online: Bool
+    }
+
+    private struct DetailKey: Equatable {
+        var world: ObjectIdentifier?
+        var draped: Bool
+        var online: Bool
+    }
+
+    /// Keeps sharper imagery under the part of the walk in view, loading it again as the walker
+    /// moves on: one download at a time, waiting longer after each one that fails.
+    private func sharpen() async {
+        guard let world, draped else { return }
+        if let detailImagery { world.show(detail: detailImagery) }
+        var wait = 2.0
+        while !Task.isCancelled {
+            let center = world.detailCenter(at: player.shownDistance, walking: player.playing)
+            if world.needsDetail(around: center) {
+                do {
+                    let loaded = try await world.loadDetail(around: center)
+                    guard !Task.isCancelled, self.world === world else { return }
+                    wait = 2
+                    // A slow download may finish after scrubbing back to imagery we already
+                    // have. Keep the picture nearest the part of the walk now in view.
+                    let wanted = world.detailCenter(at: player.shownDistance, walking: player.playing)
+                    if let shown = world.detail {
+                        let previous = SIMD2<Double>(shown.rect.midX, shown.rect.midY)
+                        if simd_distance(previous, wanted) < simd_distance(center, wanted) { continue }
+                    }
+                    world.show(detail: loaded)
+                    detailImagery = loaded
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    try? await Task.sleep(for: .seconds(wait))
+                    wait = min(60, wait * 2)
+                    continue
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
     }
 
     /// Loads what imagery is missing, the terrain's before the ring's, and lays each on as
@@ -229,6 +274,36 @@ final class WalkWorld: @unchecked Sendable {
     static let background = UIColor(red: 0.035, green: 0.043, blue: 0.058, alpha: 1)
     /// The sky, and the haze far terrain fades into.
     static let haze = UIColor(red: 0.055, green: 0.066, blue: 0.09, alpha: 1)
+    /// Over satellite imagery, a daylight sky instead: the pale haze at the horizon, which far
+    /// terrain fades into, and blue overhead.
+    static let daylightHaze = SIMD3<Double>(0.78, 0.85, 0.92)
+    static let daylightZenith = SIMD3<Double>(0.22, 0.44, 0.78)
+
+    /// The daylight sky as a 2:1 latitude–longitude picture, which SceneKit wraps around the
+    /// scene, so the horizon stays level as the camera tilts: blue overhead, paling toward the
+    /// horizon, and haze below it, past the terrain's edge.
+    static let daylightSky: CGImage? = {
+        let width = 1_024, height = 512
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        for row in 0..<height {
+            // Degrees above the horizon at this row's middle.
+            let elevation = 90 - 180 * (Double(row) + 0.5) / Double(height)
+            let t = pow(max(0, elevation) / 90, 0.45)
+            let c = daylightHaze + (daylightZenith - daylightHaze) * t
+            for column in 0..<width {
+                let i = 4 * (row * width + column)
+                pixels[i] = UInt8((c.x * 255).rounded())
+                pixels[i + 1] = UInt8((c.y * 255).rounded())
+                pixels[i + 2] = UInt8((c.z * 255).rounded())
+            }
+        }
+        let provider = CGDataProvider(data: Data(pixels) as CFData)
+        return provider.flatMap {
+            CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                    provider: $0, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        }
+    }()
     static let trailColor = UIColor(Color.amber)
     /// Vertical field of view, degrees.
     static let fieldOfView = 62.0
@@ -450,17 +525,16 @@ final class WalkWorld: @unchecked Sendable {
         func material(_ image: CGImage) -> SCNMaterial {
             let material = SCNMaterial()
             material.lightingModel = .lambert
-            // At most 0.48 × 1.4 (the sun) + 0.25 + a little ambient: under the 0.95 bloom.
             material.diffuse.contents = image
-            material.diffuse.intensity = 0.48
-            material.emission.contents = image
-            material.emission.intensity = 0.25
-            for property in [material.diffuse, material.emission] {
-                property.mipFilter = .linear
-                property.maxAnisotropy = 8
-                property.wrapS = .clamp
-                property.wrapT = .clamp
-            }
+            material.diffuse.mipFilter = .linear
+            material.diffuse.maxAnisotropy = 16
+            material.diffuse.wrapS = .clamp
+            material.diffuse.wrapT = .clamp
+            // The shader sets how bright it is, and lays the sharper imagery near the walker
+            // over it once that loads.
+            material.emission.contents = UIColor.black
+            material.shaderModifiers = [.surface: Self.drapeShader]
+            Self.setDetail(nil, on: material)
             return material
         }
         var parts: [(node: SCNNode, picture: MapImagery, ring: Bool)] = []
@@ -478,8 +552,114 @@ final class WalkWorld: @unchecked Sendable {
             let geometry = SCNGeometry(sources: old.sources.filter { $0.semantic != .color } + [coordinates], elements: old.elements)
             geometry.firstMaterial = material(part.picture.image)
             part.node.geometry = geometry
-            if part.ring { ringDraped = true } else { draped = true; crestStrength = 0.35 }
+            if part.ring {
+                ringDraped = true
+            } else {
+                draped = true
+                crestStrength = 0.35
+                // Daylight over the imagery: a night sky over a sunny photo reads as a void.
+                if let sky = Self.daylightSky {
+                    scene.background.contents = sky
+                    let h = Self.daylightHaze
+                    scene.fogColor = UIColor(red: h.x, green: h.y, blue: h.z, alpha: 1)
+                    // Pale haze shows more than the dark one: keep the middle distance clear.
+                    scene.fogDensityExponent = 1.8
+                }
+            }
         }
+    }
+
+    /// The haze starts a few kilometers out, and further while looking down from high up;
+    /// `range` is how far the camera is from what it looks at.
+    func haze(range: Double) {
+        let start = max(3_000, range * 1.2)
+        // Only when it changes, so a still scene isn't drawn again.
+        guard abs(scene.fogStartDistance - start) > 1 else { return }
+        scene.fogStartDistance = start
+        scene.fogEndDistance = start + 21_000
+    }
+
+    // MARK: Sharper imagery near the walker
+
+    /// One picture for the whole terrain is 3–9 m a pixel, a smear on the ground in front of
+    /// the camera. A sharper one, about 1.5 m a pixel, covers this square around the part of
+    /// the walk in view, and follows it.
+    static let detailSide = 3_000.0
+    static let detailPixels = 2_048
+    /// Ahead of the walker while it walks, so the window covers the ground ahead and still
+    /// the ground below the camera, behind it.
+    static let detailLead = 500.0
+    /// How far the wanted window moves before it's loaded again.
+    static let detailStep = 500.0
+
+    /// The sharper imagery shown, if any (changed on the main thread only).
+    private(set) var detail: MapImagery?
+
+    /// Lays the imagery, lit by the sun and partly lighting itself, so slopes facing away from
+    /// the sun stay readable (the imagery has its own shadows); at most 0.48 × 1.4 (the sun)
+    /// + 0.25 + a little ambient, under the 0.95 bloom, so even white doesn't glow. Within the
+    /// detail square, the sharper imagery replaces it, blending in over its edges.
+    static let drapeShader = """
+    #pragma arguments
+    texture2d<float> detailImage;
+    float4 detailRect;
+    float detailOn;
+    #pragma body
+    float4 world = scn_frame.inverseViewTransform * float4(_surface.position, 1.0);
+    float2 uv = float2((world.x - detailRect.x) * detailRect.z, (world.z - detailRect.y) * detailRect.w);
+    constexpr sampler detailSampler(filter::linear, mip_filter::linear, address::clamp_to_edge, max_anisotropy(16));
+    float3 sharp = detailImage.sample(detailSampler, uv).rgb;
+    float2 edge = min(uv, 1.0 - uv);
+    float w = smoothstep(0.0, 0.08, min(edge.x, edge.y)) * detailOn;
+    float3 color = mix(_surface.diffuse.rgb, sharp, w);
+    _surface.diffuse = float4(color * 0.48, 1.0);
+    _surface.emission = float4(color * 0.25, 1.0);
+    """
+
+    /// A placeholder for the shader's detail picture until one loads.
+    private static let blank: CGImage? = UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1)).image { _ in }.cgImage
+
+    /// Binds `imagery` (or none) to a draped material's shader. The picture and where it lies
+    /// change together.
+    private static func setDetail(_ imagery: MapImagery?, on material: SCNMaterial) {
+        guard let image = imagery?.image ?? blank else { return }
+        let picture = SCNMaterialProperty(contents: image)
+        picture.mipFilter = .linear
+        picture.maxAnisotropy = 16
+        picture.wrapS = .clamp
+        picture.wrapT = .clamp
+        material.setValue(picture, forKey: "detailImage")
+        // From SceneKit's x (east) and z (south) to the picture's u and v, as for the base.
+        let rect = imagery?.rect ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+        material.setValue(NSValue(scnVector4: SCNVector4(Float(rect.minX), Float(-rect.maxY), Float(1 / rect.width), Float(1 / rect.height))),
+                          forKey: "detailRect")
+        material.setValue(imagery == nil ? 0.0 : 1.0, forKey: "detailOn")
+    }
+
+    /// Where the sharper imagery should be centered, map meters: ahead of the walker while it
+    /// walks, on it while paused to look around.
+    func detailCenter(at distance: Double, walking: Bool) -> SIMD2<Double> {
+        let p = walk.point(at: min(walk.length, distance + (walking ? Self.detailLead : 0)))
+        return SIMD2(p.x, p.y)
+    }
+
+    /// Whether the imagery shown is too far from `center`, or there's none yet.
+    func needsDetail(around center: SIMD2<Double>) -> Bool {
+        guard let detail, detail.center == relief.projection.center else { return true }
+        return simd_distance(SIMD2(detail.rect.midX, detail.rect.midY), center) > Self.detailStep
+    }
+
+    @MainActor func loadDetail(around center: SIMD2<Double>) async throws -> MapImagery {
+        let half = Self.detailSide / 2
+        let rect = CGRect(x: center.x - half, y: center.y - half, width: Self.detailSide, height: Self.detailSide)
+        return try await MapImagery.load(projection: relief.projection, rect: rect, width: Self.detailPixels)
+    }
+
+    /// Shows sharper imagery made for this terrain, replacing what was shown before.
+    @MainActor func show(detail imagery: MapImagery) {
+        guard draped, imagery.center == relief.projection.center, let material = ground.geometry?.firstMaterial else { return }
+        Self.setDetail(imagery, on: material)
+        detail = imagery
     }
 
     private static func textureCoordinates(_ vertices: SCNGeometrySource, rect: CGRect) -> SCNGeometrySource {
@@ -803,11 +983,13 @@ final class WalkPlayer {
         ended = false
         if case .intro = mode { mode = .follow }
         if case .free = mode {
-            // Keep looking around from the new spot: the camera jumps to follow it.
+            // Keep looking around from the new spot: the camera jumps to follow it. Dragging
+            // may have put SceneKit's own camera in its place; this one moves.
+            view?.pointOfView = world.camera
             let pose = world.follow(at: distance)
             eye = pose.eye
             target = pose.target
-            place(eye: eye, target: target, up: SIMD3(0, 1, 0))
+            place(eye: eye, target: target, up: SIMD3(0, 0, 1))
             pointOrbit()
         }
         moveWalker()
@@ -903,6 +1085,10 @@ final class WalkPlayer {
             // Only what changed is set, so a still scene isn't drawn again.
             if abs(world.crests.opacity - opacity) > 1e-3 { world.crests.opacity = opacity }
             if world.crests.isHidden != (opacity < 0.01) { world.crests.isHidden = opacity < 0.01 }
+            // Looking around, dragged or pinched away from the walker, the haze follows too.
+            if case .free = mode, let target = view?.defaultCameraController.target {
+                world.haze(range: Double(simd_distance(pov.simdWorldPosition, SIMD3(target.x, target.y, target.z))))
+            }
         }
         if now - lastShown > 0.08 || !playing {
             lastShown = now
@@ -921,10 +1107,7 @@ final class WalkPlayer {
         guard let world else { return }
         world.camera.position = WalkWorld.scn(eye)
         world.camera.look(at: WalkWorld.scn(target), up: WalkWorld.scn(up), localFront: SCNVector3(0, 0, -1))
-        // The haze starts a few kilometers out, and further while looking down from high up.
-        let range = simd_distance(eye, target)
-        world.scene.fogStartDistance = max(3_000, range * 1.2)
-        world.scene.fogEndDistance = world.scene.fogStartDistance + 21_000
+        world.haze(range: simd_distance(eye, target))
     }
 
     private func mix(_ a: SIMD3<Double>, _ b: SIMD3<Double>, _ t: Double) -> SIMD3<Double> { a + (b - a) * t }

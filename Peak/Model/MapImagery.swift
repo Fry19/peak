@@ -29,7 +29,16 @@ struct MapImagery: @unchecked Sendable {
         options.size = CGSize(width: Double(width) / scale, height: Double(width) / scale * mapRect.height / mapRect.width)
         options.traitCollection = UITraitCollection(displayScale: scale)
         options.preferredConfiguration = MKImageryMapConfiguration(elevationStyle: .flat)
-        let snapshot = try await MKMapSnapshotter(options: options).start()
+        // A cancelled task stops the download too: the walk asks again as it moves on.
+        let snapshotter = MKMapSnapshotter(options: options)
+        let snapshot = try await withTaskCancellationHandler {
+            // The operation still runs if cancellation preceded the handler's registration.
+            try Task.checkCancellation()
+            return try await snapshotter.start()
+        } onCancel: {
+            snapshotter.cancel()
+        }
+        try Task.checkCancellation()
         guard let source = snapshot.image.cgImage else { throw Failure.noImage }
 
         // Where the corners and each strip's top and bottom are on the snapshot, in pixels.
@@ -44,9 +53,11 @@ struct MapImagery: @unchecked Sendable {
             let y = rect.maxY - rect.height * Double(i) / Double(strips)
             return (y, onSnapshot(projection.latLon(SIMD2(rect.midX, y))).y)
         }
-        return try await Task.detached(priority: .userInitiated) {
+        let imagery = try await Task.detached(priority: .userInitiated) {
             try reproject(source, rect: rect, center: projection.center, width: width, left: left, right: right, edges: edges)
         }.value
+        try Task.checkCancellation()
+        return imagery
     }
 
     /// Apple's imagery is Web Mercator, stretched north–south away from the equator; the map
