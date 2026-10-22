@@ -32,6 +32,10 @@ struct AppSettings: Codable, Equatable {
     /// Fetch the sharpest terrain on mobile data too, not just on Wi-Fi.
     var detailOnMobile = true
     var showDiagnostics = false
+    /// Today's sun path, dotted across the sky in the camera view.
+    var showSunPath = false
+    /// The peak to remind about 20 minutes before alpenglow (last light on its summit).
+    var alpenglow: Peak?
 
     private static let key = "settings"
 
@@ -59,11 +63,15 @@ extension AppSettings {
         trailXRay = try c.decodeIfPresent(Bool.self, forKey: .trailXRay) ?? trailXRay
         detailOnMobile = try c.decodeIfPresent(Bool.self, forKey: .detailOnMobile) ?? detailOnMobile
         showDiagnostics = try c.decodeIfPresent(Bool.self, forKey: .showDiagnostics) ?? showDiagnostics
+        showSunPath = try c.decodeIfPresent(Bool.self, forKey: .showSunPath) ?? showSunPath
+        alpenglow = try c.decodeIfPresent(Peak.self, forKey: .alpenglow)
     }
 }
 
-/// Numbers as the user wants to read them.
+/// Numbers as the user wants to read them, written the way their region writes numbers
+/// ("4,478 m" in the US, "4.478 m" in Germany; "12.3 km" or "12,3 km").
 enum Format {
+    /// Whole numbers, grouped.
     private static let grouped: NumberFormatter = {
         let f = NumberFormatter()
         f.numberStyle = .decimal
@@ -71,8 +79,22 @@ enum Format {
         return f
     }()
 
+    /// Up to one decimal, without a trailing zero: "12.3", "25".
+    private static let tenths: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.minimumFractionDigits = 0
+        f.maximumFractionDigits = 1
+        return f
+    }()
+
     private static func whole(_ v: Double) -> String {
         grouped.string(from: NSNumber(value: v.rounded())) ?? String(Int(v.rounded()))
+    }
+
+    /// A number with up to one decimal, "12.3" or "25", in the user's region's way.
+    static func decimal(_ v: Double) -> String {
+        tenths.string(from: NSNumber(value: (v * 10).rounded() / 10)) ?? String(v)
     }
 
     /// "4,478 m" or "14,692 ft".
@@ -90,24 +112,29 @@ enum Format {
         (meters >= 0 ? "+" : "−") + elevation(abs(meters), units)
     }
 
-    /// "850 m", "12.3 km", "650 ft" or "7.6 mi".
+    /// "850 m", "12.3 km", "25 km", "650 ft" or "7.6 mi".
     static func distance(_ meters: Double, _ units: AppSettings.Units) -> String {
         switch units {
         case .metric:
             if meters < 1_000 { return whole((meters / 10).rounded() * 10) + " m" }
-            return meters < 100_000 ? String(format: "%.1f km", meters / 1_000) : whole(meters / 1_000) + " km"
+            return (meters < 100_000 ? decimal(meters / 1_000) : whole(meters / 1_000)) + " km"
         case .imperial:
             let miles = meters / 1_609.344
             if miles < 0.2 { return whole((meters / 0.3048 / 10).rounded() * 10) + " ft" }
-            return miles < 100 ? String(format: "%.1f mi", miles) : whole(miles) + " mi"
+            return (miles < 100 ? decimal(miles) : whole(miles)) + " mi"
         }
+    }
+
+    /// "2.5×" for a zoom.
+    static func zoom(_ factor: Double) -> String {
+        decimal(factor) + "×"
     }
 
     /// "236° SW".
     static func bearing(_ azimuth: Double) -> String {
         let names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
         let a = normalizedAzimuth(azimuth)
-        return String(format: "%.0f° %@", a.rounded() == 360 ? 0 : a, names[Int((a / 45).rounded()) % 8])
+        return whole(a.rounded() == 360 ? 0 : a) + "° " + names[Int((a / 45).rounded()) % 8]
     }
 
     /// "1.2 GB" or "350 MB".

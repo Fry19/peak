@@ -28,13 +28,15 @@ struct TerrainScene: @unchecked Sendable {
     /// Every peak within range, visible or not, by id.
     let allPeaks: [Int64: PeakView]
 
-    static func build(terrain: Terrain, latitude: Double, longitude: Double, peaks: [Peak]) -> TerrainScene {
+    /// `accuracy` is the fix's horizontal accuracy, meters: the eye stands on the highest
+    /// ground within it (up to 30 m), so a fix just off a crest doesn't hide the view.
+    static func build(terrain: Terrain, latitude: Double, longitude: Double, accuracy: Double, peaks: [Peak]) -> TerrainScene {
         // Peaks OpenStreetMap has no elevation for take the terrain's. Then give blunted
         // summits their real tips before drawing skylines from them.
         let peaks = terrain.fillElevations(peaks)
         terrain.raiseSummits(peaks)
         let renderer = HorizonRenderer(terrain: terrain)
-        let observer = renderer.observer(latitude: latitude, longitude: longitude)
+        let observer = renderer.observer(latitude: latitude, longitude: longitude, accuracy: accuracy)
         var settings = HorizonSettings()
         settings.maxDistance = radius
         let horizon = renderer.render(from: observer, settings: settings)

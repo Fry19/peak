@@ -26,7 +26,7 @@ struct RootView: View {
                         Button {
                             model.setZoom(1)
                         } label: {
-                            Text(String(format: "%.1f×", model.zoom))
+                            Text(Format.zoom(model.zoom))
                                 .font(.system(size: 13, weight: .semibold))
                                 .monospacedDigit()
                                 .foregroundStyle(.white)
@@ -34,8 +34,9 @@ struct RootView: View {
                                 .padding(.vertical, 6)
                                 .background(.ultraThinMaterial, in: Capsule())
                                 .environment(\.colorScheme, .dark)
+                                .tapArea(minWidth: 64, minHeight: 44)
                         }
-                        .accessibilityLabel("Zoomed \(String(format: "%.1f", model.zoom)) times; tap to zoom out")
+                        .accessibilityLabel("Zoomed \(Format.decimal(model.zoom)) times; tap to zoom out")
                     }
                     if model.settings.showDiagnostics {
                         DebugPanel(model: model)
@@ -47,7 +48,7 @@ struct RootView: View {
                 Spacer()
                 VStack(spacing: 10) {
                     HStack(alignment: .center, spacing: 10) {
-                        if !model.aligning {
+                        if showsBarButtons {
                             RoundButton(systemImage: "list.bullet", label: "Peaks") { model.sheet = .list }
                         }
                         StatusPill(model: model)
@@ -56,7 +57,8 @@ struct RootView: View {
                             RoundButton(systemImage: "square.and.arrow.up", label: "Save or share this view") {
                                 model.capturePausedView()
                             }
-                        } else if !model.aligning {
+                            RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
+                        } else if showsBarButtons {
                             RoundButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right", label: "Line up by hand") {
                                 model.startAligning()
                             }
@@ -94,6 +96,40 @@ struct RootView: View {
             PhotoView(model: model, photo: photo)
         }
     }
+
+    /// The peak list, lining up and settings sit beside the pill once the view is working;
+    /// while something's wrong, the pill's message gets the whole width.
+    private var showsBarButtons: Bool {
+        guard !model.aligning else { return false }
+        if model.frozen != nil { return true }
+        if case .ready = model.status { return true }
+        return false
+    }
+}
+
+extension View {
+    /// Grows where a tap lands to at least the given size, centered, without changing the
+    /// layout or the look.
+    func tapArea(minWidth: CGFloat = 44, minHeight: CGFloat = 44) -> some View {
+        modifier(TapArea(minWidth: minWidth, minHeight: minHeight))
+    }
+}
+
+private struct TapArea: ViewModifier {
+    let minWidth: CGFloat
+    let minHeight: CGFloat
+    @State private var size = CGSize.zero
+
+    func body(content: Content) -> some View {
+        let dx = max(0, (minWidth - size.width) / 2), dy = max(0, (minHeight - size.height) / 2)
+        content
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
+            .padding(.horizontal, dx)
+            .padding(.vertical, dy)
+            .contentShape(Rectangle())
+            .padding(.horizontal, -dx)
+            .padding(.vertical, -dy)
+    }
 }
 
 /// What a sheet shows, with its own navigation.
@@ -108,6 +144,8 @@ private struct SheetContent: View {
                 PeakDetailView(model: model, peakID: id)
                     .navigationDestination(for: TrailLink.self) { TrailDetailView(model: model, link: $0) }
             }
+            // Tapping another label swaps the card's content in place; the sheet stays up.
+            .id(id)
             .presentationDetents([.medium, .large])
             .presentationBackgroundInteraction(.enabled(upThrough: .medium))
             .presentationBackground(.regularMaterial)
@@ -210,6 +248,7 @@ private struct TrailChip: View {
                     .frame(width: 28, height: 28)
                     .background(xRay ? AnyShapeStyle(Color(red: 1, green: 0.72, blue: 0.28)) : AnyShapeStyle(.white.opacity(0.15)),
                                 in: Circle())
+                    .tapArea()
             }
             .accessibilityLabel("See through the ridges")
             .accessibilityValue(xRay ? "On" : "Off")
@@ -220,6 +259,7 @@ private struct TrailChip: View {
                     .font(.system(size: 12, weight: .semibold))
                     .frame(width: 28, height: 28)
                     .background(.white.opacity(0.15), in: Circle())
+                    .tapArea()
             }
             .accessibilityLabel("See the trail from above")
             Button {
@@ -229,6 +269,7 @@ private struct TrailChip: View {
                     .font(.system(size: 12, weight: .bold))
                     .frame(width: 28, height: 28)
                     .background(.white.opacity(0.15), in: Circle())
+                    .tapArea()
             }
             .accessibilityLabel("Stop showing the trail")
         }

@@ -52,6 +52,8 @@ final class PhotoImportTests: XCTestCase {
         XCTAssertEqual(camera.intrinsics.horizontalFOV, 67.3, accuracy: 0.2)
         XCTAssertEqual(camera.intrinsics.fx, camera.intrinsics.fy)
         XCTAssertEqual(camera.intrinsics.cx, 2016)
+        XCTAssertEqual(camera.positionError, 4.8)
+        XCTAssertEqual(camera.alignmentSettings.positionUncertainty, 5)   // never under the floor
     }
 
     func testSouthAndWestAreNegative() throws {
@@ -137,6 +139,7 @@ final class PhotoImportTests: XCTestCase {
         let m = try XCTUnwrap(PhotoMetadata(properties: p))
         XCTAssertNil(m.latitude)
         XCTAssertNil(m.heading)
+        XCTAssertNil(m.positionError)
         XCTAssertThrowsError(try PhotoCamera(m)) { XCTAssertEqual($0 as? PhotoCamera.Problem, .noLocation) }
 
         // 0, 0 is how some apps say "unknown".

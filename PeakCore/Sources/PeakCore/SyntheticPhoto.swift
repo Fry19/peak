@@ -19,11 +19,62 @@ public struct SyntheticScene: Sendable {
     public init() {}
 }
 
+/// How a real phone camera departs from a perfect pinhole: what is left of the lens's
+/// distortion after the phone corrects it, and rolling shutter (rows read top to bottom
+/// while the phone turns).
+public struct CameraRealism: Sendable, Equatable {
+    /// Radial distortion: a point `r` from the center (in focal lengths) appears at
+    /// r·(1 + k1·r²). Positive is pincushion, negative barrel. A few thousandths is typical
+    /// of what remains in a phone's corrected picture.
+    public var k1 = 0.0
+    /// How far the heading turns while the frame is read out, degrees from the top row to
+    /// the bottom one (positive turns right). The middle row has the camera's attitude.
+    public var rollingShutter = 0.0
+
+    public init(k1: Double = 0, rollingShutter: Double = 0) {
+        self.k1 = k1
+        self.rollingShutter = rollingShutter
+    }
+
+    public var isPinhole: Bool { k1 == 0 && rollingShutter == 0 }
+
+    /// Where a pinhole pixel appears in the distorted picture.
+    public func distort(x: Double, y: Double, _ k: CameraIntrinsics) -> (x: Double, y: Double) {
+        let u = (x - k.cx) / k.fx, v = (y - k.cy) / k.fy
+        let s = 1 + k1 * (u * u + v * v)
+        return (k.cx + k.fx * u * s, k.cy + k.fy * v * s)
+    }
+
+    /// The pinhole pixel that appears at a pixel of the distorted picture.
+    public func undistort(x: Double, y: Double, _ k: CameraIntrinsics) -> (x: Double, y: Double) {
+        let ud = (x - k.cx) / k.fx, vd = (y - k.cy) / k.fy
+        var u = ud, v = vd
+        for _ in 0..<8 {
+            let s = 1 + k1 * (u * u + v * v)
+            u = ud / s
+            v = vd / s
+        }
+        return (k.cx + k.fx * u, k.cy + k.fy * v)
+    }
+
+    /// The camera's heading when row `y` was read, degrees.
+    public func heading(row y: Double, _ camera: Camera) -> Double {
+        camera.attitude.heading + rollingShutter * (y / Double(camera.intrinsics.height) - 0.5)
+    }
+}
+
 public enum SyntheticPhoto {
-    public static func render(_ horizon: HorizonProfile, camera: Camera, scene: SyntheticScene = SyntheticScene()) -> RGBImage {
+    public static func render(_ horizon: HorizonProfile, camera: Camera, scene: SyntheticScene = SyntheticScene(),
+                              realism: CameraRealism = CameraRealism()) -> RGBImage {
         let k = camera.intrinsics
         let w = k.width, h = k.height
-        let projector = camera.projector
+        let pinhole = camera.projector
+        // With rolling shutter, each row has its own heading.
+        let rowProjectors: [Camera.Projector] = realism.rollingShutter == 0 ? [] : (0..<h).map { y in
+            var a = camera.attitude
+            a.heading = realism.heading(row: Double(y) + 0.5, camera)
+            return Camera(intrinsics: k, attitude: a).projector
+        }
         var image = RGBImage(width: w, height: h)
         var rng = SplitMix64(seed: scene.seed)
         let noiseSeed = rng.next()
@@ -33,7 +84,13 @@ public enum SyntheticPhoto {
 
         for y in 0..<h {
             for x in 0..<w {
-                let look = projector.look(x: Double(x) + 0.5, y: Double(y) + 0.5)
+                let look: (azimuth: Double, elevation: Double)
+                if realism.isPinhole {
+                    look = pinhole.look(x: Double(x) + 0.5, y: Double(y) + 0.5)
+                } else {
+                    let p = realism.undistort(x: Double(x) + 0.5, y: Double(y) + 0.5, k)
+                    look = (rowProjectors.isEmpty ? pinhole : rowProjectors[y]).look(x: p.x, y: p.y)
+                }
                 let skyline = horizon.elevation(atAzimuth: look.azimuth)
                 var c: SIMD3<Double>
                 if look.elevation > skyline {

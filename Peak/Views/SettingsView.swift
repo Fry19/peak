@@ -27,6 +27,7 @@ struct SettingsView: View {
                 }
                 Toggle("Ridges in front of the skyline", isOn: $model.settings.showRidges)
                 Toggle("Tick when a peak crosses the middle", isOn: $model.settings.haptics)
+                Toggle("Today's sun path", isOn: $model.settings.showSunPath)
             }
 
             Section {

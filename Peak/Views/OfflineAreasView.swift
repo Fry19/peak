@@ -107,7 +107,11 @@ struct SaveAreaView: View {
 
     @State private var position: MapCameraPosition
     @State private var center: CLLocationCoordinate2D
-    @State private var radiusKm = 25.0
+    /// The circle's radius, meters: a round number of kilometers or miles.
+    @State private var radius: Double
+    /// How many points a meter is on the map now, for the scale bar.
+    @State private var pointsPerMeter: Double?
+    @State private var mapWidth = 0.0
     @State private var name = ""
     /// The name was typed or came from a search, so the map moving doesn't replace it.
     @State private var nameChosen = false
@@ -121,6 +125,7 @@ struct SaveAreaView: View {
         let start = model.location?.coordinate ?? CLLocationCoordinate2D(latitude: 39.5, longitude: -98.35)
         let span = model.location == nil ? 3_000_000.0 : 25_000 * 2.8
         _center = State(initialValue: start)
+        _radius = State(initialValue: model.settings.units == .metric ? 25_000 : 15 * 1_609.344)
         _position = State(initialValue: .region(MKCoordinateRegion(center: start, latitudinalMeters: span, longitudinalMeters: span)))
     }
 
@@ -132,7 +137,7 @@ struct SaveAreaView: View {
                         .foregroundStyle(.white.opacity(0.12))
                         .stroke(.white.opacity(0.6), lineWidth: 1)
                 }
-                MapCircle(center: center, radius: radiusKm * 1000)
+                MapCircle(center: center, radius: radius)
                     .foregroundStyle(Color.accentColor.opacity(0.18))
                     .stroke(Color.accentColor, lineWidth: 2)
                 UserAnnotation()
@@ -141,10 +146,21 @@ struct SaveAreaView: View {
             .mapControls {
                 MapUserLocationButton()
                 MapCompass()
-                MapScaleView()
             }
+            .onGeometryChange(for: Double.self) { $0.size.width } action: { mapWidth = $0 }
             .onMapCameraChange(frequency: .continuous) { context in
                 center = context.region.center
+                // MapKit's own scale follows the phone's region; this one follows the app's units.
+                let across = context.region.span.longitudeDelta * 111_320 * cos(context.region.center.latitude * .pi / 180)
+                pointsPerMeter = across > 0 && mapWidth > 0 ? mapWidth / across : nil
+            }
+            .overlay(alignment: .topLeading) {
+                if let pointsPerMeter {
+                    ScaleBar(pointsPerMeter: pointsPerMeter, units: model.settings.units)
+                        .shadow(color: .black.opacity(0.6), radius: 1)
+                        .padding(12)
+                        .allowsHitTesting(false)
+                }
             }
             .onMapCameraChange(frequency: .onEnd) { context in
                 nameFromMap(context.region.center)
@@ -181,15 +197,15 @@ struct SaveAreaView: View {
     }
 
     private var panel: some View {
-        let estimate = OfflineArea.estimatedBytes(latitude: center.latitude, longitude: center.longitude, radius: radiusKm * 1000)
+        let estimate = OfflineArea.estimatedBytes(latitude: center.latitude, longitude: center.longitude, radius: radius)
         return VStack(alignment: .leading, spacing: 14) {
             TextField("Name", text: Binding(get: { name }, set: { name = $0; nameChosen = true }))
                 .font(.headline)
                 .textFieldStyle(.roundedBorder)
             HStack {
                 Text("Radius")
-                Slider(value: $radiusKm, in: 5...50, step: 5)
-                Text(Format.distance(radiusKm * 1000, model.settings.units))
+                Slider(value: radiusSteps, in: model.settings.units == .metric ? 5...50 : 5...30, step: 5)
+                Text(Format.distance(radius, model.settings.units))
                     .monospacedDigit()
                     .frame(minWidth: 56, alignment: .trailing)
             }
@@ -207,24 +223,30 @@ struct SaveAreaView: View {
         }
         .padding()
         .background(.regularMaterial)
-        .onChange(of: radiusKm) {
+        .onChange(of: radius) {
             // Keep the whole circle in view.
-            let span = radiusKm * 1000 * 2.8
+            let span = radius * 2.8
             withAnimation { position = .region(MKCoordinateRegion(center: center, latitudinalMeters: span, longitudinalMeters: span)) }
         }
+    }
+
+    /// The slider's value: the radius in kilometers or miles, as the app's units say.
+    private var radiusSteps: Binding<Double> {
+        let unit = model.settings.units == .metric ? 1_000.0 : 1_609.344
+        return Binding(get: { (radius / unit).rounded() }, set: { radius = $0 * unit })
     }
 
     private func save() {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let title = trimmed.isEmpty ? String(format: "%.3f, %.3f", center.latitude, center.longitude) : trimmed
-        model.saveArea(name: title, latitude: center.latitude, longitude: center.longitude, radius: radiusKm * 1000)
+        model.saveArea(name: title, latitude: center.latitude, longitude: center.longitude, radius: radius)
         dismiss()
     }
 
     private func pick(_ item: MKMapItem) {
         let coordinate = item.placemark.coordinate
         center = coordinate
-        let span = radiusKm * 1000 * 2.8
+        let span = radius * 2.8
         position = .region(MKCoordinateRegion(center: coordinate, latitudinalMeters: span, longitudinalMeters: span))
         name = item.name ?? name
         nameChosen = true

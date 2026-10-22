@@ -126,9 +126,13 @@ public struct PhotoCamera: Sendable, Equatable {
 
     /// The 35 mm equivalent assumed when the photo doesn't say: an iPhone's main camera.
     public static let defaultFocalLength35mm = 26.0
+    public static let typicalPositionError = 10.0
 
     public var latitude: Double
     public var longitude: Double
+    /// How far off the position may be, meters: the GPS error the camera wrote, or a
+    /// typical phone fix's when it didn't.
+    public var positionError: Double
     /// For the upright picture at full size.
     public var intrinsics: CameraIntrinsics
     /// Heading from true north (0 when unknown, see `hasHeading`); pitch and roll 0: the
@@ -146,6 +150,7 @@ public struct PhotoCamera: Sendable, Equatable {
         guard let lat = metadata.latitude, let lon = metadata.longitude else { throw Problem.noLocation }
         latitude = lat
         longitude = lon
+        positionError = metadata.positionError.flatMap { $0 > 0 ? $0 : nil } ?? Self.typicalPositionError
         date = metadata.date
         let (w, h) = metadata.uprightSize
         let f35 = metadata.focalLength35mm ?? Self.defaultFocalLength35mm
@@ -177,6 +182,7 @@ public struct PhotoCamera: Sendable, Equatable {
     /// for the lens when it's a guess, and a little wider for a magnetic heading.
     public var alignmentSettings: AlignmentSettings {
         var s = AlignmentSettings.photo
+        s.positionUncertainty = LocationQuality.positionUncertainty(accuracy: positionError, moved: 0)
         if focalLengthIsGuessed {
             s.refineFieldOfView = true
             s.fieldOfViewSigma = 0.1

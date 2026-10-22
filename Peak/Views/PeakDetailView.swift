@@ -54,14 +54,21 @@ struct PeakDetailView: View {
                 .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 4, trailing: 4))
 
                 if let url = facts?.pictureURL {
-                    AsyncImage(url: url) { image in
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    } placeholder: {
-                        Rectangle().fill(.white.opacity(0.06))
+                    // A photo that doesn't load leaves no empty box behind.
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case let .success(image):
+                            image.resizable().aspectRatio(contentMode: .fill)
+                                .frame(height: 180)
+                                .frame(maxWidth: .infinity)
+                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                        case .failure:
+                            EmptyView()
+                        default:
+                            RoundedRectangle(cornerRadius: 14).fill(.white.opacity(0.06))
+                                .frame(height: 180)
+                        }
                     }
-                    .frame(height: 180)
-                    .frame(maxWidth: .infinity)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 }
@@ -85,6 +92,10 @@ struct PeakDetailView: View {
                 .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             }
 
+            Section {
+                PeakSunRow(model: model, peak: peak)
+            }
+
             if let summary = facts?.summary {
                 Section("About") {
                     Text(summary)
@@ -102,7 +113,7 @@ struct PeakDetailView: View {
             } header: {
                 Text("Hikes nearby")
             } footer: {
-                Text("Trails from OpenStreetMap within 5 km of the summit. Climbs and lengths come from the terrain model; check conditions before you go.")
+                Text("Trails from OpenStreetMap within \(Format.distance(DataStore.hikeRadius, units)) of the summit. Climbs and lengths come from the terrain model; check conditions before you go.")
             }
 
             Section {
@@ -130,7 +141,9 @@ struct PeakDetailView: View {
             stats.append(Stat(title: "Bearing", value: Format.bearing(view.azimuth)))
         }
         if let observer = scene?.observer {
-            stats.append(Stat(title: place != nil ? "Above the photo spot" : "Above you", value: Format.climb(peak.elevation - observer.height, units)))
+            let above = peak.elevation - observer.height
+            let title = place != nil ? (above >= 0 ? "Above the photo spot" : "Below the photo spot") : (above >= 0 ? "Above you" : "Below you")
+            stats.append(Stat(title: title, value: Format.elevation(abs(above), units)))
         }
         if let range = facts?.range { stats.append(Stat(title: "Range", value: range)) }
         if let year = facts?.firstAscentYear { stats.append(Stat(title: "First ascent", value: String(year))) }

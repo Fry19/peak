@@ -64,6 +64,16 @@ public enum LocationQuality {
         accuracy >= 0 && accuracy < (precise ? 2_000 : 10_000)
     }
 
+    /// How far the viewer may be from where the view was built, meters, for skyline
+    /// matching (`AlignmentSettings.positionUncertainty`): the current fix's accuracy plus
+    /// how far it is from the spot the view was built for, since the view is only rebuilt
+    /// after moving some way. Never under `minUncertainty`, as fixes claim more than they have.
+    public static func positionUncertainty(accuracy: Double, moved: Double) -> Double {
+        max(minUncertainty, (accuracy >= 0 ? accuracy : matchingAccuracy) + max(0, moved))
+    }
+
+    public static let minUncertainty = 5.0
+
     /// Whether to rebuild the view for a new fix, given the accuracy the view was built
     /// with and how far the new fix is from where it was built: when the fix is much
     /// better or good enough for matching where the view's wasn't, or when you've moved

@@ -141,7 +141,8 @@ final class LabeledPhoto: Identifiable {
         }
         self.photoCamera = photoCamera
         do {
-            let place = try await model.scene(latitude: photoCamera.latitude, longitude: photoCamera.longitude) { [weak self] step in
+            let place = try await model.scene(latitude: photoCamera.latitude, longitude: photoCamera.longitude,
+                                               accuracy: photoCamera.positionError) { [weak self] step in
                 self?.stage = .loading(step)
             }
             scene = place.scene
