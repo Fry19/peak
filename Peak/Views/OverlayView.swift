@@ -911,10 +911,17 @@ final class OverlayCanvas: UIView {
         }
 
         summitPoints = points
+        var thresholds = LabelLayout.Thresholds().scaled(forZoom: model.zoom)
+        // From above, hundreds of summits come into sight along the ridges: the best of them
+        // keep their dots, well apart, and zooming in brings more. From the ground, nearer
+        // ridges hide all but a few, and every dot is a summit in sight.
+        if model.risenView != nil {
+            thresholds.dotSpacing = 20
+            thresholds.keepDotSpacing = 14
+        }
         let layout = LabelLayout(bounds: Self.screenRect(bounds), keepClear: clearRects.map(Self.screenRect),
-                                 upX: Double(worldUp.x), upY: Double(worldUp.y), limit: limit,
-                                 thresholds: LabelLayout.Thresholds().scaled(forZoom: model.zoom))
-        let result = layout.place(candidates, previous: labeled)
+                                 upX: Double(worldUp.x), upY: Double(worldUp.y), limit: limit, thresholds: thresholds)
+        let result = layout.place(candidates, previous: labeled, previousDots: Set(dots.map(\.id)))
         labeled = result.labeled
 
         // Label layers: each labeled peak's fades in, the rest fade out where they are.

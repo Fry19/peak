@@ -118,6 +118,13 @@ public struct LabelLayout: Sendable {
         public var stickiness = 0.4
         /// A dot this close to a labeled peak's dot is left out.
         public var dotClearance = 10.0
+        /// A dot nearer than this to a labeled peak's dot or a better-ranked peak's dot is
+        /// left out, points; 0 keeps them all. Seen from above, hundreds of summits crowd
+        /// along the ridges.
+        public var dotSpacing = 0.0
+        /// Two dots both shown last frame need only this between them, so that the stretch
+        /// toward the edges of the view, as the phone turns, doesn't make them blink.
+        public var keepDotSpacing = 0.0
         /// The selected peak's label keeps this far inside the edges.
         public var selectedMargin = 8.0
         /// Other peaks' labels go below their dots, where given, when there's no room above
@@ -140,7 +147,8 @@ public struct LabelLayout: Sendable {
         /// Where the selected peak's label goes, or nil if its dot isn't on screen (or it
         /// wasn't a candidate): then it needs an arrow at the edge instead.
         public var selected: Placement?
-        /// The other peaks in view, which get only a dot.
+        /// The other peaks in view, which get only a dot (as far apart as `dotSpacing` asks,
+        /// best first).
         public var dots: [Int64]
 
         public var labeled: Set<Int64> { Set(labels) }
@@ -177,7 +185,10 @@ public struct LabelLayout: Sendable {
 
     /// Labels the selected peak, then the rest by rank (with those shown last frame,
     /// `previous`, ranked up), each only where it fits and doesn't crowd one placed before.
-    public func place(_ candidates: [Candidate], previous: Set<Int64>, previousBelow: Set<Int64> = []) -> Result {
+    /// The rest get dots, spaced apart by rank when `dotSpacing` asks, with last frame's
+    /// (`previousDots`) ranked up.
+    public func place(_ candidates: [Candidate], previous: Set<Int64>, previousBelow: Set<Int64> = [],
+                      previousDots: Set<Int64> = []) -> Result {
         let t = thresholds
         var placed: [(id: Int64, x: Double, y: Double, box: LabelBox)] = []
         var result = Result(labels: [], selected: nil, dots: [])
@@ -230,9 +241,35 @@ public struct LabelLayout: Sendable {
                 unlabeled.append(c)
             }
         }
-        result.dots = unlabeled.filter { c in
+        let dots = unlabeled.filter { c in
             placed.allSatisfy { abs($0.x - c.x) > t.dotClearance || abs($0.y - c.y) > t.dotClearance }
-        }.map(\.id)
+        }
+        result.dots = t.dotSpacing > 0 ? spaced(dots, labels: placed.map { ($0.id, $0.x, $0.y) },
+                                                 previous: previous.union(previousDots)) : dots.map(\.id)
+        return result
+    }
+
+    /// The dots kept `dotSpacing` apart from each other and from the labels' dots, best
+    /// first; those shown last frame (as dots or labels) are ranked up, and two of them need
+    /// only `keepDotSpacing`.
+    private func spaced(_ dots: [Candidate], labels: [(id: Int64, x: Double, y: Double)], previous: Set<Int64>) -> [Int64] {
+        let t = thresholds
+        func rank(_ c: Candidate) -> Double { c.score + (previous.contains(c.id) ? t.stickiness : 0) }
+        let order = dots.sorted { a, b in rank(a) != rank(b) ? rank(a) > rank(b) : a.id < b.id }
+        var kept = labels
+        var result: [Int64] = []
+        for c in order {
+            let shown = previous.contains(c.id)
+            let clear = kept.allSatisfy { k in
+                let spacing = shown && previous.contains(k.id) ? t.keepDotSpacing : t.dotSpacing
+                let dx = k.x - c.x, dy = k.y - c.y
+                return dx * dx + dy * dy >= spacing * spacing
+            }
+            if clear {
+                kept.append((c.id, c.x, c.y))
+                result.append(c.id)
+            }
+        }
         return result
     }
 
