@@ -2,25 +2,30 @@ import Foundation
 import PeakCore
 import UIKit
 
-/// Seeing over the ridges: while the rise button is held, the view is drawn from above where
-/// you stand, a step higher every moment (100 m, 300 m, 1 km, or 300, 1,000 and 3,000 ft),
-/// over a plain night sky instead of the camera picture, which can't come up too. Letting go
-/// brings it back down. The views from above are built one after another on the first press
-/// and kept until the live view changes; the live view itself, which skyline matching, the
-/// cards and the trails use, stays on the ground throughout.
+/// Seeing over the ridges: a tap on the rise button draws the view from above where you
+/// stand (100 m, 300 m, 1 km or 3 km, or 300, 1,000, 3,000 or 10,000 ft, the one chosen last,
+/// at first the second), over a plain night sky instead of the camera picture, which can't
+/// come up too, and it stays up until the button is tapped again. The views from above are
+/// built one after another, the chosen one first, and kept until the live view changes; the
+/// live view itself, which skyline matching, the cards and the trails use, stays on the
+/// ground throughout.
 extension AppModel {
     /// What the rise button shows.
     struct Rise: Equatable {
-        /// Held down, or turned on with VoiceOver.
-        var holding = false
+        /// Turned on: up, or on the way, until it's turned off.
+        var isUp = false
+        /// The height chosen, 1 up to `riseHeights.count` (0 on the way down), on screen once
+        /// its view is built.
+        var target = 0
         /// The height on screen: 0 on the ground, else 1 up to `riseHeights.count`.
         var level = 0
         /// Its height above your eye, meters.
         var height = 0.0
         /// Peaks in sight from up there that are hidden from the ground.
         var revealed = 0
-        /// Held, and waiting for a view from above to be built.
-        var pending = false
+
+        /// Away from the height chosen: waiting for its view to be built, or stepping to it.
+        var pending: Bool { isUp && level != target }
     }
 
     /// One view from above.
@@ -54,8 +59,8 @@ extension AppModel {
         var staleMeshes: [RiseMesh] = []
         /// The live view (`sceneGeneration`) `views` are seen from.
         var generation = -1
-        /// The height to climb to: 1 at first, one more each `dwell` while held.
-        var target = 0
+        /// The height the next tap goes up to: the one chosen last.
+        var chosen = 2
         var build: Task<Void, Never>?
         var motion: Task<Void, Never>?
         let haptics = UIImpactFeedbackGenerator(style: .soft)
@@ -72,13 +77,15 @@ extension AppModel {
         }
     }
 
-    /// Heights above your eye, meters: round numbers in the units you read.
+    /// Heights above your eye, meters: round numbers in the units you read. The terrain
+    /// reaches 80 km, so from the highest it fades into haze about 2.5° below level, where
+    /// mountains farther out would stand.
     static func riseHeights(_ units: AppSettings.Units) -> [Double] {
-        units == .metric ? [100, 300, 1_000] : [300, 1_000, 3_000].map { $0 * 0.3048 }
+        units == .metric ? [100, 300, 1_000, 3_000] : [300, 1_000, 3_000, 10_000].map { $0 * 0.3048 }
     }
 
-    /// How long each height is held before the next, seconds.
-    private static let dwell = 0.8
+    /// How long the view rests at each height it passes on the way, seconds.
+    private static let step = 0.09
 
     /// The rise button shows once the view is fully working: the peaks are in, and the pill
     /// has nothing to add (coarse terrain, an approximate location). Short of that there's
@@ -108,42 +115,51 @@ extension AppModel {
         risenView?.scene ?? scene
     }
 
-    /// The rise button pressed or let go. Held, the view climbs a step at a time; let go, it
-    /// comes down a step at a time.
-    func setRising(_ holding: Bool) {
-        if holding { startRising(climbing: true) } else { stopRising() }
+    /// The rise button: up to the height chosen last, or back down to the camera.
+    func toggleRising() {
+        if rise.isUp { comeDown() } else { chooseRiseLevel(riseWork.chosen) }
     }
 
-    /// VoiceOver's activation: up one step and staying there, or back down.
-    func toggleRising() {
-        if rise.holding { stopRising() } else { startRising(climbing: false) }
+    /// Up (or down) to height `level`, 1 up to `riseHeights.count`, and staying there.
+    func chooseRiseLevel(_ level: Int) {
+        let level = max(1, min(Self.riseHeights(settings.units).count, level))
+        if !rise.isUp {
+            guard canRise else { return }
+            rise.isUp = true
+            if settings.haptics { riseWork.haptics.prepare() }
+        }
+        riseWork.chosen = level
+        rise.target = level
+        buildRisenViews()
+        moveToTarget()
     }
 
     /// VoiceOver's adjustable action: one step up or down; below the first, back on the ground.
     func adjustRise(by steps: Int) {
-        guard rise.holding else {
-            if steps > 0 { startRising(climbing: false) }
+        guard rise.isUp else {
+            if steps > 0 { chooseRiseLevel(1) }
             return
         }
-        riseWork.target = max(0, min(riseWork.heights.count, riseWork.target + steps))
-        if riseWork.target == 0 { stopRising() } else { showRiseLevel() }
+        let target = rise.target + steps
+        if target < 1 { comeDown() } else { chooseRiseLevel(target) }
     }
 
     /// Straight back to the ground, for what needs the live view: pausing it, a sheet, a
     /// picture or map over it, lining up, or leaving the app.
     func land() {
-        guard rise.holding || rise.level > 0 else { return }
-        rise.holding = false
+        guard rise.isUp || rise.level > 0 else { return }
+        rise.isUp = false
+        rise.target = 0
         riseWork.motion?.cancel()
         riseWork.motion = nil
         setRiseLevel(0)
     }
 
-    /// The live view changed: its views from above are out of date. While risen they're built
+    /// The live view changed: its views from above are out of date. While up they're built
     /// again, the old ones shown meanwhile; otherwise they're let go.
     func riseSceneChanged() {
         sceneGeneration += 1
-        if scene != nil, rise.holding {
+        if scene != nil, rise.isUp {
             buildRisenViews()
         } else {
             land()
@@ -162,64 +178,45 @@ extension AppModel {
         riseWork.generation = -1
     }
 
-    private func startRising(climbing: Bool) {
-        guard canRise, !rise.holding else { return }
-        rise.holding = true
-        riseWork.target = 0
-        buildRisenViews()
-        if settings.haptics { riseWork.haptics.prepare() }
-        riseWork.motion?.cancel()
-        riseWork.motion = Task { @MainActor [weak self] in
-            // A tap is too short to go up: it only says to hold.
-            try? await Task.sleep(for: .milliseconds(200))
-            guard !Task.isCancelled, let self, self.rise.holding else { return }
-            self.riseWork.target = max(self.riseWork.target, 1)
-            self.showRiseLevel()
-            // Climbing: a step more each `dwell` once the last one is on screen. Views from
-            // above show themselves as they're built.
-            while climbing, !Task.isCancelled, self.rise.holding, self.riseWork.target < self.riseWork.heights.count {
-                if self.rise.level >= self.riseWork.target {
-                    try? await Task.sleep(for: .seconds(Self.dwell))
-                    guard !Task.isCancelled, self.rise.holding else { return }
-                    self.riseWork.target += 1
-                    self.showRiseLevel()
-                } else {
-                    // Waiting for the next view to be built.
-                    try? await Task.sleep(for: .milliseconds(50))
-                }
-            }
-        }
-    }
-
-    private func stopRising() {
-        guard rise.holding else { return }
+    /// Back down to the camera through the heights below, quickly.
+    private func comeDown() {
+        guard rise.isUp else { return }
         // Avoid a quick series of depth changes for people who reduce motion.
         if UIAccessibility.isReduceMotionEnabled {
             land()
             return
         }
-        rise.holding = false
-        setRiseLevel(rise.level)
+        rise.isUp = false
+        rise.target = 0
+        moveToTarget()
+    }
+
+    /// Steps the view to the height chosen through the heights built in between, a moment
+    /// at each, or (with Reduce Motion) straight to it. Short of a view still being built, it
+    /// stops as near as it can, and the build moves it on when the view is in.
+    private func moveToTarget() {
         riseWork.motion?.cancel()
-        // Down through the heights below, quickly.
+        riseWork.motion = nil
+        guard !UIAccessibility.isReduceMotionEnabled else {
+            setRiseLevel((0...rise.target).last { $0 == 0 || riseWork.view($0 - 1) != nil } ?? 0)
+            return
+        }
         riseWork.motion = Task { @MainActor [weak self] in
-            while let self, !Task.isCancelled, !self.rise.holding, self.rise.level > 0 {
-                self.setRiseLevel(self.rise.level - 1)
-                try? await Task.sleep(for: .milliseconds(90))
+            while let self, !Task.isCancelled {
+                let level = self.rise.level, target = self.rise.target
+                let next = target > level
+                    ? (level + 1...target).first { self.riseWork.view($0 - 1) != nil }
+                    : (target..<level).last { $0 == 0 || self.riseWork.view($0 - 1) != nil }
+                guard let next, next != level else { return }
+                self.setRiseLevel(next)
+                try? await Task.sleep(for: .seconds(Self.step))
             }
         }
     }
 
-    /// Up to the target, or as near as the views built so far allow.
-    private func showRiseLevel() {
-        var level = 0
-        while level < riseWork.target, riseWork.view(level) != nil { level += 1 }
-        setRiseLevel(level)
-    }
-
     private func setRiseLevel(_ level: Int) {
         let up = level > rise.level
-        var next = Rise(holding: rise.holding, level: level, pending: rise.holding && riseWork.target > level)
+        var next = Rise(isUp: rise.isUp, target: rise.target, level: level)
         if level > 0, let view = riseWork.view(level - 1) {
             next.height = view.height
             next.revealed = view.revealed.count
@@ -232,8 +229,8 @@ extension AppModel {
         screen?.overlay.setNeedsUpdate()
     }
 
-    /// Builds the views from above that the live view doesn't have yet, lowest first, off the
-    /// main thread. Built ones are kept for the next press.
+    /// Builds the views from above that the live view doesn't have yet, the height chosen
+    /// first and then the lowest, off the main thread. Built ones are kept for the next tap.
     private func buildRisenViews() {
         guard let scene else { return }
         let heights = Self.riseHeights(settings.units)
@@ -262,9 +259,10 @@ extension AppModel {
                 self.riseWork.mesh = RiseMesh(mesh: mesh, generation: generation, seconds: Date().timeIntervalSince(started))
                 self.screen?.overlay.setNeedsUpdate()
             }
-            for (i, height) in heights.enumerated() {
-                guard let self, !Task.isCancelled, self.riseWork.generation == generation else { return }
-                if self.riseWork.views[i] != nil { continue }
+            while let self, !Task.isCancelled, self.riseWork.generation == generation {
+                let missing = self.riseWork.views.indices.filter { self.riseWork.views[$0] == nil }
+                guard let i = missing.contains(self.rise.target - 1) ? self.rise.target - 1 : missing.first else { break }
+                let height = heights[i]
                 let started = Date()
                 let view = await Task.detached(priority: .userInitiated) {
                     let up = scene.risen(by: height)
@@ -280,7 +278,12 @@ extension AppModel {
                 self.riseWork.views[i] = built
                 if i < self.riseWork.stale.count { self.riseWork.stale[i] = nil }
                 // Not on the way down: that steps on by itself.
-                if self.rise.holding { self.showRiseLevel() }
+                if self.rise.pending {
+                    self.moveToTarget()
+                } else if self.rise.isUp {
+                    // The height on screen may have been the old view's: its count with it.
+                    self.setRiseLevel(self.rise.level)
+                }
             }
             if let self, self.riseWork.generation == generation {
                 self.riseWork.build = nil

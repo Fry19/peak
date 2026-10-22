@@ -12,7 +12,7 @@ final class PanoramaMeshTests: XCTestCase {
 
     /// Over flat ground, each vertex lies where `LocalFrame.look` (exact ellipsoid geometry
     /// plus refraction) sees that point on the ground, near and far, from the eye and from
-    /// a kilometer above it.
+    /// a kilometer and 10,000 ft (the highest view from above) over it.
     func testVerticesSitWhereTheGroundIsSeen() {
         let flat = TestTerrain.cones([], base: 0)
         let eye = GeoPoint(latitude: 46, longitude: 8, height: 300)
@@ -22,7 +22,7 @@ final class PanoramaMeshTests: XCTestCase {
         let mesh = PanoramaMesh.build(terrain: flat, from: eye, settings: settings)
         XCTAssertEqual(mesh.rays, 12)
         XCTAssertEqual(mesh.vertices.count, mesh.rays * mesh.rings.count + 1)
-        for lift in [0.0, 1_000] {
+        for lift in [0.0, 1_000, 3_048] {
             var risen = eye
             risen.height += lift
             let frame = LocalFrame(origin: risen)

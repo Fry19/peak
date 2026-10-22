@@ -11,8 +11,6 @@ struct RootView: View {
     /// Where the chips at the top and the controls at the bottom are, for labels to keep clear of.
     @State private var topControls = CGRect.zero
     @State private var bottomControls = CGRect.zero
-    /// A tap on the rise button: say to hold it.
-    @State private var riseHint = false
 
     /// The telephoto behind the picture, by its own zoom ("5×"), or nil on the wide lens.
     private var lensZoom: Double? {
@@ -33,8 +31,8 @@ struct RootView: View {
                 .ignoresSafeArea()
             VStack(spacing: 10) {
                 VStack(spacing: 10) {
-                    if RiseChip.isShown(model, hint: riseHint) {
-                        RiseChip(model: model, hint: riseHint)
+                    if RiseChip.isShown(model) {
+                        RiseChip(model: model)
                             .transition(.opacity)
                     }
                     if model.aligning {
@@ -64,15 +62,15 @@ struct RootView: View {
                             .padding(.horizontal, 10)
                     }
                 }
-                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: RiseChip.isShown(model, hint: riseHint))
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: RiseChip.isShown(model))
                 .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { topControls = $0 }
                 Spacer()
                 VStack(spacing: 10) {
-                    // Hold to see over the ridges: above the end of the bar, under the thumb, so
-                    // the pill keeps its room.
+                    // See over the ridges: above the end of the bar, under the thumb, so the pill
+                    // keeps its room.
                     VStack(alignment: .trailing, spacing: 10) {
                         if showsBarButtons, model.frozen == nil, model.offersRise {
-                            RiseButton(model: model, hint: $riseHint)
+                            RiseButton(model: model)
                         }
                         HStack(alignment: .center, spacing: 10) {
                             if showsBarButtons {

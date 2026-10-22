@@ -1,54 +1,35 @@
 import PeakCore
 import SwiftUI
 
-/// Hold to see over the ridges (`AppModel+Rise`): the view climbs while it's held, amber,
-/// and comes back down when it's let go. A tap only says to hold. With VoiceOver, it goes up
-/// one step and stays; swiping up or down changes the height.
+/// Tap to see over the ridges (`AppModel+Rise`): the view goes up to the height chosen last
+/// and stays there, the button amber, until it's tapped again. While up, the heights sit
+/// beside it, the chosen one amber with its unit, as the Camera app shows its zooms. With
+/// VoiceOver, swiping up or down on the button changes the height too.
 struct RiseButton: View {
     let model: AppModel
-    /// Says to hold, at the top of the screen.
-    @Binding var hint: Bool
-    @State private var pressing = false
-    @State private var pressedAt = Date.distantPast
-    @State private var hintTask: Task<Void, Never>?
 
     var body: some View {
-        let on = pressing || model.rise.holding
-        Image(systemName: "arrow.up.to.line")
-            .font(.system(size: 17, weight: .medium))
-            .foregroundStyle(on ? .black : .white)
-            .frame(width: 44, height: 44)
-            .background {
-                if on { Circle().fill(Color.amber) }
+        let up = model.rise.isUp
+        HStack(spacing: 10) {
+            if up {
+                RiseHeights(model: model)
+                    .transition(.opacity)
             }
-            .glassBackground(in: Circle())
-            .environment(\.colorScheme, .dark)
-            .contentShape(Circle())
-            // Never completes: only pressing and letting go (or the touch being taken away) count,
-            // and the finger may wander off the button while it's held.
-            .onLongPressGesture(minimumDuration: .infinity, maximumDistance: .infinity) {} onPressingChanged: { pressing in
-                self.pressing = pressing
-                if pressing {
-                    pressedAt = Date()
-                    showHint(false)
-                    model.setRising(true)
-                } else {
-                    // Let go before it went up: a tap.
-                    let tapped = Date().timeIntervalSince(pressedAt) < 0.35 && model.rise.level == 0
-                    model.setRising(false)
-                    if tapped { showHint(true) }
-                }
+            Button { model.toggleRising() } label: {
+                Image(systemName: up ? "arrow.down.to.line" : "arrow.up.to.line")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(up ? .black : .white)
+                    .frame(width: 44, height: 44)
+                    .background {
+                        if up { Circle().fill(Color.amber) }
+                    }
+                    .glassBackground(in: Circle())
+                    .environment(\.colorScheme, .dark)
+                    .contentShape(Circle())
             }
-            // Taken away while held (the view paused, a sheet): no let-go will come.
-            .onDisappear { if pressing || model.rise.holding { model.setRising(false) } }
-            .accessibilityElement()
-            .accessibilityLabel("See over the ridges")
-            .accessibilityAddTraits(.isButton)
+            .accessibilityLabel(up ? "Back down to the camera" : "See over the ridges")
             .accessibilityValue(value)
-            .accessibilityHint(model.rise.holding
-                ? "Activate to return to the camera. Swipe up or down to change the height."
-                : "Activate to rise and stay above the ridges. Swipe up or down to change the height.")
-            .accessibilityAction { model.toggleRising() }
+            .accessibilityHint("Swipe up or down to change the height.")
             .accessibilityAdjustableAction { direction in
                 switch direction {
                 case .increment: model.adjustRise(by: 1)
@@ -56,6 +37,9 @@ struct RiseButton: View {
                 @unknown default: break
                 }
             }
+        }
+        // Taken away while up (the peaks reloading, say): there'd be no way back down.
+        .onDisappear { model.land() }
     }
 
     private var value: String {
@@ -63,28 +47,48 @@ struct RiseButton: View {
         guard rise.level > 0 else { return rise.pending ? "Rising" : "On the ground" }
         return RiseChip.summary(rise, units: model.settings.units)
     }
+}
 
-    private func showHint(_ shown: Bool) {
-        hintTask?.cancel()
-        hint = shown
-        guard shown else { return }
-        hintTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(3))
-            if !Task.isCancelled { hint = false }
+/// The heights to see from, in a row: the chosen one amber with its unit, the others just
+/// their numbers.
+private struct RiseHeights: View {
+    let model: AppModel
+
+    var body: some View {
+        let units = model.settings.units
+        HStack(spacing: 0) {
+            ForEach(Array(AppModel.riseHeights(units).enumerated()), id: \.offset) { i, height in
+                let level = i + 1, chosen = model.rise.target == level
+                let text = chosen ? Format.elevation(height, units) : Format.elevationNumber(height, units)
+                Button { model.chooseRiseLevel(level) } label: {
+                    Text(text)
+                        .font(.system(size: 13, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(chosen ? Color.amber : .white)
+                        .padding(.horizontal, 9)
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Format.elevation(height, units) + " up")
+                .accessibilityAddTraits(chosen ? .isSelected : [])
+            }
         }
+        .padding(.horizontal, 4)
+        .glassBackground(in: Capsule())
+        .environment(\.colorScheme, .dark)
+        .animation(nil, value: model.rise.target)
     }
 }
 
 /// Over the top of the view while risen: how high, and how many more peaks are in sight
-/// from up there. Before the first view from above is in, that it's on its way; after a
-/// tap on the rise button, to hold it.
+/// from up there. Before the first view from above is in, that it's on its way.
 struct RiseChip: View {
     let model: AppModel
-    var hint = false
 
     /// Whether it has anything to say.
-    static func isShown(_ model: AppModel, hint: Bool) -> Bool {
-        model.rise.level > 0 || model.rise.pending || hint
+    static func isShown(_ model: AppModel) -> Bool {
+        model.rise.level > 0 || model.rise.pending
     }
 
     /// "300 m up · 12 more peaks around you": a count in every direction, not just on screen.
@@ -123,8 +127,6 @@ struct RiseChip: View {
         } else if rise.pending {
             ProgressView().controlSize(.small).tint(.white)
             Text("Rising…")
-        } else if hint {
-            Text("Hold to see over the ridges")
         }
     }
 }
