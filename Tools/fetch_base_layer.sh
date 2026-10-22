@@ -10,8 +10,8 @@
 # to a new release, and update TAG and SHA256 here.
 set -eu
 
-TAG="base-layer-2026-10"
-SHA256="f78f34df69de65729c16aeb4ece47c7195f0ca7eb471a259df01f3858581232e"
+TAG="base-layer-2026-10b"
+SHA256="26d1bfa88f0ba1cc8a872fd2278671d9abba2b4909e88bda9fd8a661eab766e5"
 URL="https://github.com/Fry19/peak/releases/download/$TAG/World.pkbase"
 
 cd "$(dirname "$0")/.."
