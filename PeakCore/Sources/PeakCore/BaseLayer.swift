@@ -264,9 +264,14 @@ public enum CoarseSight {
 
     /// Whether a peak `distance` meters away that clears the terrain in front by `clearance`
     /// degrees (negative: hidden) may as well be hidden as in sight, or the other way round.
-    /// The terrain in front is taken to be about halfway there.
     public static func isUncertain(distance: Double, clearance: Double) -> Bool {
-        distance < nearDistance || abs(clearance) < atan(heightError / max(distance / 2, 1)) * 180 / .pi
+        distance < nearDistance || abs(clearance) < margin(distance: distance)
+    }
+
+    /// How far a peak `distance` meters away must clear the terrain in front, or lie under it,
+    /// to be told apart, degrees: the terrain in front is taken to be about halfway there.
+    public static func margin(distance: Double) -> Double {
+        atan(heightError / max(distance / 2, 1)) * 180 / .pi
     }
 }
 
@@ -309,8 +314,30 @@ extension HorizonRenderer {
     /// under what that horizon's rays either side of it see nearer than it is checked on
     /// its own bearing as far as that terrain. Only a confirmed obstruction skips the rest
     /// of the march: there can be an opening between the rendered rays.
+    ///
+    /// With `rendered`, an eye above all the terrain within `ceilingRadius` (a view from above)
+    /// also spares every line of sight the ground near it that, at that terrain's highest
+    /// (`Terrain.ceiling`), stays under the peak less `CoarseSight.margin`: the march starts
+    /// where such ground could first rise that high (`March.firstSample`). What's left out
+    /// can't change a peak's lot: whatever rises that high farther on is higher than all of
+    /// it, and if nothing does, the peak clears the terrain in front by more than the margin
+    /// with or without it, so it's in sight and not uncertain either way. The hidden-peak
+    /// check above, which needs terrain half a degree over the peak, is spared the same ground.
     public func sightings(_ peaks: [Peak], from observer: GeoPoint, settings: HorizonSettings,
                           rendered: HorizonProfile? = nil) -> [(peak: Peak, visibility: Visibility, isUncertain: Bool)] {
+        sightings(peaks, from: observer, settings: settings, rendered: rendered, ceilingRadius: Self.ceilingRadius)
+    }
+
+    /// How far around the eye `sightings` looks for the highest terrain, meters. More than half
+    /// of a 250 km line of sight's samples lie this near (every 15 m out to 15 km), and the
+    /// pixels to look through grow with its square. From 10,000 ft over the Smokies (a desk
+    /// bench, 6,099 peaks), 20 km took the lines of sight from 1.14 s to 0.51 s, 35 km to 0.31 s,
+    /// 50 km (the Smokies' crest just within it) to 0.20 s, and 70 km no further.
+    static let ceilingRadius = 50_000.0
+
+    /// `sightings`, with the ground near an eye above it spared within `ceilingRadius` (nil: none).
+    func sightings(_ peaks: [Peak], from observer: GeoPoint, settings: HorizonSettings, rendered: HorizonProfile?,
+                   ceilingRadius: Double?) -> [(peak: Peak, visibility: Visibility, isUncertain: Bool)] {
         let here = LatLon(observer.latitude, observer.longitude)
         guard let rendered, !rendered.envelope.isEmpty else {
             return sightlines(peaks, from: observer, maxDistance: settings.maxDistance, settings: settings).map { p, v in
@@ -323,20 +350,28 @@ extension HorizonRenderer {
             let d = groundDistance(from: observer, to: $0.point)
             return d > 200 && d < settings.maxDistance
         }
+        // One march for all: its samples out to any distance are the same.
+        let march = March(observer: observer, settings: settings)
+        let ceiling = ceilingRadius.flatMap { radius in
+            terrain.ceiling(around: observer, within: radius, under: observer.height).map { (height: $0, radius: radius) }
+        }
         typealias Sighting = (peak: Peak, visibility: Visibility, isUncertain: Bool)
         var results = [Sighting?](repeating: nil, count: near.count)
         results.withUnsafeMutableBufferPointer { out in
             DispatchQueue.concurrentPerform(iterations: near.count) { i in
                 let p = near[i], d = groundDistance(from: observer, to: p.point)
+                let look = frame.look(at: p.point, refraction: settings.refraction)
+                // A ten-thousandth of a degree more, for the Float the march keeps its angles in.
+                let first = ceiling.map {
+                    march.firstSample(reaching: look.elevation - CoarseSight.margin(distance: d) - 1e-4, azimuth: look.azimuth,
+                                      ceiling: $0.height, within: $0.radius)
+                } ?? 0
                 if d >= CoarseSight.hiddenDistance {
-                    let look = frame.look(at: p.point, refraction: settings.refraction)
                     let candidate = rendered.blocking(azimuth: look.azimuth, nearerThan: d - 250)
                     if look.elevation <= candidate.elevation - CoarseSight.hiddenMargin {
                         // Include the candidate's last sample despite Float distance rounding.
                         let end = min(d - 250, candidate.distance + max(settings.nearStep, settings.relativeStep * candidate.distance))
-                        var check = settings
-                        check.maxDistance = end
-                        let blocking = maxElevation(from: observer, azimuth: look.azimuth, upTo: end, settings: check)
+                        let blocking = maxElevation(along: march, azimuth: look.azimuth, upTo: end, from: first)
                         if look.elevation <= blocking - CoarseSight.hiddenMargin {
                             out[i] = (p, Visibility(azimuth: look.azimuth, elevation: look.elevation, distance: d,
                                                    clearance: look.elevation - blocking, isVisible: false), false)
@@ -344,7 +379,7 @@ extension HorizonRenderer {
                         }
                     }
                 }
-                let v = visibility(of: p.point, from: observer, settings: settings)
+                let v = visibility(of: p.point, along: march, from: first)
                 out[i] = (p, v, terrain.isCoarse(between: here, and: p.position) &&
                     CoarseSight.isUncertain(distance: v.distance, clearance: v.clearance))
             }

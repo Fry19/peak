@@ -60,6 +60,81 @@ final class TerrainTests: XCTestCase {
         XCTAssertTrue(alone.height(latitude: 45.2, longitude: 7.2).isNaN)
     }
 
+    /// No height within the radius rises above the ceiling: around the corner of four tiles
+    /// of different spacing (one with its pixels centered, as the base layer's), with a patch
+    /// blending into them, and a spike on the coarsest just south of the circle, past its box,
+    /// which the heights inside reach into.
+    func testCeilingBoundsEveryHeightWithinTheRadius() {
+        func rolling(_ lat: Double, _ lon: Double) -> Double { 600 + 300 * sin(lat * 50) * cos(lon * 40) }
+        let eye = GeoPoint(latitude: 46.03, longitude: 7.97, height: 0)
+        let size = 30
+        var coarse = [Int16](repeating: 0, count: size * size)
+        for r in 0..<size {
+            for c in 0..<size {
+                coarse[r * size + c] = Int16(rolling(46 - (Double(r) + 0.5) / 30, 7 + (Double(c) + 0.5) / 30).rounded())
+            }
+        }
+        coarse[5 * size + 29] = 2_500
+        let spike = GeoPoint(latitude: 46 - 5.5 / 30, longitude: 7 + 29.5 / 30, height: 0)
+        let corner = ElevationTile(south: 45, west: 7, rows: size, cols: size, originLatitude: 46 - 0.5 / 30,
+                                   originLongitude: 7 + 0.5 / 30, stepLatitude: 1.0 / 30, stepLongitude: 1.0 / 30, heights: coarse)
+        var bump = [Int16](repeating: 0, count: 120 * 120)
+        for r in 0..<120 {
+            for c in 0..<120 {
+                bump[r * 120 + c] = Int16(rolling(46.08 - Double(r) / 1_200, 7.92 + Double(c) / 1_200) + 900 * exp(-Double((r - 60) * (r - 60) + (c - 50) * (c - 50)) / 200))
+            }
+        }
+        let patch = ElevationTile(south: 46, west: 7, rows: 120, cols: 120, originLatitude: 46.08, originLongitude: 7.92,
+                                  stepLatitude: 1.0 / 1_200, stepLongitude: 1.0 / 1_200, heights: bump)
+        let tiles = [ElevationTile(south: 46, west: 7, size: 300, height: rolling), ElevationTile(south: 46, west: 8, size: 60, height: rolling),
+                     ElevationTile(south: 45, west: 8, size: 120, height: rolling), corner]
+        let terrain = Terrain(tiles: tiles, detail: [patch], missingIsSea: false)
+        let radius = groundDistance(from: eye, to: spike) - 1_500
+        guard let ceiling = terrain.ceiling(around: eye, within: radius, under: 5_000) else { return XCTFail("no ceiling") }
+        XCTAssertEqual(ceiling, 2_500)
+        var rng = SplitMix64(seed: 7)
+        var top = -Double.infinity
+        for k in 0..<20_000 {
+            // All around, and toward the spike near the edge.
+            let toward = k % 4 == 0
+            let azimuth = toward ? LocalFrame(origin: eye).look(at: spike).azimuth + 4 * (rng.uniform() - 0.5) : 360 * rng.uniform()
+            let distance = radius * (toward ? 1 - 0.1 * rng.uniform() : rng.uniform().squareRoot())
+            let p = destination(from: eye, azimuth: azimuth, distance: distance)
+            let h = terrain.height(latitude: p.latitude, longitude: p.longitude)
+            XCTAssertLessThanOrEqual(h, ceiling, "at \(p)")
+            top = max(top, h)
+        }
+        XCTAssertGreaterThan(top, 1_500, "the spike reaches into the circle")
+    }
+
+    /// The ceiling is only told where no height there can be missing, and under the limit.
+    func testCeilingNeedsDataAllAround() {
+        func flat(_ south: Int, _ west: Int, _ height: Double = -20) -> ElevationTile {
+            ElevationTile(south: south, west: west, size: 60) { _, _ in height }
+        }
+        let eye = GeoPoint(latitude: 46.5, longitude: 7.5, height: 0)
+        let one = Terrain(tiles: [flat(46, 7, 500)], missingIsSea: false)
+        XCTAssertEqual(one.ceiling(around: eye, within: 20_000, under: 1_000), 500)
+        XCTAssertNil(one.ceiling(around: eye, within: 20_000, under: 500), "reaches the limit")
+        XCTAssertNil(one.ceiling(around: eye, within: 60_000, under: 1_000), "past the tiles")
+        // A cell without a tile near a corner: no data, or the sea.
+        let corner = GeoPoint(latitude: 46.02, longitude: 7.98, height: 0)
+        let gap = [flat(46, 7), flat(46, 8), flat(45, 7)]
+        XCTAssertNil(Terrain(tiles: gap, missingIsSea: false).ceiling(around: corner, within: 10_000, under: 1_000))
+        XCTAssertEqual(Terrain(tiles: gap).ceiling(around: corner, within: 10_000, under: 1_000), 0)
+        XCTAssertEqual(Terrain(tiles: gap + [flat(45, 8)], missingIsSea: false).ceiling(around: corner, within: 10_000, under: 1_000), -20)
+        // A void in a tile: no data around it reads as missing.
+        var heights = [Int16](repeating: -20, count: 60 * 60)
+        heights[30 * 60 + 30] = ElevationTile.noData
+        let void = ElevationTile(south: 46, west: 7, rows: 60, cols: 60, originLatitude: 47, originLongitude: 7,
+                                 stepLatitude: 1.0 / 60, stepLongitude: 1.0 / 60, heights: heights)
+        XCTAssertNil(Terrain(tiles: [void], missingIsSea: false).ceiling(around: eye, within: 20_000, under: 1_000))
+        XCTAssertEqual(Terrain(tiles: [void]).ceiling(around: eye, within: 20_000, under: 1_000), 0)
+        // Near a pole a box doesn't hold the circle.
+        let north = Terrain(tiles: (0..<360).map { flat(89, $0 - 180, 0) }, missingIsSea: false)
+        XCTAssertNil(north.ceiling(around: GeoPoint(latitude: 89.5, longitude: 0, height: 0), within: 20_000, under: 1_000))
+    }
+
     /// A blunt top (a cone cut off 150 m below its tip) gets its tip back from the peak's
     /// elevation, without changing the terrain further out.
     func testRaiseSummitsRestoresBluntTips() {

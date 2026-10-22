@@ -506,6 +506,78 @@ public final class Terrain: @unchecked Sendable {
 }
 
 extension Terrain {
+    /// The highest `height(latitude:longitude:)` can be within `radius` meters of `origin`
+    /// along the ground (on the conformal sphere the horizon renderer's rays follow), if that's
+    /// under `limit`: the highest pixel of the tiles and patches there, since a bilinear height,
+    /// with voids left out, and a patch's blend into what lies under it never rise above the
+    /// pixels they come from. Those lie within a pixel of the point on its own tile or patch,
+    /// or at a tile's last row or column, on the next one nearest a pixel beyond (`sample`).
+    /// Nil if it may reach `limit`, if a height there may be missing (NaN, which ends a ray
+    /// march: outside the grid, or with `missingIsSea: false`, a cell without a tile or a void
+    /// in one), or near a pole.
+    func ceiling(around origin: GeoPoint, within radius: Double, under limit: Double) -> Double? {
+        let sphere = ConformalSphere(latitude: origin.latitude)
+        let delta = radius * sphere.radiansPerMeter
+        guard delta >= 0, abs(sphere.chi0) + delta < 80 * .pi / 180 else { return nil }
+        // The circle's box: conformal latitudes χ0 ± δ, longitudes asin(sin δ / cos χ0) either
+        // way, and a hair more for rounding.
+        let degrees = 180 / Double.pi, hair = 1e-6
+        let halfWidth = asin(min(1, sin(delta) / cos(sphere.chi0))) * degrees + hair
+        let circle = (south: ConformalSphere.geodeticLatitude(sinChi: sin(sphere.chi0 - delta)) * degrees - hair,
+                      north: ConformalSphere.geodeticLatitude(sinChi: sin(sphere.chi0 + delta)) * degrees + hair,
+                      west: origin.longitude - halfWidth, east: origin.longitude + halfWidth)
+        typealias Box = (south: Double, north: Double, west: Double, east: Double)
+        func grown(_ b: Box, _ s: (lat: Double, lon: Double)) -> Box {
+            (b.south - s.lat, b.north + s.lat, b.west - s.lon, b.east + s.lon)
+        }
+        // The cells a box touches, nil if any is outside the grid.
+        func cells(_ b: Box) -> [Int]? {
+            let rows = (Int(b.south.rounded(.up)) - 1)...(Int(b.north.rounded(.up)) - 1)
+            let cols = Int(b.west.rounded(.down))...Int(b.east.rounded(.down))
+            guard rows.lowerBound >= minSouth, rows.upperBound - minSouth < latCount,
+                  cols.lowerBound >= minWest, cols.upperBound - minWest < lonCount else { return nil }
+            return rows.flatMap { s in cols.map { w in (s - minSouth) * lonCount + (w - minWest) } }
+        }
+        func layers(_ cell: Int) -> [ElevationTile] { Array(patches[patchStart[cell]..<patchStart[cell + 1]]) + (grid[cell].map { [$0] } ?? []) }
+        // The largest pixel steps on the cells a box touches.
+        func steps(_ b: Box) -> (lat: Double, lon: Double)? {
+            cells(b)?.flatMap(layers).reduce((0, 0)) { (max($0.lat, $1.stepLatitude), max($0.lon, $1.stepLongitude)) }
+        }
+        guard let own = steps(circle), let next = steps(grown(circle, own)) else { return nil }
+        let box = grown(circle, (own.lat + next.lat, own.lon + next.lon))
+        guard let touched = cells(box) else { return nil }
+        var top = Int16.min
+        for cell in touched {
+            if grid[cell] == nil {
+                guard missing == 0 else { return nil }
+                top = max(top, 0)
+            }
+            for tile in layers(cell) {
+                let r0 = max(0, Int(((tile.originLatitude - box.north) / tile.stepLatitude).rounded(.up)))
+                let r1 = min(tile.rows - 1, Int(((tile.originLatitude - box.south) / tile.stepLatitude).rounded(.down)))
+                let c0 = max(0, Int(((box.west - tile.originLongitude) / tile.stepLongitude).rounded(.up)))
+                let c1 = min(tile.cols - 1, Int(((box.east - tile.originLongitude) / tile.stepLongitude).rounded(.down)))
+                guard r0 <= r1, c0 <= c1 else { continue }
+                var low = Int16.max
+                for r in r0...r1 {
+                    let row = r * tile.cols
+                    for c in c0...c1 {
+                        let v = tile.heights[row + c]
+                        top = max(top, v)
+                        low = min(low, v)
+                    }
+                    if Double(top) >= limit { return nil }
+                }
+                // A void in a tile reads as `missing` where it has no data around it.
+                if low == ElevationTile.noData, tile === grid[cell] {
+                    guard missing == 0 else { return nil }
+                    top = max(top, 0)
+                }
+            }
+        }
+        return Double(top) < limit && top != Int16.min ? Double(top) : nil
+    }
+
     /// Exact grid positions worth sampling in addition to the horizon's regular rays.
     /// These are hints: the renderer reads the current blended height here, since a finer
     /// patch may have replaced or softened a tip in an underlying tile.

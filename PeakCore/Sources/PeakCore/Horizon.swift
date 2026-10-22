@@ -381,8 +381,13 @@ public final class HorizonRenderer: @unchecked Sendable {
     /// Highest apparent elevation angle of the terrain along one azimuth, out to `distance`.
     public func maxElevation(from observer: GeoPoint, azimuth: Double, upTo distance: Double,
                              settings: HorizonSettings = HorizonSettings()) -> Double {
+        maxElevation(along: March(observer: observer, settings: settings), azimuth: azimuth, upTo: distance)
+    }
+
+    /// The same along `march` (its observer and settings), from its sample `first` on.
+    func maxElevation(along march: March, azimuth: Double, upTo distance: Double, from first: Int = 0) -> Double {
         var points: [HorizonProfile.EnvelopePoint] = []
-        March(observer: observer, settings: settings).run(terrain: terrain, azimuth: azimuth, upTo: distance, envelope: &points)
+        march.run(terrain: terrain, azimuth: azimuth, upTo: distance, envelope: &points, from: first)
         return Double(points.last?.elevation ?? -90)
     }
 
@@ -402,12 +407,17 @@ public final class HorizonRenderer: @unchecked Sendable {
     public func visibility(of target: GeoPoint, from observer: GeoPoint,
                            summitRadius: Double = 250, tolerance: Double = 15,
                            settings: HorizonSettings = HorizonSettings()) -> Visibility {
-        let look = LocalFrame(origin: observer).look(at: target, refraction: settings.refraction)
+        visibility(of: target, along: March(observer: observer, settings: settings), summitRadius: summitRadius, tolerance: tolerance)
+    }
+
+    /// The same along `march` (its observer and settings), from its sample `first` on.
+    func visibility(of target: GeoPoint, along march: March, summitRadius: Double = 250, tolerance: Double = 15,
+                    from first: Int = 0) -> Visibility {
+        let look = LocalFrame(origin: march.observer).look(at: target, refraction: march.settings.refraction)
         // The march measures distance along the ground. The straight-line distance is longer
         // for a summit far above or below, and would let terrain behind the summit block it.
-        let ground = groundDistance(from: observer, to: target)
-        let blocking = maxElevation(from: observer, azimuth: look.azimuth,
-                                    upTo: max(0, ground - summitRadius), settings: settings)
+        let ground = groundDistance(from: march.observer, to: target)
+        let blocking = maxElevation(along: march, azimuth: look.azimuth, upTo: max(0, ground - summitRadius), from: first)
         let slack = atan(tolerance / max(look.distance, 1)) * 180 / .pi
         let clearance = look.elevation - blocking
         return Visibility(azimuth: look.azimuth, elevation: look.elevation, distance: ground,
@@ -464,14 +474,14 @@ struct March {
     /// Near ground that `nearAllowance` lets through is left out, as if it weren't there;
     /// the highest of it (tan of its elevation angle, and its distance) is returned. If the
     /// data ends before anything else is seen, the highest of it stays, as the skyline.
+    ///
+    /// The march starts at sample `first` (see `firstSample`).
     @discardableResult
     func run(terrain: Terrain, azimuth: Double, upTo maxDistance: Double,
-             envelope: inout [HorizonProfile.EnvelopePoint], inSight: Bool = false) -> (tan: Double, distance: Double)? {
+             envelope: inout [HorizonProfile.EnvelopePoint], inSight: Bool = false,
+             from first: Int = 0) -> (tan: Double, distance: Double)? {
         let ray = GreatCircleRay(sphere: sphere, longitude: observer.longitude, azimuth: azimuth)
-        // Refraction as a larger effective Earth: R' = R / (1 − k).
-        let radius = WGS84.radius(latitude: observer.latitude * .pi / 180, azimuth: azimuth * .pi / 180)
-        let effectiveRadius = radius / (1 - settings.refraction)
-        let observerRadius = effectiveRadius + observer.height
+        let radii = radii(azimuth: azimuth)
         let elevationResolution = 0.01
         let passUnder = settings.nearAllowance > 0 ? observer.height + settings.nearAllowance : -Double.infinity
         var passed: (tan: Double, distance: Double)?
@@ -486,7 +496,8 @@ struct March {
         }
         var newSegment = false
 
-        for (k, d) in samples.enumerated() {
+        for k in min(first, samples.count)..<samples.count {
+            let d = samples[k]
             if d > maxDistance { break }
             let p = ray.point(cosDelta: cosDelta[k], sinDelta: sinDelta[k])
             let h = terrain.height(latitude: p.latitude, longitude: p.longitude)
@@ -497,13 +508,7 @@ struct March {
                 }
                 break
             }
-            // Elevation angle on the effective sphere, with θ = d / R'.
-            let theta = d / effectiveRadius
-            let t2 = theta * theta
-            let cosT = 1 - t2 / 2 + t2 * t2 / 24
-            let sinT = theta * (1 - t2 / 6 + t2 * t2 / 120)
-            let r = effectiveRadius + h
-            let tanElevation = (cosT * r - observerRadius) / (sinT * r)
+            let tanElevation = Self.tanElevation(height: h, distance: d, radii: radii)
 
             if h < passUnder, d <= settings.nearRange {
                 if tanElevation > passed?.tan ?? -.infinity { passed = (tanElevation, d) }
@@ -537,5 +542,43 @@ struct March {
             envelope.append(.init(elevation: Float(e), distance: Float(dist), startsSegment: false))
         }
         return passed
+    }
+
+    /// The effective Earth's radius along `azimuth` (refraction as a larger Earth: R' = R / (1 − k)),
+    /// and the eye's distance from its center, meters.
+    func radii(azimuth: Double) -> (effective: Double, eye: Double) {
+        let radius = WGS84.radius(latitude: observer.latitude * .pi / 180, azimuth: azimuth * .pi / 180)
+        let effective = radius / (1 - settings.refraction)
+        return (effective, effective + observer.height)
+    }
+
+    /// tan of the elevation angle of ground `h` meters high, `d` meters away along the ground,
+    /// on the effective sphere (θ = d / R').
+    @inline(__always)
+    static func tanElevation(height h: Double, distance d: Double, radii: (effective: Double, eye: Double)) -> Double {
+        let theta = d / radii.effective
+        let t2 = theta * theta
+        let cosT = 1 - t2 / 2 + t2 * t2 / 24
+        let sinT = theta * (1 - t2 / 6 + t2 * t2 / 120)
+        let r = radii.effective + h
+        return (cosT * r - radii.eye) / (sinT * r)
+    }
+
+    /// The first sample at which ground no higher than `ceiling` meters could stand at
+    /// `elevation` degrees or more on bearing `azimuth`, or the first past `radius` meters,
+    /// where the ceiling no longer holds. Every sample before it is lower than `elevation`, so
+    /// a march that only needs what rises to `elevation` can start there. The ceiling is
+    /// raised by a meter, far more than rounding. 0 for `elevation` at or past ±90°, whose
+    /// tangent would wrap around.
+    func firstSample(reaching elevation: Double, azimuth: Double, ceiling: Double, within radius: Double) -> Int {
+        guard elevation > -90, elevation < 90 else { return 0 }
+        let target = tan(elevation * .pi / 180)
+        let radii = radii(azimuth: azimuth)
+        var k = 0
+        while k < samples.count, samples[k] <= radius,
+              Self.tanElevation(height: ceiling + 1, distance: samples[k], radii: radii) < target {
+            k += 1
+        }
+        return k
     }
 }
