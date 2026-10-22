@@ -1,0 +1,7 @@
+# satellite-look (claude lead)
+
+- consult · codex · 2 min · exit: 0 · changed outcome: y · confirmed the diagnosis (same imagery and drape; the walk's 3 km haze; the map's muted, unlit imagery); changed: 7 km haze only when draped (3 km kept for the Terrain style) and re-applied after draping while paused; light precomposed and multiplied once, masked to the imagery drawn; zoomed terrain detail no longer skipped under imagery; lighting left unnormalized. · 01a164c9-3b1b
+- review · codex · 5 min · exit: 0 · changed outcome: y · applied: missing neighbour heights now fall back to the cell's own height instead of the map's lowest elevation (false slopes and dark bands at terrain gaps; also in the Terrain style's shade). Noted: the 7 km floor also keeps "See it in 3D" clearer once the camera comes closer than ~6 km, which is the direction asked for; not separately rendered. · 01a164d6-68ec
+
+Inspected: iPhone 17 Pro (iOS 26.5) temp simulator at Gornergrat with temporary DEBUG hooks (not committed): map from above before/after on the Sentier de la Dent-Blanche (default, zoomed out to you, zoomed in 4x) and the Matterhorn summit path; Walk in 3D before/after; Terrain style map unchanged once sharp terrain loads; final render after Codex's fix. A horizontal line at the right when zoomed out appears on main too (Apple mosaic boundary). Not checked: touch gestures, landscape, a second phone size, physical device.
+Lesson: before/after renders taken with the same hook and location made a subjective look request checkable; capture main first next time.

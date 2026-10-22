@@ -3,9 +3,9 @@ import SwiftUI
 import simd
 
 /// The trail seen from straight above, north up: over satellite imagery while there's a
-/// connection, or over the terrain drawn in the walk in 3D's colors (tinted where
-/// OpenStreetMap has glaciers, water and bare rock, the crests glowing faintly), which works
-/// without a signal and takes over whenever the imagery can't load. The trail in orange,
+/// connection, lit by the walk in 3D's sun, or over the terrain drawn in the walk in 3D's
+/// colors (tinted where OpenStreetMap has glaciers, water and bare rock, the crests glowing
+/// faintly), which works without a signal and takes over whenever the imagery can't load. The trail in orange,
 /// the summit and you. Pinch and drag to look around, out as far as where you are;
 /// double-tap to zoom in.
 struct TrailFromAboveView: View {
@@ -352,11 +352,10 @@ struct TrailFromAboveView: View {
 
     /// Keep the broad map while moving, then resample the visible ground from the DEM.
     /// Magnifying the broad hillshade alone loses small gullies and spurs on longer hikes.
-    /// Not where imagery covers the screen, which hides it; elsewhere it's what shows.
+    /// Under imagery too, whose sunlight it sharpens.
     private func loadTerrainDetail(screen: CGSize, content: EdgeInsets) async {
         guard let map, let terrain = model.scene?.terrain else { return }
         let visible = Viewport(size: screen, map: map, content: content).visible(camera)
-        if shownImagery(on: map).contains(where: { $0.rect.contains(visible) }) { return }
         let seen = visible.intersection(drawn(map))
         guard !seen.isNull, seen.width > 0, seen.height > 0 else { return }
         let rect = seen.insetBy(dx: -seen.width * 0.15, dy: -seen.height * 0.15).intersection(drawn(map))
@@ -644,8 +643,10 @@ struct OverheadMap: @unchecked Sendable {
         var glow: CGFloat
     }
 
-    /// The hillshade, one pixel per grid point, and where its pixels' edges lie on the map.
+    /// The hillshade, one pixel per grid point, and where its pixels' edges lie on the map;
+    /// and the sunlight laid over the imagery there (`images`).
     let shade: CGImage
+    let light: CGImage
     let shadeRect: CGRect
     let cellSize: Double
     let elevationRange: ClosedRange<Float>
@@ -694,8 +695,7 @@ struct OverheadMap: @unchecked Sendable {
         guard let low = known.min(), let high = known.max() else { return nil }
         let elevationRange = low...high
         let ground = cover.map { relief.landCover($0.areas, within: $0.box, fade: coverFade) }
-        guard let shade = image(relief, cover: ground,
-                                elevationRange: elevationRange) else { return nil }
+        guard let (shade, light) = images(relief, cover: ground, elevationRange: elevationRange) else { return nil }
 
         var bands = bandSteps.map { Band(path: Path(), opacity: $0.opacity, width: $0.width, glow: $0.glow) }
         // On a map of a wide area, short spurs are only clutter.
@@ -711,7 +711,7 @@ struct OverheadMap: @unchecked Sendable {
             })
         }
         let size = relief.size, pixel = relief.cellSize
-        return OverheadMap(shade: shade,
+        return OverheadMap(shade: shade, light: light,
                            shadeRect: CGRect(x: -size.x / 2 - pixel / 2, y: -size.y / 2 - pixel / 2,
                                              width: size.x + pixel, height: size.y + pixel),
                            cellSize: pixel, elevationRange: elevationRange,
@@ -728,6 +728,8 @@ struct OverheadMap: @unchecked Sendable {
     struct Detail: @unchecked Sendable {
         let mapID: UUID
         let image: CGImage
+        /// The sunlight over the imagery there.
+        let light: CGImage
         let rect: CGRect
         let cellSize: Double
     }
@@ -741,10 +743,9 @@ struct OverheadMap: @unchecked Sendable {
                                extent: MapExtent(center: projection.latLon(center), width: rect.width, height: rect.height),
                                cellSize: cellSize)
         let ground = cover.map { relief.landCover($0.areas, within: $0.box, fade: Self.coverFade) }
-        guard let image = Self.image(relief, cover: ground,
-                                     elevationRange: elevationRange) else { return nil }
+        guard let (image, light) = Self.images(relief, cover: ground, elevationRange: elevationRange) else { return nil }
         let size = relief.size + SIMD2(repeating: cellSize)
-        return Detail(mapID: id, image: image,
+        return Detail(mapID: id, image: image, light: light,
                       rect: CGRect(x: center.x - size.x / 2, y: center.y - size.y / 2, width: size.x, height: size.y),
                       cellSize: cellSize)
     }
@@ -807,16 +808,21 @@ struct OverheadMap: @unchecked Sendable {
     static let coverFade = 1_500.0
 
     /// The tour's slate, local relief, land cover, north-west lighting and contour spacing,
-    /// evaluated on a flat raster so the map keeps its lightweight pan and zoom gestures.
-    private static func image(_ relief: ReliefMap, cover: LandCoverGrid?,
-                              elevationRange: ClosedRange<Float>) -> CGImage? {
+    /// evaluated on a flat raster so the map keeps its lightweight pan and zoom gestures. And
+    /// the same north-west sun as the light the walk in 3D lays its imagery under
+    /// (`WalkWorld.drapeShader`: half lit by the sun, a quarter by itself), for multiplying
+    /// over the map's imagery so its slopes stand out as they do in 3D; in sRGB, so drawn with
+    /// SwiftUI's multiply it comes near that light's linear one.
+    private static func images(_ relief: ReliefMap, cover: LandCoverGrid?,
+                               elevationRange: ClosedRange<Float>) -> (shade: CGImage, light: CGImage)? {
         let fine = relief.relativeHeight(radius: max(90, 2 * relief.cellSize))
         let broad = relief.relativeHeight(radius: max(450, 4 * relief.cellSize))
         let lightDirection = simd_normalize(SIMD3<Float>(-1, 1, 0.99))
         let run = Float(2 * relief.cellSize)
-        func height(_ r: Int, _ c: Int) -> Float {
+        func height(_ r: Int, _ c: Int, fallback: Float) -> Float {
             let h = relief.heights[max(0, min(relief.rows - 1, r)) * relief.cols + max(0, min(relief.cols - 1, c))]
-            return h.isFinite ? h : elevationRange.lowerBound
+            // Missing terrain isn't a drop to the map's lowest valley.
+            return h.isFinite ? h : fallback
         }
         func smooth(_ a: Float, _ b: Float, _ value: Float) -> Float {
             let t = min(1, max(0, (value - a) / (b - a)))
@@ -828,17 +834,25 @@ struct OverheadMap: @unchecked Sendable {
             return UInt8(min(255, max(0, 255 * srgb)))
         }
         var pixels = [UInt8](repeating: 0, count: relief.rows * relief.cols * 4)
+        var lights = pixels
         for i in relief.heights.indices where relief.heights[i].isFinite {
             let r = i / relief.cols, c = i % relief.cols
-            let dx = height(r, c + 1) - height(r, c - 1)
-            let dy = height(r - 1, c) - height(r + 1, c)
+            let here = relief.heights[i]
+            let dx = height(r, c + 1, fallback: here) - height(r, c - 1, fallback: here)
+            let dy = height(r - 1, c, fallback: here) - height(r + 1, c, fallback: here)
             let normal = simd_normalize(SIMD3(-dx / run, -dy / run, 1))
             let shade = TrailTerrainStyle.shade(height: relief.heights[i], normalUp: normal.z,
                                                  fine: fine[i], broad: broad[i], range: elevationRange)
             var color = TrailTerrainStyle.color(light: shade.light, form: shade.form,
                                                   rock: cover?.rock[i] ?? 0, ice: cover?.glacier[i] ?? 0, water: cover?.water[i] ?? 0)
             let sun = max(0, simd_dot(normal, lightDirection))
-            color *= 1.4 * sun * SIMD3<Float>(1, 0.97, 0.93) + 0.045 * SIMD3<Float>(0.55, 0.65, 0.85)
+            let light = 1.4 * sun * SIMD3<Float>(1, 0.97, 0.93) + 0.045 * SIMD3<Float>(0.55, 0.65, 0.85)
+            color *= light
+            let onImagery = 0.48 * light + 0.25
+            lights[4 * i] = channel(onImagery.x)
+            lights[4 * i + 1] = channel(onImagery.y)
+            lights[4 * i + 2] = channel(onImagery.z)
+            lights[4 * i + 3] = 255
             // The same 50/250 m contours as the tour, fading where the raster can't
             // separate them. Derivatives are in height per raster pixel.
             let w = max(0.0001, (abs(dx) + abs(dy)) / 2)
@@ -854,11 +868,15 @@ struct OverheadMap: @unchecked Sendable {
             pixels[4 * i + 2] = channel(color.z)
             pixels[4 * i + 3] = 255
         }
-        guard let provider = CGDataProvider(data: Data(pixels) as CFData) else { return nil }
-        return CGImage(width: relief.cols, height: relief.rows, bitsPerComponent: 8, bitsPerPixel: 32,
-                       bytesPerRow: relief.cols * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        func image(_ pixels: [UInt8]) -> CGImage? {
+            guard let provider = CGDataProvider(data: Data(pixels) as CFData) else { return nil }
+            return CGImage(width: relief.cols, height: relief.rows, bitsPerComponent: 8, bitsPerPixel: 32,
+                           bytesPerRow: relief.cols * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                           bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                           provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        }
+        guard let shade = image(pixels), let light = image(lights) else { return nil }
+        return (shade, light)
     }
 }
 
@@ -925,13 +943,26 @@ private struct MapLayer: View, Animatable {
             if let detail = terrainDetail {
                 picture(detail.image, detail.rect.applying(t))
             }
-            // Its darkest shadows lifted a little and its colors muted, to sit with the dark
-            // interface and let the orange trail stand out.
-            ForEach(Array(sharpEnough.enumerated()), id: \.offset) { _, picture in
+            let shown = sharpEnough
+            ForEach(Array(shown.enumerated()), id: \.offset) { _, picture in
                 self.picture(picture.image, picture.rect.applying(t))
-                    .saturation(0.8)
-                    .contrast(0.9)
-                    .brightness(-0.01)
+            }
+            if !shown.isEmpty {
+                // Lit as the walk in 3D lights it, so the slopes stand out: the sunlight, finest
+                // where there's more than one, laid over the imagery once and only where it is.
+                ZStack {
+                    if let wide { picture(wide.light, wide.rect.applying(t)) }
+                    picture(map.light, shadeRect)
+                    if let detail = terrainDetail { picture(detail.light, detail.rect.applying(t)) }
+                }
+                .compositingGroup()
+                .mask {
+                    Path { path in
+                        for picture in shown { path.addRect(picture.rect.applying(t)) }
+                    }
+                }
+                .blendMode(.multiply)
+                .allowsHitTesting(false)
             }
             Canvas { context, _ in
                 // Faint ridges first and the main ones over them; under each line a wide faint
