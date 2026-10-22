@@ -232,6 +232,21 @@ private struct ProfileChart: View {
                 .lineStyle(StrokeStyle(lineWidth: 2))
         }
         .chartYScale(domain: low...high)
+        // Numbers on the axes written like the rest of the app's.
+        .chartXAxis {
+            AxisMarks { _ in
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.precision(.fractionLength(0...1)))
+            }
+        }
+        .chartYAxis {
+            AxisMarks { _ in
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.precision(.fractionLength(0)))
+            }
+        }
         .chartXAxisLabel(units == .metric ? "km" : "mi")
         .chartYAxisLabel(units == .metric ? "m" : "ft")
     }

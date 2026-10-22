@@ -526,7 +526,7 @@ private struct EdgeArrow: View {
 }
 
 /// A thin bar of a round length, about a hundred points long.
-private struct ScaleBar: View {
+struct ScaleBar: View {
     let pointsPerMeter: Double
     let units: AppSettings.Units
 
@@ -597,6 +597,7 @@ private struct FromAboveChip: View {
                     .font(.system(size: 13, weight: .semibold))
                     .frame(width: 28, height: 28)
                     .background(.white.opacity(0.15), in: Circle())
+                    .tapArea()
             }
             .accessibilityLabel("Back to the camera")
         }

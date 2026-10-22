@@ -12,6 +12,13 @@ final class OverlayCanvas: UIView {
     weak var model: AppModel?
     weak var screen: CameraScreenView?
     private var link: CADisplayLink?
+    /// Nothing is laid out (and nothing ticks) while a full-screen view covers the camera.
+    var paused = false {
+        didSet {
+            link?.isPaused = paused
+            if !paused { needsUpdate = true }
+        }
+    }
     private var needsUpdate = true
     private var smoothed: ViewCorrection?
     private var lastUpdate = Date()
@@ -188,6 +195,7 @@ final class OverlayCanvas: UIView {
             let link = CADisplayLink(target: self, selector: #selector(tick))
             link.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 30)
             link.add(to: .main, forMode: .common)
+            link.isPaused = paused
             self.link = link
         }
     }
@@ -211,6 +219,7 @@ final class OverlayCanvas: UIView {
 
     /// Lays everything out for the frame on screen now.
     func update() {
+        guard !paused else { return }
         needsUpdate = false
         CATransaction.begin()
         CATransaction.setDisableActions(true)

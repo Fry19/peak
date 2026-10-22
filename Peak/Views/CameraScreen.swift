@@ -40,6 +40,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         layer.addSublayer(video)
         overlay.screen = self
         overlay.model = model
+        overlay.paused = model.showsFromAbove
         addSubview(overlay)
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
         // Lining up by hand: drag to move the lines, turn with two fingers to level them.
@@ -63,6 +64,11 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         guard let model else { return }
         model.setZoom(model.zoom * Double(gesture.scale))
         gesture.scale = 1
+    }
+
+    /// A full-screen view covers the camera: the overlay rests until it's gone.
+    func setCovered(_ covered: Bool) {
+        overlay.paused = covered
     }
 
     /// Shows the picture at the model's zoom.

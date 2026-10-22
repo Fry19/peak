@@ -599,7 +599,7 @@ final class WalkPlayer {
             if let label = world.label {
                 let d = Double(simd_distance(label.simdWorldPosition, pov.simdWorldPosition))
                 let s = Float(d * 0.05)
-                label.scale = SCNVector3(s, s, s)
+                if abs(label.scale.x - s) > s * 1e-4 { label.scale = SCNVector3(s, s, s) }
             }
             // The crest lines show the ridges on ground seen from above. Looking along it,
             // toward the horizon, the light and the skyline show them already, and the lines
@@ -607,8 +607,9 @@ final class WalkPlayer {
             let down = Double(asin(max(-1, min(1, -pov.simdWorldFront.y)))) * 180 / .pi
             let t = min(1, max(0, (down - 30) / 25))
             let opacity = CGFloat(t * t * (3 - 2 * t))
-            world.crests.opacity = opacity
-            world.crests.isHidden = opacity < 0.01
+            // Only what changed is set, so a still scene isn't drawn again.
+            if abs(world.crests.opacity - opacity) > 1e-3 { world.crests.opacity = opacity }
+            if world.crests.isHidden != (opacity < 0.01) { world.crests.isHidden = opacity < 0.01 }
         }
         if now - lastShown > 0.08 || !playing {
             lastShown = now
@@ -618,7 +619,8 @@ final class WalkPlayer {
 
     private func moveWalker() {
         guard let world else { return }
-        world.walker.position = WalkWorld.scn(world.walkerPosition(at: distance))
+        let position = WalkWorld.scn(world.walkerPosition(at: distance))
+        if !SCNVector3EqualToVector3(world.walker.position, position) { world.walker.position = position }
     }
 
     /// Puts the camera at `eye` looking at `target`, map meters, with `up` (map axes) up.
@@ -654,7 +656,9 @@ private struct WalkSceneView: UIViewRepresentable {
         let view = SCNView(frame: .zero, options: [SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue])
         view.backgroundColor = WalkWorld.background
         view.antialiasingMode = .multisampling4X
-        view.rendersContinuously = true
+        // Drawn when something moves: the walk, or the camera dragged around. Paused and
+        // left alone, it rests.
+        view.rendersContinuously = false
         view.preferredFramesPerSecond = 60
         view.scene = world.scene
         view.pointOfView = world.camera

@@ -35,13 +35,33 @@ struct StatusPill: View {
         return Format.bearing(CameraGeometry.heading(pose, correction: model.frozen?.correction ?? model.viewCorrection(for: pose)))
     }
 
+    /// The heading at a fixed width, so the pill and the buttons beside it don't shift as
+    /// you turn and the number changes length.
+    @ViewBuilder private func headingText(_ heading: String, alignment: Alignment) -> some View {
+        Text("888° NW")
+            .hidden()
+            .overlay(alignment: alignment) {
+                Text(heading)
+                    .contentTransition(.numericText())
+                    .animation(.snappy(duration: 0.2), value: heading)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(heading)
+    }
+
     @ViewBuilder private var content: some View {
         if model.aligning {
             Image(systemName: "hand.draw.fill").font(.system(size: 11))
-            Text("Lining up" + (heading.map { " · \($0)" } ?? ""))
+            Text("Lining up")
+            if let heading {
+                HStack(spacing: 4) { Text("·"); headingText(heading, alignment: .leading) }
+            }
         } else if model.frozen != nil {
             Image(systemName: "pause.fill").font(.system(size: 10))
-            Text("Paused" + (heading.map { " · \($0)" } ?? ""))
+            Text("Paused")
+            if let heading {
+                HStack(spacing: 4) { Text("·"); headingText(heading, alignment: .leading) }
+            }
         } else {
             switch model.status {
             case .locating:
@@ -52,27 +72,37 @@ struct StatusPill: View {
                 Text(text)
             case let .problem(text, action):
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-                Text(text).multilineTextAlignment(.leading).frame(maxWidth: 220)
+                Text(text)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let action {
-                    Button(action == .openSettings ? "Settings" : "Retry") {
+                    Button {
                         if action == .openSettings, let url = URL(string: UIApplication.openSettingsURLString) {
                             UIApplication.shared.open(url)
                         } else {
                             model.retry()
                         }
+                    } label: {
+                        Text(action == .openSettings ? "Settings" : "Retry")
+                            .font(.system(size: 13, weight: .semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(.white.opacity(0.2), in: Capsule())
+                            .tapArea(minHeight: 44)
                     }
-                    .font(.system(size: 13, weight: .semibold))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(.white.opacity(0.2), in: Capsule())
+                    .foregroundStyle(.white)
                 }
             case let .ready(note):
                 let state = model.correction.state
                 Circle()
                     .fill(state == .locked ? Color.green : state == .byHand ? Color.cyan : Color.orange)
                     .frame(width: 7, height: 7)
-                Text((heading.map { "\($0) · " } ?? "") + (state == .locked ? "Locked" : state == .byHand ? "Lined up" : "Compass")
-                     + (model.waitingForPeaks ? " · Getting peaks…" : "") + (note.map { " · \($0)" } ?? ""))
+                HStack(spacing: 4) {
+                    if let heading { headingText(heading, alignment: .trailing); Text("·") }
+                    Text((state == .locked ? "Locked" : state == .byHand ? "Lined up" : "Compass")
+                         + (model.waitingForPeaks ? " · Getting peaks…" : "") + (note.map { " · \($0)" } ?? ""))
+                }
             }
         }
     }

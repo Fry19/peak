@@ -37,6 +37,11 @@ struct PeakListView: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
+        .overlay {
+            if model.scene != nil, !query.isEmpty, matching.isEmpty {
+                ContentUnavailableView.search(text: query)
+            }
+        }
         .searchable(text: $query, prompt: "Search peaks")
         .navigationTitle("Peaks")
         .navigationBarTitleDisplayMode(.inline)
