@@ -2,9 +2,12 @@
 """Build the worldwide base layer (World.pkbase): coarse terrain and named peaks for the
 whole world, bundled with the app so it works on first launch anywhere without a signal.
 
-    python3 Tools/fetch_world_peaks.py --cache build/peaks --out build/world_peaks.tsv
+    python3 Tools/fetch_world_peaks.py --out build/world_peaks.tsv
     python3 Tools/build_base_layer.py --etopo build/etopo15 --download \\
         --peaks build/world_peaks.tsv --out build/World.pkbase
+
+To renew only the peaks, --terrain-from OLD.pkbase copies an existing file's terrain as it
+is, in place of --etopo.
 
 Terrain: NOAA ETOPO 2022 at 15 arc-seconds (public domain; about 5.4 GB in 288 files,
 downloaded into --etopo with --download). Each 1° cell is kept at 30″ (about 0.9 km),
@@ -17,7 +20,9 @@ level; land below it is kept only in known depressions (the Dead Sea, the Caspia
 Valley and a few more), since ETOPO gives the sea floor elsewhere.
 
 Peaks: every named OpenStreetMap natural=peak|volcano (from fetch_world_peaks.py), in 5°
-blocks: id, position to 1e-5°, elevation, prominence, Wikidata item and name.
+blocks: id, position to 1e-5°, elevation, prominence, Wikidata item and name. The
+prominence is OpenStreetMap's, or where that is missing or unreadable, Wikidata's for the
+peak's item (as the app fills it in when online).
 
 File layout (little-endian), read by PeakCore's BaseLayer:
 
@@ -33,11 +38,12 @@ File layout (little-endian), read by PeakCore's BaseLayer:
         block's data u32 (relative to peak data)
     peak data: per block, zlib of: count u32, then columns of `count` each: id deltas
         (varint, ids ascending), lat u24 and lon u24 (1e-5° from the block's south-west
-        corner), elevation i16 (−32768 when unknown), prominence u16 (0 when unknown),
+        corner), elevation i16 (−32768 when unknown), prominence u16 (0 when unknown, so
+        a known 0 m is stored as 1),
         Wikidata number varint (0 when none), names (UTF-8, each ended by a zero byte).
 
 Data: ETOPO 2022 (NOAA NCEI, public domain; doi:10.25921/fd45-gt74). Peaks
-© OpenStreetMap contributors, ODbL.
+© OpenStreetMap contributors, ODbL; prominence also from Wikidata, CC0.
 """
 
 import argparse
@@ -249,11 +255,20 @@ def varint(v):
             return bytes(out)
 
 
+def wikidata_prominence(raw):
+    """The meters in fetch_world_peaks.py's last column, if a summit could have them."""
+    try:
+        v = float(raw)
+    except ValueError:
+        return None
+    return v if 0 <= v <= 9000 else None
+
+
 def read_peaks(path):
     peaks = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
-            parts = (line.rstrip("\n").split("\t") + [""] * 7)[:7]
+            parts = (line.rstrip("\n").split("\t") + [""] * 8)[:8]
             try:
                 pid, lat, lon = int(parts[0]), float(parts[1]), float(parts[2])
             except ValueError:
@@ -263,6 +278,8 @@ def read_peaks(path):
                 continue
             ele = parse_elevation(parts[4]) if parts[4] else None
             prom = parse_elevation(parts[5]) if parts[5] else None
+            if prom is None:
+                prom = wikidata_prominence(parts[7])
             m = re.fullmatch(r"Q(\d+)", parts[6].strip())
             peaks[pid] = (lat, lon, ele, prom, int(m.group(1)) if m else 0, name)
     return peaks
@@ -310,13 +327,34 @@ def main():
                     help="height error allowed per cell, m RMS, instead of fitting --terrain-mb")
     ap.add_argument("--region", type=float, nargs=4, metavar=("S", "W", "N", "E"),
                     help="only these cells (for tests); the rest of the world is left out")
+    ap.add_argument("--terrain-from", metavar="PKBASE",
+                    help="copy this base layer's terrain as it is, in place of --etopo (to renew only the peaks)")
     ap.add_argument("--fixture", action="store_true", help="write the tests' small fixture to --out instead")
     args = ap.parse_args()
     if args.fixture:
         return fixture(args.out)
-    if not args.etopo or not args.peaks:
-        ap.error("--etopo and --peaks are needed")
+    if not args.peaks or bool(args.etopo) == bool(args.terrain_from):
+        ap.error("--peaks and either --etopo or --terrain-from are needed")
+    if args.terrain_from and (args.download or args.max_error is not None
+                              or any(getattr(args, k) != ap.get_default(k) for k in ("terrain_mb", "step", "ridge"))):
+        ap.error("--terrain-from copies the terrain as it is: no --download, --terrain-mb, --step, --ridge or --max-error")
 
+    if args.terrain_from:
+        step, cells = read_terrain(args.terrain_from)
+        if args.region:
+            s, w, n, e = args.region
+            cells = {k: c for k, c in cells.items() if s <= k[0] < n and w <= k[1] < e}
+    else:
+        step, cells = args.step, etopo_terrain(args)
+    peaks = read_peaks(args.peaks)
+    if args.region:
+        s, w, n, e = args.region
+        peaks = {k: p for k, p in peaks.items() if s <= p[0] < n and w <= p[1] < e}
+    write(args.out, step, cells, peaks)
+
+
+def etopo_terrain(args):
+    """The terrain cells, from ETOPO, as `write` takes them."""
     if args.download:
         download(args.etopo)
     files = sorted(os.path.join(args.etopo, f) for f in os.listdir(args.etopo) if f.endswith("_surface.nc"))
@@ -342,11 +380,30 @@ def main():
     tau, choice = choose(cells, args.terrain_mb * 1e6, args.max_error)
     counts = {rows: sum(1 for l in choice.values() if l[0] == rows) for rows in LEVELS}
     print(f"terrain: height error up to {tau:.1f} m RMS per cell; cells by rows per degree: {counts}", file=sys.stderr)
+    return {k: (l[0], l[1], l[3]) for k, l in choice.items()}
 
-    peaks = read_peaks(args.peaks)
-    if args.region:
-        peaks = {k: p for k, p in peaks.items() if s <= p[0] < n and w <= p[1] < e}
-    write(args.out, args.step, {k: (l[0], l[1], l[3]) for k, l in choice.items()}, peaks)
+
+def read_terrain(path):
+    """The height step and terrain cells of an existing base layer, as `write` takes them."""
+    with open(path, "rb") as f:
+        blob = f.read()
+    if len(blob) < 64 or blob[:4] != MAGIC:
+        sys.exit(f"{path}: not a base layer")
+    version, step, _, t_index, t_data, p_index, _ = struct.unpack_from("<IfIQQQQ", blob, 4)
+    if (version != VERSION or not (math.isfinite(step) and step > 0)
+            or not (t_index == 64 and t_data == t_index + 180 * 360 * 6 <= p_index <= len(blob))):
+        sys.exit(f"{path}: unknown version or layout")
+    cells, start = {}, 0
+    for i in range(180 * 360):
+        rows, cols, end = struct.unpack_from("<BBI", blob, t_index + 6 * i)
+        if not start <= end <= p_index - t_data or not (rows == 0) == (cols == 0) == (end == start):
+            sys.exit(f"{path}: bad terrain index at cell {i}")
+        if rows:
+            cells[(i // 360 - 90, i % 360 - 180)] = (rows, cols, blob[t_data + start:t_data + end])
+        start = end
+    if start != p_index - t_data:
+        sys.exit(f"{path}: the terrain index doesn't cover its data")
+    return step, cells
 
 
 def write(out, step, cells, peaks):
