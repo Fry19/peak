@@ -28,6 +28,8 @@ final class OverlayCanvas: UIView {
     private var lastPrepare = Date.distantPast
     /// The heading correction last frame, to tell its moves from the phone's.
     private var lastCorrectionHeading: Double?
+    /// `AppModel.Correction.folded` when last drawn.
+    private var lastFolded: Double?
     private let haptics = UISelectionFeedbackGenerator()
     /// Peaks labeled last frame, which the next layout favors.
     private var labeled: Set<Int64> = []
@@ -286,9 +288,21 @@ final class OverlayCanvas: UIView {
             return
         }
         // The lens's offset changes with the picture when the lens switches, so it isn't eased.
-        let correction = frozen?.correction
-            ?? smoothedCorrection(model.viewCorrection(for: pose), zoom: model.zoom, at: now) + model.lensOffset(shown.lens, pose: pose)
-        if frozen != nil { smoothed = correction }
+        // Nor is the gyroscope's hold, which takes the compass's wander back out as it happens;
+        // when the correction takes over what the hold gave, the eased value moves along.
+        let folded = model.correction.compass.folded
+        if let lastFolded, folded != lastFolded { smoothed?.heading += folded - lastFolded }
+        lastFolded = folded
+        let correction: ViewCorrection
+        if let frozen {
+            correction = frozen.correction
+            // Live again, the lines start where the corrections are by then.
+            smoothed = nil
+        } else {
+            var c = smoothedCorrection(model.steadyCorrection(for: pose), zoom: model.zoom, at: now)
+            c.heading += model.unsmoothedHeading(at: shown.time)
+            correction = c + model.lensOffset(shown.lens, pose: pose)
+        }
         let correctionTurn = lastCorrectionHeading.map { azimuthDifference(correction.heading, $0) } ?? 0
         lastCorrectionHeading = correction.heading
         let orientation = screen?.interfaceOrientation ?? .portrait

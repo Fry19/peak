@@ -25,11 +25,13 @@ extension AppModel {
     /// it refines that lens's offset; otherwise it moves the main correction. Returns
     /// whether anything moved.
     func takeMatch(_ o: SkylineCorrector.Outcome) -> Bool {
+        // A frame from before the sensors restarted has no place under the gyroscope's zero.
+        guard o.gyro?.epoch == motion.latestGyro?.epoch else { return false }
         let since = lastWideMatch.map { Date().timeIntervalSince($0) }
         let measured = LensOffset(heading: o.delta, pitch: o.pitchDelta, roll: o.rollDelta)
         switch lensOffsets.take(lens: o.lens, sideways: o.sideways, measured: measured, sinceWideMatch: since) {
         case .main:
-            let moved = correction.add(o, north: motion.northCorrection)
+            let moved = correction.add(o, north: motion.northCorrection, now: motion.latestGyro)
             if moved, o.lens == LensSet.wideName { lastWideMatch = Date() }
             return moved
         case .refinedOffset:

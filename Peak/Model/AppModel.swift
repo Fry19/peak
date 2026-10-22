@@ -16,8 +16,13 @@ final class AppModel {
             var roll = 0.0
         }
 
-        /// The compass error, degrees.
-        var heading = 0.0
+        /// The compass error, held by the gyroscope between matches.
+        var compass = HeldHeading()
+        /// The compass error under the fused compass, degrees (without the gyroscope's hold).
+        var heading: Double {
+            get { compass.heading }
+            set { compass.heading = newValue }
+        }
         /// Pitch and roll for the phone held upright and held sideways, as skyline matches
         /// have measured them. A camera mounted a little askew tilts the view one way upright
         /// and another way sideways, so each keeps its own; they're saved, since they belong
@@ -31,7 +36,10 @@ final class AppModel {
         var matches = 0
         /// Which matches move the heading: two must agree before the first lock, and a lone
         /// jump waits for the next match to repeat it.
-        var lock = HeadingLock()
+        var lock: HeadingLock {
+            get { compass.lock }
+            set { compass.lock = newValue }
+        }
         var lastMatch: Date?
         var lastRMS = 0.0
         /// When the view was last lined up by hand.
@@ -51,17 +59,24 @@ final class AppModel {
                                   roll: level[i].roll + byHandLevel[i].roll)
         }
 
-        /// Takes an accepted match; `north` is the compass's north correction now. Returns
-        /// whether it moved anything: a match no other one has confirmed yet doesn't.
+        /// The gyroscope hold's part of the heading correction with the gyroscope at `gyro`.
+        func held(_ gyro: MotionTracker.Gyro?) -> Double {
+            compass.held(gyro?.reading)
+        }
+
+        /// Takes an accepted match; `north` is the compass's north correction now and `now`
+        /// the gyroscope's latest reading. Returns whether it moved anything: a match no
+        /// other one has confirmed yet doesn't.
         @discardableResult
-        mutating func add(_ o: SkylineCorrector.Outcome, north: Double) -> Bool {
+        mutating func add(_ o: SkylineCorrector.Outcome, north: Double, now: MotionTracker.Gyro?) -> Bool {
             // The heading this match measured, under the same north as `heading`. The lock
-            // takes the first one once two agree, then moves part of the way each time so a
-            // single odd frame can't make the labels jump. The level is steadier than the
-            // compass, so it moves more slowly, and only with matches the lock took.
-            guard let next = lock.add(o.from - north + o.delta, current: heading) else { return false }
+            // (under the gyroscope's zero, see `HeldHeading`) takes the first one once two
+            // agree, then moves part of the way each time so a single odd frame can't make the
+            // labels jump, and the gyroscope holds it from there. The level is steadier than
+            // the compass, so it moves more slowly, and only with matches the lock took.
+            // `from` has the north of its frame, as the gyroscope's divergence then does.
+            guard compass.add(o.from - (o.gyro?.north ?? north) + o.delta, at: o.gyro?.reading, now: now?.reading) else { return false }
             let first = matches == 0
-            heading = next
             let i = o.sideways ? 1 : 0
             let gain = first ? 0.5 : 0.3
             // The match measures the whole level, the part from lining up by hand included:
@@ -88,6 +103,9 @@ final class AppModel {
         var shown: Shown
         var pose: MotionTracker.Pose
         var correction: ViewCorrection
+        /// The gyroscope when the frame was taken, and the hold's part of `correction`.
+        var gyro: MotionTracker.Gyro?
+        var held = 0.0
         /// The frame's pixels, for saving it with its labels.
         var pixels: CVPixelBuffer?
     }
@@ -307,9 +325,34 @@ final class AppModel {
     /// Corrections to apply to the motion sensors for a pose: their north (magnetic or
     /// true) plus what skyline matching or lining up by hand found.
     func viewCorrection(for pose: MotionTracker.Pose?) -> ViewCorrection {
+        var c = baseCorrection(for: pose)
+        c.heading += heldHeading(at: nil)
+        return c
+    }
+
+    /// What the overlay eases: the corrections from matching and by hand, without the
+    /// compass's north and the gyroscope's hold (`unsmoothedHeading`), which follow the
+    /// sensors as they change.
+    func steadyCorrection(for pose: MotionTracker.Pose?) -> ViewCorrection {
+        correction.view(sideways: CameraGeometry.isSideways(pose))
+    }
+
+    /// The compass's north and the gyroscope's hold at `time` (seconds since boot).
+    func unsmoothedHeading(at time: TimeInterval?) -> Double {
+        motion.northCorrection + heldHeading(at: time)
+    }
+
+    /// `viewCorrection` without the gyroscope's hold.
+    func baseCorrection(for pose: MotionTracker.Pose?) -> ViewCorrection {
         var c = correction.view(sideways: CameraGeometry.isSideways(pose))
         c.heading += motion.northCorrection
         return c
+    }
+
+    /// The gyroscope hold's part of the heading correction at `time` (seconds since boot;
+    /// nil for the latest reading), degrees.
+    func heldHeading(at time: TimeInterval?) -> Double {
+        correction.held(time.flatMap { motion.gyro(at: $0) } ?? motion.latestGyro)
     }
 
     private func updateCorrector() {
@@ -327,7 +370,8 @@ final class AppModel {
         }
         corrector.update(horizon: horizon, upright: upright, sideways: sideways, lensOffsets: lensOffsets,
                          positionUncertainty: uncertainty,
-                         position: location.map { GeoPoint(latitude: $0.coordinate.latitude, longitude: $0.coordinate.longitude, height: 0) })
+                         position: location.map { GeoPoint(latitude: $0.coordinate.latitude, longitude: $0.coordinate.longitude, height: 0) },
+                         hold: correction.compass.hold)
     }
 
     func start() {
@@ -369,8 +413,8 @@ final class AppModel {
         camera.onLenses = { [weak self] in self?.lenses = $0 }
         camera.onFrame = { [weak self] frame in
             guard let self else { return }
-            if !self.corrector.paused, let pose = self.motion.pose(at: frame.time) {
-                self.corrector.offer(frame, pose: pose, gyro: self.motion.gyroHeading(at: frame.time), steady: self.motion.isSteady)
+            if !self.corrector.paused, let sample = self.motion.sample(at: frame.time) {
+                self.corrector.offer(frame, pose: sample.pose, gyro: sample.gyro, steady: self.motion.isSteady)
             }
             self.mailbox.post(frame) { [weak self] in self?.screen?.show($0) }
         }
@@ -521,9 +565,11 @@ final class AppModel {
     }
 
     private func freeze() {
-        if let shown = screen?.shown, let pose = motion.pose(at: shown.time), scene != nil {
-            frozen = Frozen(shown: shown, pose: pose, correction: viewCorrection(for: pose, lens: shown.lens),
-                            pixels: screen?.shownPixels)
+        if let shown = screen?.shown, let (pose, gyro) = motion.sample(at: shown.time), scene != nil {
+            var c = baseCorrection(for: pose) + lensOffset(shown.lens, pose: pose)
+            let held = correction.held(gyro)
+            c.heading += held
+            frozen = Frozen(shown: shown, pose: pose, correction: c, gyro: gyro, held: held, pixels: screen?.shownPixels)
         }
     }
 
@@ -633,6 +679,16 @@ final class AppModel {
     /// The view was lined up by hand: the pill says so rather than "Locked", and skyline
     /// matches have to agree with each other again before they move it.
     private func linedUpByHand() {
+        // The gyroscope holds the heading from here: for a paused picture, from when it was
+        // taken, so the compass's wander since then doesn't count.
+        let now = motion.latestGyro
+        if let frozen {
+            let shown = frozen.correction.heading - lensOffset(frozen.shown.lens, pose: frozen.pose).heading
+                - (frozen.gyro?.north ?? motion.northCorrection)
+            correction.compass.lineUp(shown, at: frozen.gyro?.reading, now: now?.reading)
+        } else {
+            correction.compass.set(correction.compass.correction(now?.reading), at: now?.reading)
+        }
         correction.byHand = Date()
         correction.lastMatch = nil
         correction.lock.reset()
@@ -651,15 +707,20 @@ final class AppModel {
         correction.level[i] = .init()
         correction.byHandLevel[i] = .init()
         lensOffsets.reset(sideways: i == 1)
-        if frozen != nil {
-            frozen?.correction.heading -= before.heading
+        if let f = frozen {
+            // Its heading may have been carried forward from when it was taken (lining up by
+            // hand): back to that moment's plain compass.
+            frozen?.correction.heading = (f.gyro?.north ?? motion.northCorrection) + lensOffset(f.shown.lens, pose: f.pose).heading
+            frozen?.held = 0
             frozen?.correction.pitch -= before.pitch
             frozen?.correction.roll -= before.roll
         }
         correction.lastMatch = nil
         correction.byHand = nil
         correction.lock.reset()
+        correction.compass.hold.reset()
         saveCalibration()
+        updateCorrector()
     }
 
     /// Moves the lines: heading, pitch and roll changes in degrees. Only for now: the level
@@ -1541,6 +1602,11 @@ final class AppModel {
                             correction.level[i].pitch, correction.level[i].roll,
                             correction.byHandLevel[i].pitch, correction.byHandLevel[i].roll))
         lines.append(String(format: "%ld matches", correction.matches))
+        if let r = correction.compass.hold.reference, let g = motion.latestGyro {
+            lines.append(r.epoch == g.epoch
+                ? String(format: "gyroscope hold %+.2f°, lined up %.0f s ago", correction.held(g), g.time - r.time)
+                : "gyroscope hold: sensors restarted since")
+        }
         if let o = lastOutcome {
             lines.append(o.accepted ? String(format: "last match: ok %+.2f°, %.2f° rms, %.0f ms", o.delta, o.rms, o.seconds * 1000)
                                         + (o.frames > 1 ? ", \(o.frames) frames of a pan" : "")

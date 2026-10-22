@@ -9,9 +9,12 @@ final class SkylineCorrector: @unchecked Sendable {
     struct Outcome {
         /// Corrections relative to the ones the frame was matched with, degrees.
         var delta: Double
-        /// The heading correction the frame was matched with (north included, the lens's
-        /// offset not), so a match can be compared with ones made under other corrections.
+        /// The heading correction the frame was matched with (north and the gyroscope's hold
+        /// included, the lens's offset not), so a match can be compared with ones made under
+        /// other corrections.
         var from: Double
+        /// The gyroscope when the frame was taken, to put the match under its steady zero.
+        var gyro: MotionTracker.Gyro?
         var pitchDelta: Double
         var rollDelta: Double
         /// The phone was held sideways; pitch and roll belong to that way of holding it.
@@ -68,6 +71,8 @@ final class SkylineCorrector: @unchecked Sendable {
     private var positionUncertainty = LocationQuality.matchingAccuracy
     /// Where the phone is (the latest fix), for keeping a pan's frames to one place.
     private var position: GeoPoint?
+    /// Keeps the heading lined up last by the gyroscope (`AppModel.Correction.hold`).
+    private var hold = HeadingHold()
     /// Counts pauses: work started before one leaves the strip alone.
     private var generation = 0
     private let matcher = SkylineMatcher()
@@ -81,7 +86,7 @@ final class SkylineCorrector: @unchecked Sendable {
     /// sideways and each lens's offset on top, and how far you may be from where the horizon was rendered, meters
     /// (`LocationQuality.positionUncertainty`). Call on any thread.
     func update(horizon: HorizonProfile?, upright: ViewCorrection, sideways: ViewCorrection, lensOffsets: LensOffsets,
-                positionUncertainty: Double, position: GeoPoint?) {
+                positionUncertainty: Double, position: GeoPoint?, hold: HeadingHold) {
         lock.lock()
         self.horizon = horizon
         self.upright = upright
@@ -89,6 +94,7 @@ final class SkylineCorrector: @unchecked Sendable {
         self.lensOffsets = lensOffsets
         self.positionUncertainty = positionUncertainty
         self.position = position
+        self.hold = hold
         lock.unlock()
     }
 
@@ -109,10 +115,10 @@ final class SkylineCorrector: @unchecked Sendable {
     }
 
     /// Offers a camera frame (on the camera queue) with the phone's pose when it was taken,
-    /// and the camera's heading by the gyroscope then (`MotionTracker.gyroHeading(at:)`).
+    /// and the gyroscope then (`MotionTracker.gyro(at:)`).
     /// Most are skipped: one is taken at a time, at most about once a second, only while
     /// the phone is steady, and none while paused.
-    func offer(_ frame: CameraFeed.Frame, pose: MotionTracker.Pose, gyro: (heading: Double, epoch: Int)?, steady: Bool) {
+    func offer(_ frame: CameraFeed.Frame, pose: MotionTracker.Pose, gyro: MotionTracker.Gyro?, steady: Bool) {
         lock.lock()
         guard !busy, !isPaused, steady, let horizon, Date().timeIntervalSince(lastStart) > 0.8 else {
             lock.unlock()
@@ -122,7 +128,9 @@ final class SkylineCorrector: @unchecked Sendable {
         lastStart = Date()
         // The correction covers both the compass's north (magnetic or true) and its error.
         let isSideways = CameraGeometry.isSideways(pose)
-        let base = isSideways ? sideways : upright
+        var base = isSideways ? sideways : upright
+        // The gyroscope keeps the heading lined up last, as the overlay draws it.
+        base.heading += gyro.map { hold.offset(divergence: $0.divergence, time: $0.time, epoch: $0.epoch) } ?? 0
         let correction = base + lensOffsets.offset(lens: frame.lens.name, sideways: isSideways)
         let uncertainty = positionUncertainty
         let position = self.position ?? horizon.observer
@@ -176,7 +184,7 @@ final class SkylineCorrector: @unchecked Sendable {
                     self.strip.removeAll()
                 }
             }
-            var outcome = Outcome(delta: a.headingCorrection, from: base.heading,
+            var outcome = Outcome(delta: a.headingCorrection, from: base.heading, gyro: gyro,
                                   pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
                                   sideways: isSideways, lens: lens.name, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
                                   ambiguity: a.ambiguity, nearAmbiguity: a.nearAmbiguity, runnerUp: a.runnerUp,

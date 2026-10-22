@@ -44,8 +44,11 @@ final class MotionTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var latest: Pose?
     /// Recent poses with their sensor timestamps (seconds since boot, the same clock as
-    /// camera frames), oldest first, and the back camera's heading by the gyroscope alone.
-    private var history: [(time: TimeInterval, pose: Pose, gyroHeading: Double)] = []
+    /// camera frames), oldest first, and the back camera's heading by the gyroscope alone
+    /// and the fused heading's divergence from it (see `Gyro`).
+    private var history: [(time: TimeInterval, pose: Pose, gyroHeading: Double, divergence: Double, north: Double)] = []
+    /// The last divergence measured with the camera off vertical, where it has a heading.
+    private var lastDivergence = 0.0
     /// The phone's attitude by the gyroscope, kept level by gravity: its heading doesn't
     /// follow the magnetometer, so frames of a pan can be placed relative to each other
     /// even where the compass is pulled off (`SkylineStrip`).
@@ -75,6 +78,7 @@ final class MotionTracker: @unchecked Sendable {
         lastUpdate = Date()
         // Readings in the old reference frame would mix two norths.
         history.removeAll()
+        lastDivergence = 0
         gyro = nil
         gyroEpoch += 1
         lock.unlock()
@@ -136,6 +140,18 @@ final class MotionTracker: @unchecked Sendable {
     func pose(at time: TimeInterval) -> Pose? {
         lock.lock()
         defer { lock.unlock() }
+        return lockedPose(at: time)
+    }
+
+    /// The pose and the gyroscope at `time` from one look at the readings, so a restart
+    /// can't pair a pose with another run's gyroscope.
+    func sample(at time: TimeInterval) -> (pose: Pose, gyro: Gyro?)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lockedPose(at: time).map { ($0, lockedGyro(at: time)) }
+    }
+
+    private func lockedPose(at time: TimeInterval) -> Pose? {
         guard let first = history.first, let last = history.last,
               time > first.time - 0.5, time < last.time + 0.5 else { return latest }
         if time <= first.time { return first.pose }
@@ -151,13 +167,35 @@ final class MotionTracker: @unchecked Sendable {
         return Pose.blend(a.pose, b.pose, max(0, min(1, f)))
     }
 
-    /// The back camera's heading by the gyroscope alone at `time` (seconds since boot),
-    /// from a zero that holds until the sensors restart (`epoch`); nil outside the readings.
-    func gyroHeading(at time: TimeInterval) -> (heading: Double, epoch: Int)? {
+    /// The gyroscope's view of one moment.
+    struct Gyro {
+        /// The back camera's heading by the gyroscope alone, from a zero that holds until
+        /// the sensors restart (`epoch`), degrees.
+        var heading: Double
+        /// The back camera's fused heading (true north, `northCorrection` included) less
+        /// `heading`: how far the compass has pulled the fused heading from the gyroscope's.
+        var divergence: Double
+        var epoch: Int
+        /// Seconds since boot.
+        var time: TimeInterval
+        /// `northCorrection` then, part of `divergence`.
+        var north: Double
+
+        var reading: GyroReading { GyroReading(divergence: divergence, time: time, epoch: epoch) }
+    }
+
+    /// The gyroscope at `time` (seconds since boot); nil outside the readings.
+    func gyro(at time: TimeInterval) -> Gyro? {
         lock.lock()
         defer { lock.unlock() }
+        return lockedGyro(at: time)
+    }
+
+    private func lockedGyro(at time: TimeInterval) -> Gyro? {
         guard let first = history.first, let last = history.last, time >= first.time, time <= last.time + 0.05 else { return nil }
-        if time >= last.time { return (last.gyroHeading, gyroEpoch) }
+        if time >= last.time {
+            return Gyro(heading: last.gyroHeading, divergence: last.divergence, epoch: gyroEpoch, time: time, north: last.north)
+        }
         var lo = 0, hi = history.count - 1
         while hi - lo > 1 {
             let mid = (lo + hi) / 2
@@ -165,7 +203,16 @@ final class MotionTracker: @unchecked Sendable {
         }
         let a = history[lo], b = history[hi]
         let f = b.time > a.time ? max(0, min(1, (time - a.time) / (b.time - a.time))) : 0
-        return (normalizedAzimuth(a.gyroHeading + f * azimuthDifference(b.gyroHeading, a.gyroHeading)), gyroEpoch)
+        return Gyro(heading: normalizedAzimuth(a.gyroHeading + f * azimuthDifference(b.gyroHeading, a.gyroHeading)),
+                    divergence: a.divergence + f * azimuthDifference(b.divergence, a.divergence), epoch: gyroEpoch, time: time,
+                    north: f < 0.5 ? a.north : b.north)
+    }
+
+    /// The gyroscope at the latest reading.
+    var latestGyro: Gyro? {
+        lock.lock()
+        defer { lock.unlock() }
+        return history.last.map { Gyro(heading: $0.gyroHeading, divergence: $0.divergence, epoch: gyroEpoch, time: $0.time, north: $0.north) }
     }
 
     /// Timestamp of the latest reading (seconds since boot).
@@ -215,8 +262,14 @@ final class MotionTracker: @unchecked Sendable {
         } else {
             gyro = GyroAttitude(x: pose.right, y: pose.up, z: pose.out)
         }
-        // The back camera looks along the phone's −z.
-        history.append((motion.timestamp, pose, gyro?.heading(of: SIMD3(0, 0, -1)) ?? 0))
+        // The back camera looks along the phone's −z. Pointed nearly straight up or down
+        // it has no heading to compare, so the divergence stays where it was.
+        let gyroHeading = gyro?.heading(of: SIMD3(0, 0, -1)) ?? 0
+        let north = useTrueNorth ? 0 : magneticDeclination
+        if abs(pose.out.z) < 0.95 {
+            lastDivergence = azimuthDifference(atan2(-pose.out.x, -pose.out.y) * 180 / .pi + north, gyroHeading)
+        }
+        history.append((motion.timestamp, pose, gyroHeading, lastDivergence, north))
         if history.count > 150 { history.removeFirst(history.count - 150) }
         rotationRate = (r.x * r.x + r.y * r.y + r.z * r.z).squareRoot()
         lastUpdate = now
