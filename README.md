@@ -41,7 +41,7 @@ The **list button** (bottom left) lists every peak around you, those in view fir
 - **Lens.** The field of view and optical center come from each frame's intrinsic matrix when the camera provides one, with focus kept far.
 - **Terrain detail.** See below. The shape of a nearby ridge is only as good as the terrain model, and sharp summits get their tips back from the peaks' surveyed heights (see "DEM accuracy at sharp summits").
 
-**Line up by hand** (the arrows button, bottom right) when the skyline can't be matched, say behind trees and roofs: the picture pauses, and you drag the lines onto the mountains and turn them with two fingers to level them. The pill then shows **Lined up** (cyan). The tilt you set is saved for your phone, separately for holding it upright and sideways, since a camera mounted a little askew tilts the view differently each way; skyline matching keeps refining it when it can.
+**Line up by hand** (the arrows button, bottom right) when the skyline can't be matched, say behind trees and roofs: the picture pauses, and you drag the lines onto the mountains and turn them with two fingers to level them. On a paused view, dragging slides the lines left or right along the horizon. Either way the pill then shows **Lined up** (cyan), and skyline matches move the lines again only once two of them agree. The tilt you set lasts for now; the level skyline matches measure is what's saved for your phone, separately for holding it upright and sideways, since a camera mounted a little askew tilts the view differently each way.
 
 Labels stand upright in the world whichever way you hold the phone, even with the screen's rotation locked.
 

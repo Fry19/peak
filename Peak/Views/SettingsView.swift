@@ -33,17 +33,6 @@ struct SettingsView: View {
             .sheetSection()
 
             Section {
-                Button {
-                    model.startAligning()
-                } label: {
-                    Label("Line up by hand", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
-                }
-            } footer: {
-                Text("Peak lines the labels up with the skyline on its own. If they sit off the mountains, drag them on yourself.")
-            }
-            .sheetSection()
-
-            Section {
                 NavigationLink {
                     OfflineAreasView(model: model)
                 } label: {

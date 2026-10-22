@@ -586,8 +586,27 @@ final class AppModel {
 
     func finishAligning() {
         aligning = false
+        linedUpByHand()
         frozen = nil
+    }
+
+    /// Slides the paused view's lines along the horizon, degrees. They stay where they're
+    /// put once the view is live again.
+    func nudge(heading: Double) {
+        guard heading != 0 else { return }
+        adjust(heading: heading, pitch: 0, roll: 0)
+        linedUpByHand()
+    }
+
+    /// The view was lined up by hand: the pill says so rather than "Locked", and skyline
+    /// matches have to agree with each other again before they move it.
+    private func linedUpByHand() {
         correction.byHand = Date()
+        correction.lastMatch = nil
+        correction.lock.reset()
+        // A telephoto's offset is measured against the wide lens's last match, which no
+        // longer holds: the next telephoto match goes through the lock like any other.
+        lastWideMatch = nil
         updateCorrector()
     }
 

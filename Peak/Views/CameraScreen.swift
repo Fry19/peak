@@ -32,6 +32,8 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     /// Its pixels, kept for saving it when the view is paused (only the newest frame's).
     private(set) var shownPixels: CVPixelBuffer?
     private(set) var lastFrameDate = Date.distantPast
+    /// A second finger joined the drag on the paused view.
+    private var pinching = false
 
     init(model: AppModel) {
         self.model = model
@@ -46,6 +48,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         addSubview(overlay)
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
         // Lining up by hand: drag to move the lines, turn with two fingers to level them.
+        // Paused, a drag slides them along the horizon.
         let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
         let rotation = UIRotationGestureRecognizer(target: self, action: #selector(rotated(_:)))
         // Pinch to zoom in on the picture and the lines together.
@@ -54,12 +57,33 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
             g.delegate = self
             addGestureRecognizer(g)
         }
+        // Without dragging (VoiceOver, Voice Control), the paused lines move by actions.
+        accessibilityLabel = "Paused view"
+        accessibilityCustomActions = [
+            UIAccessibilityCustomAction(name: "Move lines left") { [weak self] _ in self?.moveLines(heading: 0.5) ?? false },
+            UIAccessibilityCustomAction(name: "Move lines right") { [weak self] _ in self?.moveLines(heading: -0.5) ?? false },
+        ]
     }
 
-    // UIView asks itself this for its own gesture recognizers; dragging and turning only
-    // work while lining up.
+    /// The paused view is one element, for its actions to move the lines.
+    override var isAccessibilityElement: Bool {
+        get { model?.frozen != nil && model?.aligning == false }
+        set {}
+    }
+
+    private func moveLines(heading: Double) -> Bool {
+        guard let model, model.frozen != nil, !model.aligning else { return false }
+        model.nudge(heading: heading)
+        overlay.update()
+        return true
+    }
+
+    // UIView asks itself this for its own gesture recognizers; turning only works while
+    // lining up, and dragging then or while paused.
     override func gestureRecognizerShouldBegin(_ gesture: UIGestureRecognizer) -> Bool {
-        gesture is UITapGestureRecognizer || gesture is UIPinchGestureRecognizer || model?.aligning == true
+        if gesture is UITapGestureRecognizer || gesture is UIPinchGestureRecognizer { return true }
+        guard let model else { return false }
+        return model.aligning || (gesture is UIPanGestureRecognizer && model.frozen != nil)
     }
 
     @objc private func pinched(_ gesture: UIPinchGestureRecognizer) {
@@ -85,15 +109,26 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     }
 
     @objc private func panned(_ gesture: UIPanGestureRecognizer) {
-        guard let model, model.aligning, let f = overlay.lastFocal, f > 0 else { return }
+        guard let model, model.aligning || model.frozen != nil, let f = overlay.lastFocal, f > 0 else { return }
         let t = gesture.translation(in: self)
         gesture.setTranslation(.zero, in: self)
+        // Paused, two fingers are pinching: that zooms, it doesn't turn the view, nor does
+        // the finger left once the other lifts.
+        if !model.aligning {
+            if gesture.state == .began { pinching = false }
+            if gesture.numberOfTouches > 1 { pinching = true }
+            guard !pinching, gesture.state == .began || gesture.state == .changed else { return }
+        }
         // The drag in the world's terms: along the horizon, and down.
         let a = overlay.upAngle
         let along = Double(t.x * cos(a) + t.y * sin(a)), down = Double(-t.x * sin(a) + t.y * cos(a))
         // Lines follow the finger: turning the view left moves them right, tilting it up
         // moves them down.
-        model.adjust(heading: -along / f * 180 / .pi, pitch: down / f * 180 / .pi, roll: 0)
+        if model.aligning {
+            model.adjust(heading: -along / f * 180 / .pi, pitch: down / f * 180 / .pi, roll: 0)
+        } else {
+            model.nudge(heading: -along / f * 180 / .pi)
+        }
         overlay.update()
     }
 

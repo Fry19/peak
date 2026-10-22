@@ -72,7 +72,9 @@ struct RootView: View {
                             }
                             RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
                         } else if showsBarButtons {
-                            // Lining up by hand is in Settings: the skyline match usually does it.
+                            RoundButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right", label: "Line up by hand") {
+                                model.startAligning()
+                            }
                             RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
                         }
                     }
@@ -110,7 +112,7 @@ struct RootView: View {
         }
     }
 
-    /// The peak list and settings sit beside the pill once the view is working;
+    /// The peak list, lining up and settings sit beside the pill once the view is working;
     /// while something's wrong, the pill's message gets the whole width.
     private var showsBarButtons: Bool {
         guard !model.aligning else { return false }
@@ -224,6 +226,7 @@ private struct AlignBanner: View {
                     .buttonStyle(.bordered)
                 Button("Done") { model.finishAligning() }
                     .buttonStyle(.borderedProminent)
+                    .foregroundStyle(.black)
             }
             .tint(.white)
         }
