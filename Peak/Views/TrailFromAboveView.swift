@@ -3,10 +3,11 @@ import SwiftUI
 import simd
 
 /// The trail seen from straight above, north up, over the terrain's ridgelines: a dark
-/// hillshade, the crests glowing faintly (main ridges brightest), the trail in orange, the
-/// summit and you. Drawn from the terrain already on the phone, so it works without a
-/// signal; with one, satellite imagery can go underneath instead. Pinch and drag to look
-/// around; double-tap to zoom in.
+/// hillshade, faintly tinted where OpenStreetMap has glaciers, water and bare rock, the
+/// crests glowing faintly (main ridges brightest), the trail in orange, the summit and you.
+/// Drawn from the terrain already on the phone, so it works without a signal; with one,
+/// satellite imagery can go underneath instead. Pinch and drag to look around; double-tap
+/// to zoom in.
 struct TrailFromAboveView: View {
     let model: AppModel
     let trail: AppModel.ARTrail
@@ -86,10 +87,15 @@ struct TrailFromAboveView: View {
                     if let map { bottomBar(Viewport(size: full, map: map, content: content)) }
                 }
             }
-            // Built again when the terrain sharpens, you've moved or the screen turned.
+            // Built again when the terrain sharpens, land cover arrives, you've moved or the
+            // screen turned.
             .task(id: BuildKey(trail: trail.trail.id, terrain: model.scene.map { ObjectIdentifier($0.terrain) },
+                               cover: model.covers[trail.trail.id]?.revision ?? 0,
                                width: Int(full.width), height: Int(full.height))) {
                 await build(screen: full, content: content)
+            }
+            .task(id: CoverKey(trail: trail.trail.id, online: model.online)) {
+                await model.fetchCover(trail.trail, peak: model.peak(trail.peakID))
             }
             .task(id: ImageryKey(on: satellite, center: map?.projection.center, rect: map?.shadeRect)) {
                 await loadImagery(screen: full, content: content)
@@ -224,6 +230,7 @@ struct TrailFromAboveView: View {
     private struct BuildKey: Equatable {
         var trail: String
         var terrain: ObjectIdentifier?
+        var cover: Int
         var width: Int
         var height: Int
     }
@@ -249,8 +256,11 @@ struct TrailFromAboveView: View {
         let route = trail.trail, peak = model.peak(trail.peakID), here = model.scene?.position
         let fresh = builtFor != route.id
         if fresh { building = true }
+        let cover = await model.savedCover(route, peak: peak)
+        guard !Task.isCancelled else { return }
         let built = await Task.detached(priority: .userInitiated) {
-            OverheadMap.build(trail: route, peak: peak, observer: here, terrain: terrain, screen: screen, content: content)
+            OverheadMap.build(trail: route, peak: peak, observer: here, terrain: terrain, cover: cover, screen: screen,
+                              content: content)
         }.value
         guard !Task.isCancelled else { return }
         if fresh {
@@ -422,7 +432,8 @@ struct OverheadMap: @unchecked Sendable {
 
     /// Built for a screen of `screen` points, with the trail fitting inside `content`. With
     /// `lookAround` off it's a still picture: just what's on screen with the whole trail in view.
-    static func build(trail: Trail, peak: Peak?, observer: LatLon?, terrain: Terrain,
+    /// `cover` tints the terrain where there are glaciers, water and bare rock.
+    static func build(trail: Trail, peak: Peak?, observer: LatLon?, terrain: Terrain, cover: AppModel.TrailCover?,
                       screen: CGSize, content: EdgeInsets, lookAround: Bool = true) -> OverheadMap? {
         let area = CGRect(x: content.leading, y: content.top,
                           width: max(1, screen.width - content.leading - content.trailing),
@@ -438,7 +449,8 @@ struct OverheadMap: @unchecked Sendable {
         let cell = max(30, max(width, height) / 900)
         let relief = ReliefMap(terrain: terrain, extent: MapExtent(center: frame.center, width: width, height: height), cellSize: cell)
         let projection = relief.projection
-        guard let shade = image(relief, shade: relief.hillshade(exaggeration: 1.3)) else { return nil }
+        let ground = cover.map { relief.landCover($0.areas, within: $0.box, fade: coverFade) }
+        guard let shade = image(relief, shade: relief.hillshade(exaggeration: 1.3), cover: ground) else { return nil }
 
         var bands = bandSteps.map { Band(path: Path(), opacity: $0.opacity, width: $0.width, glow: $0.glow) }
         // On a map of a wide area, short spurs are only clutter.
@@ -502,8 +514,14 @@ struct OverheadMap: @unchecked Sendable {
         return MapExtent(center: projection.latLon(SIMD2(0, shift)), width: frame.width, height: frame.height + grow)
     }
 
+    /// How far land cover fades in from the edge of where it was fetched, meters, so it
+    /// doesn't stop in a straight line.
+    static let coverFade = 1_500.0
+
     /// The hillshade as a dark, faintly blue picture; higher ground a touch lighter, like snow.
-    private static func image(_ relief: ReliefMap, shade: [Float]) -> CGImage? {
+    /// Land cover tints it faintly: bare rock and scree a touch lighter and cooler, glaciers
+    /// pale blue-white, water dark blue, each still shaded by the slopes.
+    private static func image(_ relief: ReliefMap, shade: [Float], cover: LandCoverGrid?) -> CGImage? {
         let known = relief.heights.filter(\.isFinite)
         guard let low = known.min(), let high = known.max() else { return nil }
         let range = max(1, high - low)
@@ -511,9 +529,16 @@ struct OverheadMap: @unchecked Sendable {
         for i in 0..<(relief.rows * relief.cols) where shade[i].isFinite {
             let s = shade[i], e = (relief.heights[i] - low) / range
             let light = 0.03 + 0.21 * s * s + 0.05 * e
-            pixels[4 * i] = UInt8(min(255, 255 * light * 0.84))
-            pixels[4 * i + 1] = UInt8(min(255, 255 * light * 0.93))
-            pixels[4 * i + 2] = UInt8(min(255, 255 * light * 1.08))
+            var color = light * SIMD3<Float>(0.84, 0.93, 1.08)
+            if let cover {
+                let rock = cover.rock[i], ice = cover.glacier[i], water = cover.water[i]
+                if rock > 0 { color += (light * 1.22 * SIMD3(0.78, 0.93, 1.14) - color) * rock }
+                if ice > 0 { color += ((0.13 + 0.32 * s * s + 0.06 * e) * SIMD3(0.74, 0.89, 1.12) - color) * ice }
+                if water > 0 { color += ((0.025 + 0.02 * s) * SIMD3(0.75, 1.3, 2.6) - color) * water }
+            }
+            pixels[4 * i] = UInt8(min(255, 255 * color.x))
+            pixels[4 * i + 1] = UInt8(min(255, 255 * color.y))
+            pixels[4 * i + 2] = UInt8(min(255, 255 * color.z))
             pixels[4 * i + 3] = 255
         }
         guard let provider = CGDataProvider(data: Data(pixels) as CFData) else { return nil }
@@ -947,8 +972,12 @@ struct TrailMapPreview: View {
             .buttonStyle(.plain)
             .disabled(map == nil || place != nil)
             .task(id: Key(trail: trail.id, terrain: (place ?? model.scene).map { ObjectIdentifier($0.terrain) },
-                          width: Int(size.width), height: Int(size.height))) {
+                          cover: model.covers[trail.id]?.revision ?? 0, width: Int(size.width), height: Int(size.height))) {
                 await build(size)
+            }
+            // The map from above and the walk in 3D, opened from here, have it too.
+            .task(id: CoverKey(trail: trail.id, online: model.online)) {
+                await model.fetchCover(trail, peak: peak)
             }
         }
         .accessibilityElement(children: .ignore)
@@ -960,6 +989,7 @@ struct TrailMapPreview: View {
     private struct Key: Equatable {
         var trail: String
         var terrain: ObjectIdentifier?
+        var cover: Int
         var width: Int
         var height: Int
     }
@@ -972,8 +1002,10 @@ struct TrailMapPreview: View {
             return
         }
         let route = trail, peak = self.peak, here = scene?.position, content = Self.content
+        let cover = await model.savedCover(route, peak: peak)
+        guard !Task.isCancelled else { return }
         let built = await Task.detached(priority: .userInitiated) {
-            OverheadMap.build(trail: route, peak: peak, observer: here, terrain: terrain, screen: size,
+            OverheadMap.build(trail: route, peak: peak, observer: here, terrain: terrain, cover: cover, screen: size,
                               content: content, lookAround: false)
         }.value
         guard !Task.isCancelled else { return }
@@ -982,4 +1014,10 @@ struct TrailMapPreview: View {
             failed = built == nil
         }
     }
+}
+
+/// Land cover around a trail is fetched again when the connection comes back.
+struct CoverKey: Equatable {
+    var trail: String
+    var online: Bool
 }

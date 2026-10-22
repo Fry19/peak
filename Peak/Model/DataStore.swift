@@ -66,12 +66,14 @@ struct OfflineArea: Codable, Identifiable, Hashable {
         let terrain = pixels(level: 2, margin: TerrainScene.radius, wholeTiles: true) +
                       pixels(level: 1, margin: AppModel.areaMediumDetail, wholeTiles: false) +
                       pixels(level: 0, margin: AppModel.areaFullDetail, wholeTiles: false)
-        return Int(terrain * 2.5) + 3_000_000
+        // Land cover: about 60 KB a cell kept in the Alps.
+        let cells = DataStore.landCoverCells(OfflineArea(name: "", latitude: latitude, longitude: longitude, radius: radius)).count
+        return Int(terrain * 2.5) + cells * 60_000 + 3_000_000
     }
 }
 
-/// Downloads terrain, peaks, hikes and facts, and keeps them on the phone, so a place
-/// visited once works offline afterwards.
+/// Downloads terrain, peaks, hikes, land cover and facts, and keeps them on the phone, so a
+/// place visited once works offline afterwards.
 ///
 /// Copernicus tiles are cloud-optimized GeoTIFFs with built-in lower-resolution copies, so
 /// a tile can be fetched at 240 m (about 0.6 MB), 120 m (2 MB) or 60 m (8 MB) with one range
@@ -110,6 +112,7 @@ actor DataStore {
     private let trailDirectory: URL
     private let factDirectory: URL
     private let areaDirectory: URL
+    private let coverDirectory: URL
     /// Tile headers read this session, by tile.
     private var layouts: [Key: GeoTIFF.Layout] = [:]
 
@@ -121,7 +124,8 @@ actor DataStore {
         trailDirectory = baseDirectory.appendingPathComponent("Trails", isDirectory: true)
         factDirectory = baseDirectory.appendingPathComponent("Facts", isDirectory: true)
         areaDirectory = baseDirectory.appendingPathComponent("Areas", isDirectory: true)
-        for dir in [demDirectory, peakDirectory, trailDirectory, factDirectory, areaDirectory] {
+        coverDirectory = baseDirectory.appendingPathComponent("LandCover", isDirectory: true)
+        for dir in [demDirectory, peakDirectory, trailDirectory, factDirectory, areaDirectory, coverDirectory] {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         // Everything here can be downloaded again: keep it out of iCloud backups, which it
@@ -545,10 +549,119 @@ actor DataStore {
     /// `summitRadius`), with a little to spare, meters.
     static let summitPathRadius = 450.0
 
+    // MARK: Land cover
+
+    /// How long kept land cover is good for before it's fetched again (with a signal):
+    /// glaciers and lakes change slowly.
+    static let landCoverLifetime: TimeInterval = 90 * 86_400
+
+    /// Land cover cells read this session.
+    private var coverCells: [LandCoverCell: [LandCoverArea]] = [:]
+    /// Land cover downloads under way, by cell: a second request for a cell waits for the
+    /// first instead of asking the servers again.
+    private var coverDownloads: [LandCoverCell: Task<Void, Error>] = [:]
+
+    /// Glaciers, water, bare rock and scree in a box, from the phone. With `fetch`, the
+    /// cells that aren't on the phone (or are old) are downloaded first; one that can't be
+    /// is left out, and `complete` is false.
+    func landCover(in box: GeoBox, fetch: Bool) async -> (areas: [LandCoverArea], complete: Bool) {
+        let cells = LandCoverCell.covering(box)
+        if fetch {
+            try? await fetchCover(cells.filter { age(of: coverURL($0)) >= Self.landCoverLifetime }, strict: false)
+        }
+        var seen = Set<Int64>()
+        var areas: [LandCoverArea] = []
+        var complete = true
+        for cell in cells {
+            guard let found = savedCover(cell) else {
+                complete = false
+                continue
+            }
+            for area in found where seen.insert(area.id).inserted && area.bounds.intersects(box) { areas.append(area) }
+        }
+        return (areas, complete)
+    }
+
+    private func coverURL(_ cell: LandCoverCell) -> URL {
+        coverDirectory.appendingPathComponent(cell.fileName)
+    }
+
+    /// A cell's land cover on the phone, however old; nil when it isn't there.
+    private func savedCover(_ cell: LandCoverCell) -> [LandCoverArea]? {
+        if let areas = coverCells[cell] { return areas }
+        guard let data = try? Data(contentsOf: coverURL(cell)), let areas = try? LandCoverArea.decode(data) else { return nil }
+        // An Alpine cell is a few hundred kilobytes read: keep the last few dozen.
+        if coverCells.count >= 48 { coverCells.removeAll() }
+        coverCells[cell] = areas
+        return areas
+    }
+
+    /// Downloads cells, a block of up to 3 by 3 per query and one block at a time (the
+    /// servers allow few queries at once). Cells already being downloaded are waited for.
+    /// Throws the last failure, once every block has been tried.
+    private func fetchCover(_ cells: [LandCoverCell], strict: Bool) async throws {
+        var waits = Set(cells.compactMap { coverDownloads[$0] })
+        let new = cells.filter { coverDownloads[$0] == nil }
+        if !new.isEmpty {
+            let batches = LandCoverCell.batches(new)
+            let task = Task {
+                var failure: Error?
+                for batch in batches {
+                    try Task.checkCancellation()
+                    do { try await self.downloadCover(batch, strict: strict) } catch { failure = error }
+                }
+                if let failure { throw failure }
+            }
+            for cell in new { coverDownloads[cell] = task }
+            waits.insert(task)
+            defer { for cell in new where coverDownloads[cell] == task { coverDownloads[cell] = nil } }
+            var failure: Error?
+            for wait in waits {
+                do { try await wait.value } catch { failure = error }
+            }
+            if let failure { throw failure }
+        } else {
+            for wait in waits { try await wait.value }
+        }
+    }
+
+    /// One query for a block of cells, kept cell by cell: each keeps every area that
+    /// reaches into it, whole. With `strict` (saving an area), a cell that can't be kept on
+    /// the phone (the disk is full) is a failure.
+    private func downloadCover(_ cells: [LandCoverCell], strict: Bool) async throws {
+        guard let box = LandCoverCell.box(cells) else { return }
+        let data = try await overpass(Overpass.landCoverQuery(south: box.south, west: box.west, north: box.north, east: box.east),
+                                      timeout: 100)
+        let areas = try Overpass.landCover(fromJSON: data)
+        let bounds = areas.map(\.bounds)
+        for cell in cells {
+            let inCell = areas.indices.filter { bounds[$0].intersects(cell.box) }.map { areas[$0] }
+            do {
+                try LandCoverArea.encode(inCell).write(to: coverURL(cell), options: .atomic)
+            } catch {
+                if strict { throw error }
+            }
+            coverCells[cell] = inCell
+        }
+    }
+
+    /// The land cover cells an area keeps: around every hike of its peaks, with room for
+    /// the maps of them (`AppModel.coverMargin`).
+    nonisolated static func landCoverCells(_ area: OfflineArea) -> [LandCoverCell] {
+        let box = area.box(margin: hikeRadius + AppModel.coverMargin)
+        return LandCoverCell.covering(GeoBox(south: box.south, west: box.west, north: box.north, east: box.east))
+    }
+
+    /// Downloads the land cover of an area that isn't on the phone yet.
+    func downloadAreaLandCover(_ area: OfflineArea) async throws {
+        let missing = Self.landCoverCells(area).filter { !FileManager.default.fileExists(atPath: coverURL($0).path) }
+        try await fetchCover(missing, strict: true)
+    }
+
     // MARK: Areas saved for offline use
     //
     // An area keeps the peaks that can be seen from anywhere in it and the hikes of every
-    // peak in it (in Areas/), and its terrain in the shared terrain cache.
+    // peak in it (in Areas/), and its terrain and land cover in the shared caches.
 
     /// Peaks and trails of saved areas, read once.
     private var areaPeakCache: [UUID: [Peak]] = [:]
@@ -630,8 +743,8 @@ actor DataStore {
         areaTrailCache[area.id] = trails
     }
 
-    /// Deletes an area's peaks and hikes, and the terrain no other area (and not the place
-    /// you are now) uses.
+    /// Deletes an area's peaks and hikes, and the terrain and land cover no other area (and
+    /// not the place you are now) uses.
     func deleteArea(_ area: OfflineArea, keeping others: [OfflineArea], near here: LatLon?) {
         for file in areaFiles(area) { try? FileManager.default.removeItem(at: file) }
         areaPeakCache[area.id] = nil
@@ -644,6 +757,12 @@ actor DataStore {
             try? FileManager.default.removeItem(at: file)
         }
         for key in layouts.keys where names.contains(key.name) { layouts[key] = nil }
+        var keptCells = Set(others.flatMap(Self.landCoverCells))
+        if let here { keptCells.formUnion(LandCoverCell.covering(GeoBox(around: here, radius: Self.hikeRadius + AppModel.coverMargin))) }
+        for cell in Self.landCoverCells(area) where !keptCells.contains(cell) {
+            try? FileManager.default.removeItem(at: coverURL(cell))
+            coverCells[cell] = nil
+        }
     }
 
     /// Bytes an area takes on the phone (terrain shared with other areas counts for each).
@@ -652,6 +771,7 @@ actor DataStore {
         var files = (try? FileManager.default.contentsOfDirectory(at: demDirectory, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         files = files.filter { names.contains(String($0.lastPathComponent.prefix(7))) }
         files += areaFiles(area)
+        files += Self.landCoverCells(area).map(coverURL)
         return files.reduce(0) { $0 + ((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
     }
 
@@ -788,10 +908,11 @@ actor DataStore {
 
     /// Deletes everything downloaded.
     func clear() {
-        for dir in [demDirectory, peakDirectory, trailDirectory, factDirectory, areaDirectory] {
+        for dir in [demDirectory, peakDirectory, trailDirectory, factDirectory, areaDirectory, coverDirectory] {
             try? FileManager.default.removeItem(at: dir)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         layouts.removeAll()
+        coverCells.removeAll()
     }
 }

@@ -258,6 +258,9 @@ final class AppModel {
     @ObservationIgnored private(set) var lastBuildSeconds = 0.0
     @ObservationIgnored private(set) var bytesDownloaded = 0
     @ObservationIgnored private var details: [Int64: PeakDetails] = [:]
+    /// Land cover around trails shown, by trail.
+    private(set) var covers: [String: TrailCover] = [:]
+    @ObservationIgnored private var coverFetches: Set<String> = []
     @ObservationIgnored private var draping = false
     @ObservationIgnored private var drapeAgain = false
 
@@ -664,6 +667,54 @@ final class AppModel {
     /// A hike already loaded for a peak's card.
     func hike(_ trailID: String, peakID: Int64) -> PeakDetails.Hike? {
         details[peakID]?.hikes.first { $0.id == trailID }
+    }
+
+    /// Glaciers, water, bare rock and scree around a trail, which its maps and its walk in 3D
+    /// tint the terrain with.
+    struct TrailCover {
+        /// Where it was looked for.
+        var box: GeoBox
+        var areas: [LandCoverArea]
+        /// All of the box is on the phone.
+        var complete: Bool
+        /// Counts up as more arrives, so what's drawn from it is drawn again.
+        var revision = 0
+    }
+
+    /// How far around a trail and its summit land cover is fetched, meters: the walk in 3D
+    /// shows a few kilometers around the trail, and the map from above about as much.
+    static let coverMargin = 5_000.0
+
+    /// The box land cover is fetched for around a trail.
+    static func coverBox(_ trail: Trail, peak: Peak?) -> GeoBox? {
+        OverheadMap.frame(trail: trail, around: peak.map { [$0.position] } ?? [], aspect: 0.46)
+            .map { GeoBox($0, margin: coverMargin) }
+    }
+
+    /// The land cover on the phone around a trail, read once. Quick: views drawing the trail
+    /// wait for it, so they're drawn once with it rather than twice.
+    @MainActor func savedCover(_ trail: Trail, peak: Peak?) async -> TrailCover? {
+        if let cover = covers[trail.id] { return cover }
+        guard let box = Self.coverBox(trail, peak: peak) else { return nil }
+        let saved = await store.landCover(in: box, fetch: false)
+        if let cover = covers[trail.id] { return cover }   // read meanwhile
+        // Trails looked at a while ago go; their land cover is still on the phone.
+        if covers.count >= 8 { covers.removeAll() }
+        covers[trail.id] = TrailCover(box: box, areas: saved.areas, complete: saved.complete)
+        return covers[trail.id]
+    }
+
+    /// Downloads the land cover around a trail that isn't on the phone, with a signal (none
+    /// is asked for without one). `covers` changes when it arrives.
+    @MainActor func fetchCover(_ trail: Trail, peak: Peak?) async {
+        guard online, !coverFetches.contains(trail.id) else { return }
+        coverFetches.insert(trail.id)
+        defer { coverFetches.remove(trail.id) }
+        guard let saved = await savedCover(trail, peak: peak), !saved.complete else { return }
+        let fetched = await store.landCover(in: saved.box, fetch: true)
+        guard fetched.complete || fetched.areas.count != saved.areas.count else { return }
+        covers[trail.id] = TrailCover(box: saved.box, areas: fetched.areas, complete: fetched.complete,
+                                      revision: (covers[trail.id]?.revision ?? 0) + 1)
     }
 
     /// Loads again the facts or hikes that failed for a peak.
@@ -1148,7 +1199,7 @@ final class AppModel {
         let far = area.tiles
         let medium = DataStore.tiles(latitude: area.latitude, longitude: area.longitude, radius: area.radius + Self.areaMediumDetail)
         let near = DataStore.tiles(latitude: area.latitude, longitude: area.longitude, radius: area.radius + Self.areaFullDetail)
-        let steps = Double(far.count + medium.count + near.count + 2)
+        let steps = Double(far.count + medium.count + near.count + 3)
         var done = 0.0
         var failure: String?
         func report(_ step: String) {
@@ -1158,7 +1209,7 @@ final class AppModel {
             if !(error is CancellationError) { failure = error.localizedDescription }
         }
 
-        // Peaks and hikes first: small, and from a different server than the terrain.
+        // Peaks, hikes and land cover first: from a different server than the terrain.
         report("Peaks")
         do { try await store.downloadAreaPeaks(area) } catch { failed(error) }
         done += 1
@@ -1172,6 +1223,9 @@ final class AppModel {
                 }
             }
         } catch { failed(error) }
+        done += 1
+        report("Land cover")
+        do { try await store.downloadAreaLandCover(area) } catch { failed(error) }
         done += 1
         for (i, key) in far.enumerated() where !Task.isCancelled {
             report("Terrain \(i + 1) of \(far.count) · 120 m")
@@ -1248,6 +1302,7 @@ final class AppModel {
         Task { @MainActor in
             await store.clear()
             details.removeAll()
+            covers.removeAll()
             storageBytes = await store.storageUsed()
         }
     }

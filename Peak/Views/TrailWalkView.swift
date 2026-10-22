@@ -4,7 +4,8 @@ import SwiftUI
 import UIKit
 
 /// The trail in 3D: the terrain around it lit from the north-west, far ridges fading into
-/// haze, and the trail in orange. It opens looking straight down, as the map does, with the
+/// haze, glaciers, water and bare rock tinted where OpenStreetMap has them, and the trail in
+/// orange. It opens looking straight down, as the map does, with the
 /// ridge crests glowing faintly, then tilts down behind the start, the crests fading as it
 /// nears the horizon, and walks the trail to its end.
 /// Pause to look around (drag to orbit, pinch to zoom); the slider moves along the trail.
@@ -47,6 +48,13 @@ struct TrailWalkView: View {
             }
         }
         .task(id: trail.trail.id) { await build() }
+        .task(id: CoverKey(trail: trail.trail.id, online: model.online)) {
+            await model.fetchCover(trail.trail, peak: model.peak(trail.peakID))
+        }
+        // Land cover that arrives once the walk is under way tints the terrain where it stands.
+        .task(id: [model.covers[trail.trail.id]?.revision ?? -1, world == nil ? 0 : 1]) {
+            if let world, let cover = model.covers[trail.trail.id] { await world.tint(with: cover) }
+        }
         .onDisappear { player.stop() }
     }
 
@@ -56,8 +64,10 @@ struct TrailWalkView: View {
             return
         }
         let route = trail.trail, peak = model.peak(trail.peakID), units = model.settings.units
+        let cover = await model.savedCover(route, peak: peak)
+        guard !Task.isCancelled else { return }
         let built = await Task.detached(priority: .userInitiated) {
-            WalkWorld.build(trail: route, peak: peak, terrain: terrain, units: units)
+            WalkWorld.build(trail: route, peak: peak, terrain: terrain, cover: cover, units: units)
         }.value
         guard !Task.isCancelled else { return }
         withAnimation(.easeOut(duration: 0.3)) {
@@ -88,9 +98,15 @@ final class WalkWorld: @unchecked Sendable {
     let overhead: (eye: SIMD3<Double>, target: SIMD3<Double>)
     /// How far from the walker the camera follows, meters.
     let range: Double
+    /// The sharp terrain around the trail, what its colors are made from, and the land cover
+    /// they're tinted with (its revision).
+    private let ground: SCNNode
+    private let shades: GroundShades
+    private var coverRevision: Int?
 
     private init(scene: SCNScene, camera: SCNNode, walker: SCNNode, you: SCNNode, label: SCNNode?, crests: SCNNode, walk: TrailWalk,
-                 relief: ReliefMap, profile: TrailProfile?, overhead: (eye: SIMD3<Double>, target: SIMD3<Double>), range: Double) {
+                 relief: ReliefMap, profile: TrailProfile?, overhead: (eye: SIMD3<Double>, target: SIMD3<Double>), range: Double,
+                 ground: SCNNode, shades: GroundShades, coverRevision: Int?) {
         self.scene = scene
         self.camera = camera
         self.walker = walker
@@ -102,6 +118,9 @@ final class WalkWorld: @unchecked Sendable {
         self.profile = profile
         self.overhead = overhead
         self.range = range
+        self.ground = ground
+        self.shades = shades
+        self.coverRevision = coverRevision
     }
 
     static let background = UIColor(red: 0.035, green: 0.043, blue: 0.058, alpha: 1)
@@ -139,7 +158,8 @@ final class WalkWorld: @unchecked Sendable {
         walk.point(at: distance) + SIMD3(0, 0, 3)
     }
 
-    static func build(trail: Trail, peak: Peak?, terrain: Terrain, units: AppSettings.Units) -> WalkWorld? {
+    static func build(trail: Trail, peak: Peak?, terrain: Terrain, cover: AppModel.TrailCover?,
+                      units: AppSettings.Units) -> WalkWorld? {
         guard let frame = OverheadMap.frame(trail: trail, around: peak.map { [$0.position] } ?? [], aspect: 0.46) else { return nil }
         // The trail with a few kilometers around it at the terrain's own 30 m where it can,
         // and around that a wide, coarser ring out to where the haze swallows it, so a view
@@ -183,8 +203,9 @@ final class WalkWorld: @unchecked Sendable {
         // few meters lower, so the sharp terrain always covers the seam.
         let edge = side / 2 - 2 * wide.cellSize
         let hole = (low: SIMD2(-edge, -edge), high: SIMD2(edge, edge))
-        scene.rootNode.addChildNode(terrainNode(relief, low: low, high: high))
-        scene.rootNode.addChildNode(terrainNode(wide, low: low, high: high, hole: hole, sink: 15))
+        let ground = terrainNode(relief, low: low, high: high, cover: cover.flatMap { landCover($0, on: relief) })
+        scene.rootNode.addChildNode(ground.node)
+        scene.rootNode.addChildNode(terrainNode(wide, low: low, high: high, hole: hole, sink: 15).node)
         let crests = SCNNode()
         for node in crestNodes(relief) + crestNodes(wide, outside: hole) { crests.addChildNode(node) }
         scene.rootNode.addChildNode(crests)
@@ -267,7 +288,28 @@ final class WalkWorld: @unchecked Sendable {
         let overhead = (eye: SIMD3(center.x, center.y, (floor.isFinite ? floor : Double(high)) + altitude),
                         target: SIMD3(center.x, center.y, floor.isFinite ? floor : Double(low)))
         return WalkWorld(scene: scene, camera: camera, walker: walker, you: you, label: label, crests: crests, walk: walk, relief: relief,
-                         profile: profile, overhead: overhead, range: range)
+                         profile: profile, overhead: overhead, range: range, ground: ground.node, shades: ground.shades,
+                         coverRevision: cover?.revision)
+    }
+
+    /// Land cover on the sharp terrain's grid. It fades out toward the terrain's edge, where
+    /// the coarser ring around it, untinted, takes over.
+    private static func landCover(_ cover: AppModel.TrailCover, on relief: ReliefMap) -> LandCoverGrid? {
+        cover.box.intersection(relief.box).map { relief.landCover(cover.areas, within: $0, fade: OverheadMap.coverFade) }
+    }
+
+    /// Tints the terrain with land cover that arrived after it was built.
+    @MainActor func tint(with cover: AppModel.TrailCover) async {
+        guard cover.revision != coverRevision, let old = ground.geometry else { return }
+        coverRevision = cover.revision
+        let relief = self.relief, shades = self.shades
+        let colors = await Task.detached(priority: .userInitiated) {
+            Self.colors(shades, cover: Self.landCover(cover, on: relief))
+        }.value
+        let geometry = SCNGeometry(sources: old.sources.filter { $0.semantic != .color } + [Self.colorSource(colors)],
+                                   elements: old.elements)
+        geometry.firstMaterial = old.firstMaterial
+        ground.geometry = geometry
     }
 
     /// Faint contour lines on the ground, every 50 m with a stronger one every 250 m, drawn
@@ -285,20 +327,31 @@ final class WalkWorld: @unchecked Sendable {
     _surface.emission.rgb += float3(0.86, 0.94, 1.0) * max(minor * 0.018, major * 0.045);
     """
 
+    /// What the terrain's colors are made from, per vertex: how light the bare ground is, and
+    /// how much the ridges and hollows around it lighten or darken it.
+    struct GroundShades: Sendable {
+        var light: [Float]
+        var form: [Float]
+    }
+
     /// The terrain, lit by the sun and colored per point: lighter higher up, as from above;
     /// rock faces lighter than the gentle ground around them; spurs and ridges lighter and
     /// gullies darker, at two scales, which brings out the small shapes the light alone
-    /// leaves flat. Squares inside `hole` are left out; `sink` lowers it all, in meters.
-    private static func terrainNode(_ relief: ReliefMap, low: Float, high: Float,
-                                    hole: (low: SIMD2<Double>, high: SIMD2<Double>)? = nil, sink: Float = 0) -> SCNNode {
+    /// leaves flat; and tinted by `cover`. Squares inside `hole` are left out; `sink` lowers
+    /// it all, in meters.
+    private static func terrainNode(_ relief: ReliefMap, low: Float, high: Float, cover: LandCoverGrid? = nil,
+                                    hole: (low: SIMD2<Double>, high: SIMD2<Double>)? = nil,
+                                    sink: Float = 0) -> (node: SCNNode, shades: GroundShades) {
         let mesh = relief.mesh(hole: hole)
         // One vertex per grid point, in grid order, so these line up with the vertices.
         let fine = relief.relativeHeight(radius: max(90, 2 * relief.cellSize))
         let broad = relief.relativeHeight(radius: max(450, 4 * relief.cellSize))
-        var positions = [Float](), normals = [Float](), colors = [Float]()
+        var positions = [Float](), normals = [Float]()
+        var shades = GroundShades(light: [], form: [])
         positions.reserveCapacity(mesh.positions.count * 3)
         normals.reserveCapacity(mesh.positions.count * 3)
-        colors.reserveCapacity(mesh.positions.count * 3)
+        shades.light.reserveCapacity(mesh.positions.count)
+        shades.form.reserveCapacity(mesh.positions.count)
         let range = max(1, high - low)
         for i in mesh.positions.indices {
             let p = mesh.positions[i], n = mesh.normals[i]
@@ -311,18 +364,18 @@ final class WalkWorld: @unchecked Sendable {
             let steep = min(1, max(0, (0.82 - n.z) / 0.22))
             v *= 1 + 0.7 * steep
             let f = fine[i].isFinite ? fine[i] : 0, b = broad[i].isFinite ? broad[i] : 0
-            let form = 0.4 * min(1, max(-1, f / 25)) + 0.3 * min(1, max(-1, b / 120))
-            v *= max(0.3, 1 + form)
-            colors.append(v); colors.append(v * 1.12); colors.append(v * 1.45)
+            let form = max(0.3, 1 + 0.4 * min(1, max(-1, f / 25)) + 0.3 * min(1, max(-1, b / 120)))
+            shades.light.append(v * form)
+            shades.form.append(form)
         }
         let count = mesh.positions.count
-        func source(_ values: [Float], _ semantic: SCNGeometrySource.Semantic, _ components: Int) -> SCNGeometrySource {
+        func source(_ values: [Float], _ semantic: SCNGeometrySource.Semantic) -> SCNGeometrySource {
             SCNGeometrySource(data: values.withUnsafeBufferPointer { Data(buffer: $0) }, semantic: semantic, vectorCount: count,
-                              usesFloatComponents: true, componentsPerVector: components, bytesPerComponent: 4,
-                              dataOffset: 0, dataStride: 4 * components)
+                              usesFloatComponents: true, componentsPerVector: 3, bytesPerComponent: 4,
+                              dataOffset: 0, dataStride: 12)
         }
-        let geometry = SCNGeometry(sources: [source(positions, .vertex, 3), source(normals, .normal, 3),
-                                             source(colors, .color, 3)],
+        let geometry = SCNGeometry(sources: [source(positions, .vertex), source(normals, .normal),
+                                             colorSource(colors(shades, cover: cover))],
                                    elements: [SCNGeometryElement(indices: mesh.indices, primitiveType: .triangles)])
         let material = SCNMaterial()
         material.lightingModel = .lambert
@@ -330,7 +383,34 @@ final class WalkWorld: @unchecked Sendable {
         material.emission.contents = UIColor.black
         material.shaderModifiers = [.surface: contourShader]
         geometry.firstMaterial = material
-        return SCNNode(geometry: geometry)
+        return (SCNNode(geometry: geometry), shades)
+    }
+
+    /// The terrain's colors, three linear values a vertex: a slate that's faintly blue, and
+    /// where there's land cover, bare rock and scree a touch lighter and cooler, glaciers pale
+    /// blue-white (the ridges and hollows in the ice still showing), water dark blue.
+    private static func colors(_ shades: GroundShades, cover: LandCoverGrid?) -> [Float] {
+        var colors = [Float]()
+        colors.reserveCapacity(shades.light.count * 3)
+        for i in shades.light.indices {
+            let v = shades.light[i]
+            var c = SIMD3<Float>(v, v * 1.12, v * 1.45)
+            if let cover {
+                let rock = cover.rock[i], ice = cover.glacier[i], water = cover.water[i]
+                if rock > 0 { c += (v * SIMD3(1.1, 1.35, 1.9) - c) * rock }
+                // Lighter than the ground around it, high up as low down; bluer than looks
+                // right on its own, since the sun is warm.
+                if ice > 0 { c += ((0.13 * shades.form[i] + 1.3 * v) * SIMD3(0.5, 0.7, 1.12) - c) * ice }
+                if water > 0 { c += (SIMD3(0.004, 0.011, 0.03) - c) * water }
+            }
+            colors.append(c.x); colors.append(c.y); colors.append(c.z)
+        }
+        return colors
+    }
+
+    private static func colorSource(_ colors: [Float]) -> SCNGeometrySource {
+        SCNGeometrySource(data: colors.withUnsafeBufferPointer { Data(buffer: $0) }, semantic: .color, vectorCount: colors.count / 3,
+                          usesFloatComponents: true, componentsPerVector: 3, bytesPerComponent: 4, dataOffset: 0, dataStride: 12)
     }
 
     /// The ridge crests as thin pale lines laid along them, brighter the more a ridge stands
