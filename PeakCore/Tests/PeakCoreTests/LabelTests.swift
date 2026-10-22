@@ -159,6 +159,83 @@ final class LabelTests: XCTestCase {
                        "off by default, as in the camera view")
     }
 
+    /// Seen from above, dots crowd along the ridges: with `dotSpacing` they're kept apart,
+    /// best first, from each other (diagonally too) and from the labels' dots, whatever
+    /// order they come in. Off by default, as on the ground.
+    func testDotsSpacedByRank() {
+        var t = LabelLayout.Thresholds()
+        t.dotSpacing = 14
+        t.keepDotSpacing = 10
+        let layout = LabelLayout(bounds: screen, limit: 10, thresholds: t)
+        // A row 5 points apart, the best in the middle.
+        let row = (0..<9).map { k in
+            LabelLayout.Candidate(id: Int64(k), x: 100 + 5 * Double(k), y: 400, score: 4 - abs(Double(k) - 4) * 0.3, box: nil)
+        }
+        let kept = layout.place(row, previous: []).dots
+        XCTAssertEqual(kept, [4, 1, 7])
+        XCTAssertEqual(layout.place(row.reversed(), previous: []).dots, kept)
+        XCTAssertEqual(LabelLayout(bounds: screen, limit: 10).place(row, previous: []).dots, [4, 3, 5, 2, 6, 1, 7, 0, 8])
+
+        func dots(_ second: (x: Double, y: Double)) -> [Int64] {
+            layout.place([LabelLayout.Candidate(id: 1, x: 200, y: 400, score: 2, box: nil),
+                          LabelLayout.Candidate(id: 2, x: second.x, y: second.y, score: 1, box: nil)], previous: []).dots
+        }
+        XCTAssertEqual(dots((214, 400)), [1, 2], "exactly the spacing apart")
+        XCTAssertEqual(dots((213.9, 400)), [1])
+        XCTAssertEqual(dots((210, 410)), [1, 2], "14.1 diagonally")
+        XCTAssertEqual(dots((209, 409)), [1], "12.7 diagonally")
+
+        // A labeled peak's dot counts too, beyond the plain clearance around it.
+        let labeled = [LabelLayout.Candidate(id: 1, x: 200, y: 400, score: 3, box: box),
+                       LabelLayout.Candidate(id: 2, x: 212, y: 400, score: 1, box: nil)]
+        XCTAssertEqual(layout.place(labeled, previous: []).labels, [1])
+        XCTAssertEqual(layout.place(labeled, previous: []).dots, [])
+        XCTAssertEqual(LabelLayout(bounds: screen, limit: 10).place(labeled, previous: []).dots, [2])
+    }
+
+    /// Two dots shown last frame stay down to `keepDotSpacing` apart; a new one needs the
+    /// full spacing from one already there, and pushes in only by ranking clearly higher.
+    func testShownDotsStay() {
+        var t = LabelLayout.Thresholds()
+        t.dotSpacing = 14
+        t.keepDotSpacing = 10
+        let layout = LabelLayout(bounds: screen, limit: 10, thresholds: t)
+        func pair(_ second: Double) -> [LabelLayout.Candidate] {
+            [LabelLayout.Candidate(id: 1, x: 200, y: 400, score: 2, box: nil),
+             LabelLayout.Candidate(id: 2, x: 212, y: 400, score: second, box: nil)]
+        }
+        XCTAssertEqual(layout.place(pair(1), previous: [], previousDots: [1, 2]).dots, [1, 2])
+        XCTAssertEqual(layout.place(pair(1), previous: [], previousDots: [1]).dots, [1], "a newcomer needs 14")
+        XCTAssertEqual(layout.place(pair(1), previous: [], previousDots: [2]).dots, [1], "the better one comes in")
+        XCTAssertEqual(layout.place(pair(2.3), previous: [], previousDots: [1]).dots, [1], "only a little better")
+        XCTAssertEqual(layout.place(pair(2.5), previous: [], previousDots: [1]).dots, [2], "clearly better")
+        // Last frame's label, now a dot, is one that was shown.
+        XCTAssertEqual(layout.place(pair(1), previous: [2], previousDots: [1]).dots, [1, 2])
+
+        // Two dots 12 points apart, one jittering ±1.5 (as the stretch toward the edges does
+        // when turning): whichever way they started, they stay that way.
+        var noise = Noise()
+        func frame() -> [LabelLayout.Candidate] {
+            [LabelLayout.Candidate(id: 1, x: 200, y: 400, score: 2, box: nil),
+             LabelLayout.Candidate(id: 2, x: 212 + 1.5 * noise.next(), y: 400 + 1.5 * noise.next(), score: 1, box: nil)]
+        }
+        func blinks(_ layout: LabelLayout, start: Set<Int64>) -> Int {
+            var shown = start, count = 0
+            for _ in 0..<300 {
+                let next = Set(layout.place(frame(), previous: [], previousDots: shown).dots)
+                if next != shown { count += 1 }
+                shown = next
+            }
+            return count
+        }
+        XCTAssertEqual(blinks(layout, start: [1, 2]), 0)
+        XCTAssertEqual(blinks(layout, start: [1]), 0)
+        var single = t
+        single.dotSpacing = 12
+        single.keepDotSpacing = 12
+        XCTAssertGreaterThan(blinks(LabelLayout(bounds: screen, limit: 10, thresholds: single), start: [1, 2]), 10)
+    }
+
     /// Pinching in adds labels one at a time, not six at once past 1.5×.
     func testLimitGrowsGraduallyWithZoom() {
         XCTAssertEqual(LabelLayout.limit(base: 10, zoom: 1), 10)
