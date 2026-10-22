@@ -11,6 +11,19 @@ struct RootView: View {
     @State private var topControls = CGRect.zero
     @State private var bottomControls = CGRect.zero
 
+    /// The telephoto behind the picture, by its own zoom ("5×"), or nil on the wide lens.
+    private var lensZoom: Double? {
+        let i = model.lenses.nearestLens(to: model.opticalZoom)
+        return i > 0 ? model.lenses.zooms[i] : nil
+    }
+
+    /// The zoom, after the telephoto in use when it's more: "5×", or "5× · 7.5×".
+    private var zoomText: Text {
+        guard let lens = lensZoom, Format.zoom(lens) != Format.zoom(model.zoom) else { return Text(Format.zoom(model.zoom)) }
+        return Text(Format.zoom(lens)) + Text(" · ").foregroundStyle(.white.opacity(0.5))
+            + Text(Format.zoom(model.zoom)).foregroundStyle(.white.opacity(0.75))
+    }
+
     var body: some View {
         ZStack {
             CameraScreen(model: model, keepClear: [topControls, bottomControls])
@@ -26,7 +39,7 @@ struct RootView: View {
                         Button {
                             model.setZoom(1)
                         } label: {
-                            Text(Format.zoom(model.zoom))
+                            zoomText
                                 .font(.system(size: 13, weight: .semibold))
                                 .monospacedDigit()
                                 .foregroundStyle(.white)
@@ -36,7 +49,7 @@ struct RootView: View {
                                 .environment(\.colorScheme, .dark)
                                 .tapArea(minWidth: 64, minHeight: 44)
                         }
-                        .accessibilityLabel("Zoomed \(Format.decimal(model.zoom)) times; tap to zoom out")
+                        .accessibilityLabel("Zoomed \(Format.decimal(model.zoom)) times\(lensZoom.map { ", through the \(Format.zoom($0)) lens" } ?? ""); tap to zoom out")
                     }
                     if model.settings.showDiagnostics {
                         DebugPanel(model: model)

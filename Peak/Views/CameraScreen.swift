@@ -120,11 +120,13 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
     }
 
     /// Turns the picture to match the interface (frames come in portrait, or the sensor's
-    /// landscape orientation, whichever way the phone is held) and zooms it about the middle.
+    /// landscape orientation, whichever way the phone is held) and zooms it about the middle,
+    /// by what the frame's lens leaves of the zoom.
     private func layoutVideo() {
-        let portrait = model?.frozen?.shown.portrait ?? shown?.portrait ?? true
+        let frame = model?.frozen?.shown ?? shown
+        let portrait = frame?.portrait ?? true
         let turns = (CameraGeometry.quarterTurns(interfaceOrientation) - (portrait ? 1 : 0) + 4) % 4
-        let zoom = CGFloat(model?.zoom ?? 1)
+        let zoom = CGFloat(frame.flatMap { model?.screenZoom(for: $0) } ?? model?.zoom ?? 1)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         video.setAffineTransform(CGAffineTransform(rotationAngle: CGFloat(turns) * .pi / 2).scaledBy(x: zoom, y: zoom))
@@ -141,10 +143,17 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         Self.displayImmediately(frame.sample)
         renderer.enqueue(frame.sample)
         let turned = shown.map { $0.portrait != frame.portrait } ?? true
+        let switched = shown.map { $0.lens.opticalZoom != frame.lens.opticalZoom } ?? false
         shown = AppModel.Shown(time: frame.time, lens: frame.lens, portrait: frame.portrait)
         shownPixels = frame.pixels
         lastFrameDate = Date()
         if turned { setNeedsLayout() }
+        // Another lens: zoom this very frame by what's left, so the picture keeps its size.
+        if switched {
+            layoutVideo()
+            let optical = (frame.lens.opticalZoom * 10).rounded() / 10
+            if model?.opticalZoom != optical { model?.opticalZoom = optical }
+        }
         // Lay the overlay out for this frame now, so both reach the screen together.
         overlay.update()
     }

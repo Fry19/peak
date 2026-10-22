@@ -236,14 +236,16 @@ final class OverlayCanvas: UIView {
             clear()
             return
         }
-        let correction = frozen?.correction ?? smoothedCorrection(model.viewCorrection(for: pose), at: now)
+        // The lens's offset changes with the picture when the lens switches, so it isn't eased.
+        let correction = frozen?.correction
+            ?? smoothedCorrection(model.viewCorrection(for: pose), zoom: model.zoom, at: now) + model.lensOffset(shown.lens, pose: pose)
         if frozen != nil { smoothed = correction }
         let correctionTurn = lastCorrectionHeading.map { azimuthDifference(correction.heading, $0) } ?? 0
         lastCorrectionHeading = correction.heading
         let orientation = screen?.interfaceOrientation ?? .portrait
         var camera = CameraGeometry.screenCamera(pose: pose, lens: shown.lens, portraitFrame: shown.portrait,
                                                  orientation: orientation, size: bounds.size, correction: correction)
-        camera.intrinsics = camera.intrinsics.zoomed(by: model.zoom)
+        camera.intrinsics = camera.intrinsics.zoomed(by: model.screenZoom(for: shown))
         let projector = camera.projector
         let settings = model.settings
         // Labels stand upright in the world, whichever way the phone is held and even with
@@ -274,6 +276,9 @@ final class OverlayCanvas: UIView {
                        size: bounds.size, scale: displayScale)
         // A heading correction turning the view by δ slides everything the other way.
         let shift = -correctionTurn * camera.intrinsics.fx * .pi / 180
+        // Zoomed in, labels sweep past faster: a crossing may span more of a frame's move.
+        crossing.reach = 60 * max(1, model.zoom).squareRoot()
+        crossing.prepareReach = 2 * crossing.reach
         tickIfCrossing(placed, correctionShift: shift, haptics: frozen == nil && settings.haptics, at: now)
     }
 
@@ -295,15 +300,17 @@ final class OverlayCanvas: UIView {
         return AppModel.Shown(time: model.motion.latestTime ?? 0, lens: lens, portrait: lens.intrinsics.height > lens.intrinsics.width)
     }
 
-    /// Eases corrections in instead of jumping.
-    private func smoothedCorrection(_ target: ViewCorrection, at now: Date) -> ViewCorrection {
+    /// Eases corrections in instead of jumping; more slowly zoomed in, where the same change
+    /// moves the lines further (a third of a second at 1×, a second at 9× and up). Only
+    /// corrections ease: turning the phone moves the lines at once.
+    private func smoothedCorrection(_ target: ViewCorrection, zoom: Double, at now: Date) -> ViewCorrection {
         let dt = max(0, min(0.2, now.timeIntervalSince(lastUpdate)))
         lastUpdate = now
         guard let value = smoothed, abs(azimuthDifference(target.heading, value.heading)) < 30 else {
             smoothed = target
             return target
         }
-        let f = 1 - exp(-dt / 0.35)
+        let f = 1 - exp(-dt / min(1, 0.35 * max(1, zoom).squareRoot()))
         let next = ViewCorrection(heading: value.heading + azimuthDifference(target.heading, value.heading) * f,
                                   pitch: value.pitch + (target.pitch - value.pitch) * f,
                                   roll: value.roll + (target.roll - value.roll) * f)
@@ -654,7 +661,8 @@ final class OverlayCanvas: UIView {
         }
 
         let layout = LabelLayout(bounds: Self.screenRect(bounds), keepClear: clearRects.map(Self.screenRect),
-                                 upX: Double(worldUp.x), upY: Double(worldUp.y), limit: limit)
+                                 upX: Double(worldUp.x), upY: Double(worldUp.y), limit: limit,
+                                 thresholds: LabelLayout.Thresholds().scaled(forZoom: model.zoom))
         let result = layout.place(candidates, previous: labeled)
         labeled = result.labeled
 

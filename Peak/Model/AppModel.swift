@@ -171,7 +171,13 @@ final class AppModel {
     var aligning = false
     /// How far the picture and the lines are zoomed in, 1 to `maxZoom`.
     var zoom: Double = 1
-    static let maxZoom = 6.0
+    /// The back lenses: with a telephoto, zooming in moves to it (see AppModel+Lenses).
+    var lenses = LensSet.wideOnly
+    var maxZoom: Double { lenses.maxZoom }
+    /// The zoom of the lens behind the picture on screen, for the zoom chip.
+    var opticalZoom = 1.0
+    @ObservationIgnored var lensOffsets = LensOffsets()
+    @ObservationIgnored var lastWideMatch: Date?
     /// The last skyline match, for diagnostics.
     var lastOutcome: SkylineCorrector.Outcome?
     var storageBytes: Int?
@@ -259,7 +265,8 @@ final class AppModel {
             let built = CLLocation(latitude: scene.observer.latitude, longitude: scene.observer.longitude)
             uncertainty = LocationQuality.positionUncertainty(accuracy: location.horizontalAccuracy, moved: location.distance(from: built))
         }
-        corrector.update(horizon: horizon, upright: upright, sideways: sideways, positionUncertainty: uncertainty)
+        corrector.update(horizon: horizon, upright: upright, sideways: sideways, lensOffsets: lensOffsets,
+                         positionUncertainty: uncertainty)
     }
 
     func start() {
@@ -298,6 +305,7 @@ final class AppModel {
         // Every frame goes to the screen with the moment it was taken; about one a second
         // also goes to skyline matching, with the phone's pose at that moment.
         camera.onStateChange = { [weak self] in self?.cameraState = $0 }
+        camera.onLenses = { [weak self] in self?.lenses = $0 }
         camera.onFrame = { [weak self] frame in
             guard let self else { return }
             if !self.corrector.paused, let pose = self.motion.pose(at: frame.time) {
@@ -309,7 +317,7 @@ final class AppModel {
             guard let self else { return }
             self.lastOutcome = outcome
             guard outcome.accepted, self.frozen == nil else { return }
-            if self.correction.add(outcome, north: self.motion.northCorrection) { self.updateCorrector() }
+            if self.takeMatch(outcome) { self.updateCorrector() }
         }
         #if DEBUG
         // Checking photo labeling: no camera (and no prompt for it over the picture).
@@ -435,11 +443,9 @@ final class AppModel {
 
     /// Zooms the picture and the lines, 1× to `maxZoom`.
     func setZoom(_ value: Double) {
-        zoom = max(1, min(Self.maxZoom, value))
+        zoom = max(1, min(maxZoom, value))
         screen?.zoomChanged()
-        // Sharper frames only while zoomed in; the gap between the two keeps it from
-        // switching back and forth.
-        if zoom >= 2 { camera.setHighResolution(true) } else if zoom <= 1.3 { camera.setHighResolution(false) }
+        camera.setZoom(zoom)
     }
 
     func toggleFreeze() {
@@ -453,7 +459,8 @@ final class AppModel {
 
     private func freeze() {
         if let shown = screen?.shown, let pose = motion.pose(at: shown.time), scene != nil {
-            frozen = Frozen(shown: shown, pose: pose, correction: viewCorrection(for: pose), pixels: screen?.shownPixels)
+            frozen = Frozen(shown: shown, pose: pose, correction: viewCorrection(for: pose, lens: shown.lens),
+                            pixels: screen?.shownPixels)
         }
     }
 
@@ -463,7 +470,7 @@ final class AppModel {
     @MainActor func capturePausedView() {
         guard let frozen, let pixels = frozen.pixels, let scene else { return }
         sheet = nil
-        photo = LabeledPhoto.capture(frozen, pixels: pixels, scene: scene, zoom: zoom)
+        photo = LabeledPhoto.capture(frozen, pixels: pixels, scene: scene, zoom: screenZoom(for: frozen.shown))
     }
 
     /// Labels a photo from the library. Called as the sheet it was picked in closes, so the
@@ -561,6 +568,7 @@ final class AppModel {
         correction.heading = 0
         correction.level[i] = .init()
         correction.byHandLevel[i] = .init()
+        lensOffsets.reset(sideways: i == 1)
         if frozen != nil {
             frozen?.correction.heading -= before.heading
             frozen?.correction.pitch -= before.pitch
@@ -593,6 +601,7 @@ final class AppModel {
     private static let oldCalibrationKey = "levelCalibration"
 
     private func loadCalibration() {
+        loadLensOffsets()
         UserDefaults.standard.removeObject(forKey: Self.oldCalibrationKey)
         guard let data = UserDefaults.standard.data(forKey: Self.calibrationKey),
               let level = try? JSONDecoder().decode([Correction.Level].self, from: data), level.count == 2 else { return }
@@ -600,6 +609,7 @@ final class AppModel {
     }
 
     private func saveCalibration() {
+        saveLensOffsets()
         if let data = try? JSONEncoder().encode(correction.level) { UserDefaults.standard.set(data, forKey: Self.calibrationKey) }
     }
 
@@ -1288,6 +1298,7 @@ final class AppModel {
                                 k.width, k.height))
         }
         if zoom > 1.01 { lines.append(String(format: "zoom %.1f×", zoom)) }
+        if let line = lensDebugLine { lines.append(line) }
         if let overlay = screen?.overlay {
             lines.append(overlay.drawsWithMetal ? "lines: Metal, \(overlay.segmentCount) segments" : "lines: shape layers")
         }

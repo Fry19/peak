@@ -9,13 +9,16 @@ final class SkylineCorrector: @unchecked Sendable {
     struct Outcome {
         /// Corrections relative to the ones the frame was matched with, degrees.
         var delta: Double
-        /// The heading correction the frame was matched with (north included), so a match
-        /// can be compared with ones made under other corrections.
+        /// The heading correction the frame was matched with (north included, the lens's
+        /// offset not), so a match can be compared with ones made under other corrections.
         var from: Double
         var pitchDelta: Double
         var rollDelta: Double
         /// The phone was held sideways; pitch and roll belong to that way of holding it.
         var sideways: Bool
+        /// The lens that took the frame (`CameraFeed.Lens.name`); the deltas are from the
+        /// corrections plus its offset.
+        var lens: String
         var accepted: Bool
         var rms: Double
         /// Why a frame was turned away (nil when accepted).
@@ -53,6 +56,7 @@ final class SkylineCorrector: @unchecked Sendable {
     private var horizon: HorizonProfile?
     private var upright = ViewCorrection()
     private var sideways = ViewCorrection()
+    private var lensOffsets = LensOffsets()
     private var positionUncertainty = LocationQuality.matchingAccuracy
     private let matcher = SkylineMatcher()
     /// The long side frames are matched at. What counts is pixels per degree: a far ridge in
@@ -60,13 +64,15 @@ final class SkylineCorrector: @unchecked Sendable {
     private static let workingSide = 960
 
     /// What to match against, the corrections in use for the phone held upright and
-    /// sideways, and how far you may be from where the horizon was rendered, meters
+    /// sideways and each lens's offset on top, and how far you may be from where the horizon was rendered, meters
     /// (`LocationQuality.positionUncertainty`). Call on any thread.
-    func update(horizon: HorizonProfile?, upright: ViewCorrection, sideways: ViewCorrection, positionUncertainty: Double) {
+    func update(horizon: HorizonProfile?, upright: ViewCorrection, sideways: ViewCorrection, lensOffsets: LensOffsets,
+                positionUncertainty: Double) {
         lock.lock()
         self.horizon = horizon
         self.upright = upright
         self.sideways = sideways
+        self.lensOffsets = lensOffsets
         self.positionUncertainty = positionUncertainty
         lock.unlock()
     }
@@ -93,7 +99,8 @@ final class SkylineCorrector: @unchecked Sendable {
         lastStart = Date()
         // The correction covers both the compass's north (magnetic or true) and its error.
         let isSideways = CameraGeometry.isSideways(pose)
-        let correction = isSideways ? sideways : upright
+        let base = isSideways ? sideways : upright
+        let correction = base + lensOffsets.offset(lens: frame.lens.name, sideways: isSideways)
         let uncertainty = positionUncertainty
         let capture = self.capture
         self.capture = nil
@@ -120,13 +127,15 @@ final class SkylineCorrector: @unchecked Sendable {
             var matcher = self.matcher
             // Near ridges shift with the position, so they count for less the less sure it is.
             matcher.settings.positionUncertainty = uncertainty
+            // A telephoto's narrow view has less skyline across it.
+            matcher.settings.adapt(toHorizontalFOV: upright.camera.intrinsics.horizontalFOV)
             let (w, h) = (upright.image.width, upright.image.height)
             matcher.workingWidth = w >= h ? Self.workingSide : Self.workingSide * w / h
             let m = matcher.match(upright.image, intrinsics: upright.camera.intrinsics, prior: prior, horizon: horizon)
             let a = m.alignment
-            let outcome = Outcome(delta: a.headingCorrection, from: correction.heading,
+            let outcome = Outcome(delta: a.headingCorrection, from: base.heading,
                                   pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
-                                  sideways: isSideways, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
+                                  sideways: isSideways, lens: lens.name, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
                                   seconds: m.seconds)
             if let capture, let frame = Self.testFrame(upright, correction: correction, horizon: horizon,
                                                        measuredLens: lens.measured, outcome: outcome) {

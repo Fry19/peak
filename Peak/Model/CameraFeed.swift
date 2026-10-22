@@ -11,6 +11,11 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
         var intrinsics: CameraIntrinsics
         /// Read from the frame's intrinsic matrix, rather than estimated from the format.
         var measured: Bool
+        /// How many times the frame magnifies over the wide lens: the zoom of the telephoto
+        /// that took it, or 1. The rest of the zoom is done on screen.
+        var opticalZoom = 1.0
+        /// The lens that took it, which its corrections are kept under (`LensSet.names`).
+        var name = LensSet.wideName
 
         /// Field of view along the long side of the frame, degrees.
         var fieldOfView: Double {
@@ -40,6 +45,19 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
     private(set) var measuresLens = false
     private var lastLens: Lens?
     private var device: AVCaptureDevice?
+    /// The lenses the camera can switch between: the wide and any telephotos. Only touched
+    /// on `queue` after `configure`.
+    private(set) var lenses = LensSet.wideOnly
+    /// The camera's zoom where the wide lens takes over (above 1 when the camera starts at
+    /// an ultra-wide), and the constituent lens behind each of `lenses`.
+    private var wideFactor = 1.0
+    private var constituents: [AVCaptureDevice] = []
+    /// The lens in use (an index into `lenses`) and when it last changed, host clock.
+    private var lensIndex = 0
+    private var zoomChanged = 0.0
+    private var wantedZoom = 1.0
+    /// Called on the main thread with the lenses once the camera is set up.
+    var onLenses: ((LensSet) -> Void)?
     /// Called on the camera queue for every frame. Must return quickly.
     var onFrame: ((Frame) -> Void)?
     /// Called on the main thread when the camera stops or comes back by itself (another app
@@ -126,12 +144,12 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
     private func configure() {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
-        // The plain wide camera: a fixed lens, so the field of view stays known.
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else { return }
+        guard let device = Self.backCamera(), let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input) else { return }
         session.addInput(input)
         self.device = device
-        // 1080p normally; 4K only while zoomed in (see `setHighResolution`), since every
+        configureLenses(device)
+        // 1080p normally; 4K only while zoomed in (see `setZoom`), since every
         // frame of it costs memory bandwidth and power.
         session.sessionPreset = session.canSetSessionPreset(.hd1920x1080) ? .hd1920x1080 : .high
 
@@ -157,6 +175,65 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
         }
     }
 
+    /// With a telephoto, the camera that switches between it and the wide (wide and telephoto,
+    /// or all three); the camera is only ever set to a lens's own zoom, so each frame is one
+    /// lens's whole picture and its geometry stays known. Otherwise the plain wide camera.
+    private static func backCamera() -> AVCaptureDevice? {
+        for type in [AVCaptureDevice.DeviceType.builtInDualCamera, .builtInTripleCamera] {
+            if let d = AVCaptureDevice.default(type, for: .video, position: .back),
+               d.constituentDevices.contains(where: { $0.deviceType == .builtInTelephotoCamera }) { return d }
+        }
+        return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+    }
+
+    /// The lenses of a camera that switches between them, from where each takes over.
+    private func configureLenses(_ device: AVCaptureDevice) {
+        let parts = device.constituentDevices
+        let factors = device.virtualDeviceSwitchOverVideoZoomFactors.map { Double(truncating: $0) }
+        guard let wide = parts.firstIndex(where: { $0.deviceType == .builtInWideAngleCamera }),
+              factors.count == parts.count - 1 else { return }
+        // Each constituent from the second takes over at its factor.
+        func factor(_ i: Int) -> Double { i == 0 ? 1 : factors[i - 1] }
+        wideFactor = factor(wide)
+        let teles = (wide + 1..<parts.count).map { (zoom: factor($0) / wideFactor, name: parts[$0].deviceType.rawValue, device: parts[$0]) }
+        lenses = LensSet(telephotos: teles.map { ($0.zoom, $0.name) })
+        constituents = [parts[wide]] + teles.filter { $0.zoom > 1.2 }.sorted { $0.zoom < $1.zoom }.map(\.device)
+        // Start at the wide (not an ultra-wide), or the lens for a zoom asked for already.
+        applyLens(lenses.lens(for: wantedZoom, current: 0))
+        let lenses = self.lenses
+        DispatchQueue.main.async { [weak self] in self?.onLenses?(lenses) }
+    }
+
+    /// Zooms in `zoom` times over the wide lens: the camera moves to the longest lens that
+    /// fits, and the picture on screen does the rest. 4K (when the phone can) while the
+    /// on-screen part is large, so the picture stays sharp.
+    func setZoom(_ zoom: Double) {
+        queue.async { [self] in
+            wantedZoom = zoom
+            let next = lenses.lens(for: zoom, current: lensIndex)
+            if next != lensIndex { applyLens(next) }
+            let digital = zoom / lenses.zooms[lensIndex]
+            // The gap between the two keeps it from switching back and forth.
+            if digital >= 2, !wantsHighResolution {
+                wantsHighResolution = true
+                applyFormat()
+            } else if digital <= 1.3, wantsHighResolution {
+                wantsHighResolution = false
+                applyFormat()
+            }
+        }
+    }
+
+    /// Sets the camera to a lens's own zoom. On `queue`.
+    private func applyLens(_ index: Int) {
+        guard let device, (try? device.lockForConfiguration()) != nil else { return }
+        let factor = CGFloat(lenses.zooms[index] * wideFactor)
+        device.videoZoomFactor = max(device.minAvailableVideoZoomFactor, min(device.maxAvailableVideoZoomFactor, factor))
+        device.unlockForConfiguration()
+        lensIndex = index
+        zoomChanged = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+    }
+
     private var output: AVCaptureVideoDataOutput?
     private var highResolution = false
     private var wantsHighResolution = false
@@ -164,15 +241,6 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
     private var throttled = false
     /// Whether the frame rate set is the slow one.
     private var slowFrames = false
-
-    /// Records in 4K (when the phone can) so a zoomed-in picture stays sharp, or back in
-    /// 1080p. Switching takes a moment, so it's only done when the zoom crosses a threshold.
-    func setHighResolution(_ on: Bool) {
-        queue.async { [self] in
-            wantsHighResolution = on
-            applyFormat()
-        }
-    }
 
     /// Sets the resolution and frame rate for what's wanted and how hot the phone is. On `queue`.
     private func applyFormat() {
@@ -190,6 +258,7 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
                 // A new format can reset these.
                 configureConnection()
                 configureFocus()
+                if lenses.hasTelephoto { applyLens(lensIndex) }
             }
         }
         // 15 frames a second while hot; otherwise the format's own rate (an invalid time
@@ -241,16 +310,30 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let width = CVPixelBufferGetWidth(pixels), height = CVPixelBufferGetHeight(pixels)
-        // The format the preset picked, known once the session runs.
-        if let device { formatFieldOfView = Double(device.activeFormat.videoFieldOfView) }
-        let lens = Self.lens(for: sampleBuffer, width: width, height: height, fallbackFOV: formatFieldOfView)
-        lock.lock()
-        lastLens = lens
-        lock.unlock()
+        // The format the preset picked, known once the session runs: the field of view at
+        // the camera's zoom 1, which is the ultra-wide's on a camera that has one.
+        if let device { formatFieldOfView = Self.narrowed(Double(device.activeFormat.videoFieldOfView), by: wideFactor) }
         // Frame times are on the session's clock; the motion sensors use the host clock.
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let host = CMClockGetHostTimeClock()
         let time = CMTimeGetSeconds(CMSyncConvertTime(pts, from: session.synchronizationClock ?? host, to: host))
+        let lens: Lens
+        if lenses.hasTelephoto, let device {
+            // Which lens the camera says it's on, and its zoom, as the frame arrives.
+            let active = device.activePrimaryConstituent.flatMap { a in constituents.firstIndex { $0.uniqueID == a.uniqueID } } ?? lensIndex
+            let reading = FrameLens.Reading(width: width, height: height,
+                                            matrix: Self.matrix(for: sampleBuffer, width: width, height: height),
+                                            zoom: Double(device.videoZoomFactor) / wideFactor, activeLens: active,
+                                            sinceZoomChange: CMTimeGetSeconds(CMClockGetTime(host)) - zoomChanged)
+            let resolved = FrameLens.resolve(reading, lenses: lenses, wideFOV: formatFieldOfView)
+            lens = Lens(intrinsics: resolved.intrinsics, measured: resolved.measured, opticalZoom: resolved.opticalZoom,
+                        name: lenses.names[resolved.lens])
+        } else {
+            lens = Self.lens(for: sampleBuffer, width: width, height: height, fallbackFOV: formatFieldOfView)
+        }
+        lock.lock()
+        lastLens = lens
+        lock.unlock()
         onFrame?(Frame(sample: sampleBuffer, pixels: pixels, time: time, lens: lens, portrait: width < height))
     }
 
@@ -262,12 +345,22 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
         let estimate = Lens(intrinsics: CameraIntrinsics(width: width, height: height,
                                                          horizontalFOV: width >= height ? fallbackFOV : verticalToHorizontal(fallbackFOV, width, height)),
                             measured: false)
+        guard let k = matrix(for: sample, width: width, height: height) else { return estimate }
+        let lens = Lens(intrinsics: k, measured: true)
+        // Anything far from a phone's wide camera is a misreading.
+        guard (40...90).contains(lens.fieldOfView), abs(k.fx / k.fy - 1) < 0.05,
+              abs(k.cx / Double(width) - 0.5) < 0.1, abs(k.cy / Double(height) - 0.5) < 0.1 else { return estimate }
+        return lens
+    }
+
+    /// The frame's intrinsic matrix turned and scaled to the frame, if it has one.
+    static func matrix(for sample: CMSampleBuffer, width: Int, height: Int) -> CameraIntrinsics? {
         guard let data = CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil) as? Data,
-              data.count >= MemoryLayout<matrix_float3x3>.size else { return estimate }
+              data.count >= MemoryLayout<matrix_float3x3>.size else { return nil }
         let m = data.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) }
         let fx = Double(m.columns.0.x), fy = Double(m.columns.1.y)
         let cx = Double(m.columns.2.x), cy = Double(m.columns.2.y)
-        guard fx > 0, fy > 0, cx > 0, cy > 0 else { return estimate }
+        guard fx > 0, fy > 0, cx > 0, cy > 0 else { return nil }
         // The frame's size in the matrix's orientation: the sensor's landscape one when the
         // frame was turned to portrait after the matrix was made.
         let turned = (cx > cy) != (width > height)
@@ -281,11 +374,12 @@ final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, 
             k = CameraIntrinsics(width: Int(w), height: Int(h), fx: fx * s, fy: fy * s, cx: w / 2, cy: h / 2)
         }
         if turned { k = k.rotatedClockwise() }
-        let lens = Lens(intrinsics: k, measured: true)
-        // Anything far from a phone's wide camera is a misreading.
-        guard (40...90).contains(lens.fieldOfView), abs(k.fx / k.fy - 1) < 0.05,
-              abs(k.cx / Double(width) - 0.5) < 0.1, abs(k.cy / Double(height) - 0.5) < 0.1 else { return estimate }
-        return lens
+        return k
+    }
+
+    /// A field of view zoomed `factor` times.
+    private static func narrowed(_ fov: Double, by factor: Double) -> Double {
+        2 * atan(tan(fov * .pi / 360) / factor) * 180 / .pi
     }
 
     /// Horizontal field of view of a portrait frame whose long side spans `fov` degrees.
