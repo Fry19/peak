@@ -187,6 +187,123 @@ final class TrailWalkTests: XCTestCase {
         XCTAssertTrue(on.z.isFinite)
     }
 
+    /// The drawn surface follows the mesh's triangles: on a planar grid it's the plane, and
+    /// across a diagonal ridge it keeps the crest the bilinear height rounds off.
+    func testSurfaceHeightFollowsTheTriangles() {
+        let plane = grid { x, y in 1_000 + 0.2 * x - 0.1 * y }
+        XCTAssertEqual(plane.surfaceHeight(at: SIMD2(130, -270)), plane.height(at: SIMD2(130, -270)), accuracy: 1e-6)
+        XCTAssertEqual(plane.surfaceHeight(at: SIMD2(500, 500)), 1_050, accuracy: 1e-6, "the corner")
+        XCTAssertTrue(plane.surfaceHeight(at: SIMD2(0, 501)).isNaN, "off the grid")
+        // A ridge from the south-west to the north-east, along the squares' diagonals.
+        let ridge = grid { x, y in 1_000 + 0.1 * (x + y) - 0.8 * abs(x - y) }
+        // The middle of the square from (0, 0) to (100, 100): on the crest, 1,010 m.
+        XCTAssertEqual(ridge.surfaceHeight(at: SIMD2(50, 50)), 1_010, accuracy: 1e-6)
+        XCTAssertLessThan(ridge.height(at: SIMD2(50, 50)), 1_000, "bilinear rounds the crest off")
+        // Either side of the crest, on one of the two triangles, each corner matches.
+        for (x, y) in [(10.0, 90.0), (90.0, 10.0), (0.0, 100.0), (100.0, 0.0)] {
+            let z = ridge.surfaceHeight(at: SIMD2(x, y))
+            XCTAssertLessThanOrEqual(z, 1_010 + 1e-6)
+            if x.truncatingRemainder(dividingBy: 100) == 0 {
+                XCTAssertEqual(z, 1_000 + 0.1 * (x + y) - 0.8 * abs(x - y), accuracy: 1e-6)
+            }
+        }
+        // A square with a corner without terrain isn't drawn.
+        var holes = plane.heights
+        holes[5 * 11 + 5] = .nan
+        let holed = ReliefMap(center: LatLon(46, 8), cellSize: 100, rows: 11, cols: 11, heights: holes)
+        XCTAssertTrue(holed.surfaceHeight(at: SIMD2(50, 50)).isNaN)
+        XCTAssertTrue(holed.surfaceHeight(at: SIMD2(250, 250)).isFinite)
+        // All four corners must exist, including a corner outside the queried triangle.
+        for missing in [0, 1, 2, 3] {
+            var corners = [Float](repeating: 1_000, count: 4)
+            corners[missing] = .nan
+            let square = ReliefMap(center: LatLon(46, 8), cellSize: 100, rows: 2, cols: 2, heights: corners)
+            XCTAssertTrue(square.surfaceHeight(at: SIMD2(-25, 25)).isNaN)
+            XCTAssertTrue(square.surfaceHeight(at: SIMD2(25, -25)).isNaN)
+        }
+    }
+
+    /// The line over the drawn mesh is checked exactly: never higher than very dense
+    /// sampling finds, and as low as it, on rough random terrain.
+    func testClearanceMatchesDenseSampling() {
+        var noise = UInt64(42)
+        func random() -> Double {
+            noise = noise &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Double(noise >> 11) / Double(1 << 53)
+        }
+        let map = grid(n: 21, cell: 50) { _, _ in 1_000 + 300 * random() }
+        for _ in 0..<200 {
+            let eye = SIMD3(-480 + 960 * random(), -480 + 960 * random(), 1_000 + 400 * random())
+            let target = SIMD3(-480 + 960 * random(), -480 + 960 * random(), 1_000 + 400 * random())
+            let exact = map.clearance(from: eye, to: target)
+            var dense = Double.infinity
+            for k in 0...20_000 {
+                let t = Double(k) / 20_000
+                let p = eye + (target - eye) * t
+                let g = map.surfaceHeight(at: SIMD2(p.x, p.y))
+                if g.isFinite { dense = min(dense, p.z - g) }
+            }
+            XCTAssertLessThanOrEqual(exact, dense + 1e-6)
+            XCTAssertEqual(exact, dense, accuracy: 0.5)
+        }
+    }
+
+    func testClearanceOverARidge() {
+        // A crest 200 m high and one square wide, running east–west at y = -300.
+        let map = grid(n: 21, cell: 50) { _, y in y == -300 ? 1_200 : 1_000 }
+        let target = SIMD3(0.0, 0, 1_100)
+        // From 1,050 m, 450 m away, the line is at 1,066.7 m over the 1,200 m crest, a third
+        // of the way.
+        XCTAssertEqual(map.clearance(from: SIMD3(0, -450, 1_050), to: target), -400.0 / 3, accuracy: 1e-6)
+        // From 1,400 m, it's at 1,300 m there: 100 m over it.
+        XCTAssertEqual(map.clearance(from: SIMD3(0, -450, 1_400), to: target), 100, accuracy: 1e-6)
+        // Drawn lower, the crest is lower; a hole the crest is in leaves it to a sharper mesh.
+        XCTAssertEqual(map.clearance(from: SIMD3(0, -450, 1_050), to: target, sink: 150), 50.0 / 3, accuracy: 1e-6)
+        let hole = (low: SIMD2(-500.0, -400), high: SIMD2(500.0, -200))
+        XCTAssertGreaterThan(map.clearance(from: SIMD3(0, -450, 1_050), to: target, hole: hole), 0)
+        XCTAssertEqual(map.clearance(from: SIMD3(0, 0, 3_000), to: target), .infinity, "straight down")
+        // Standing on the crest, the target's own ground touches the line there: within
+        // `contact` of it, ground up to `contactDepth` over the line is allowed.
+        let onCrest = SIMD3(0.0, -300, 1_200)
+        XCTAssertEqual(map.clearance(from: SIMD3(0, -450, 1_150), to: onCrest), 0, accuracy: 1e-6, "it touches")
+        XCTAssertGreaterThan(map.clearance(from: SIMD3(0, -450, 1_150), to: onCrest, contact: 50, contactDepth: 10), 0)
+        // Aimed 5 m into the crest, the allowance takes the contact, not a ridge further out.
+        XCTAssertGreaterThan(map.clearance(from: SIMD3(0, -450, 1_150), to: onCrest - SIMD3(0, 0, 5), contact: 50,
+                                           contactDepth: 10), 0)
+        XCTAssertLessThan(map.clearance(from: SIMD3(0, -450, 1_050), to: target, contact: 50, contactDepth: 10), 0)
+    }
+
+    /// A diagonal ridge right beside the target, inside its own grid square's neighbor, is
+    /// still in the way: the whole line is checked (a case Codex found against skipping a square).
+    func testClearanceSeesARidgeBesideTheTarget() {
+        // One 150 m square: south-west, north-west, south-east, north-east at 0, 200, 200, 100.
+        let map = ReliefMap(center: LatLon(46, 8), cellSize: 150, rows: 2, cols: 2, heights: [200, 100, 0, 200])
+        // From the south-west, down to the north-east corner (100 m): the diagonal ridge
+        // (200 m) a square's half-diagonal from the target is in the way, by 57 m.
+        let eye = SIMD3(-450.0, -450, 400), target = SIMD3(75.0, 75, 100)
+        XCTAssertEqual(map.clearance(from: eye, to: target), 100 + 300.0 / 7 - 200, accuracy: 1e-6)
+        XCTAssertLessThan(map.clearance(from: eye, to: target, contact: 150, contactDepth: 10), 0)
+    }
+
+    /// A line running exactly along a grid line sees the drawn edge even where the square on
+    /// one side of it has no terrain.
+    func testClearanceAlongAGridLine() {
+        var heights = [Float](repeating: 1_000, count: 9)
+        heights[4] = 1_300 // the middle point
+        heights[0] = .nan  // drops the north-west square
+        let map = ReliefMap(center: LatLon(46, 8), cellSize: 100, rows: 3, cols: 3, heights: heights)
+        // Along the middle column from north to south, at 1,100 m: the 1,300 m point is in the way.
+        XCTAssertEqual(map.clearance(from: SIMD3(0, 100, 1_100), to: SIMD3(0, -100, 1_100)), -200, accuracy: 1e-6)
+        // Along the middle row, west to east.
+        XCTAssertEqual(map.clearance(from: SIMD3(-100, 0, 1_100), to: SIMD3(100, 0, 1_100)), -200, accuracy: 1e-6)
+    }
+
+    func testSteepestSlope() {
+        XCTAssertEqual(grid { x, y in 1_000 + 0.3 * x - 0.4 * y }.steepestSlope, 0.5, accuracy: 1e-6)
+        XCTAssertEqual(grid { x, y in 1_000 + 0.1 * (x + y) - 0.8 * abs(x - y) }.steepestSlope,
+                       (0.9 * 0.9 + 0.7 * 0.7).squareRoot(), accuracy: 1e-6)
+    }
+
     /// An orbit's eye and its angles round-trip, with azimuth clockwise from north.
     func testOrbitAngles() {
         let subject = SIMD3(100.0, 200, 1_000)

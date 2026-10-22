@@ -26,6 +26,120 @@ extension ReliefMap {
         return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
     }
 
+    /// The height of the mesh drawn from this grid (`mesh()`, every point) at a map
+    /// position, meters: on the triangle of its square, which is split along the higher
+    /// diagonal, so over a diagonal ridge it can be above the bilinear height. NaN off the
+    /// grid or where a corner has no terrain, as the mesh leaves those squares out.
+    public func surfaceHeight(at p: SIMD2<Double>) -> Double {
+        let col = p.x / cellSize + Double(cols - 1) / 2
+        let row = Double(rows - 1) / 2 - p.y / cellSize
+        guard col >= 0, row >= 0, col <= Double(cols - 1), row <= Double(rows - 1) else { return .nan }
+        let c0 = min(Int(col), cols - 2), r0 = min(Int(row), rows - 2)
+        return triangleHeight(r0, c0, fx: col - Double(c0), fy: row - Double(r0))
+    }
+
+    /// The drawn height in the square whose north-west corner is grid point (r0, c0), at
+    /// (fx, fy) across it (east, south; 0 to 1); NaN when a corner has no terrain.
+    private func triangleHeight(_ r0: Int, _ c0: Int, fx: Double, fy: Double) -> Double {
+        // Corners: nw, ne, sw, se.
+        let a = Double(h(r0, c0)), b = Double(h(r0, c0 + 1)), c = Double(h(r0 + 1, c0)), d = Double(h(r0 + 1, c0 + 1))
+        guard a.isFinite, b.isFinite, c.isFinite, d.isFinite else { return .nan }
+        if a + d >= b + c {
+            // Split from nw to se.
+            return fy >= fx ? a + (d - c) * fx + (c - a) * fy : a + (b - a) * fx + (d - b) * fy
+        }
+        // Split from ne to sw.
+        return fx + fy <= 1 ? a + (b - a) * fx + (c - a) * fy : d + (c - d) * (1 - fx) + (b - d) * (1 - fy)
+    }
+
+    /// How far the straight line from `eye` to `target` passes over the mesh drawn from this
+    /// grid (`mesh(hole:)`), lowered by `sink` meters, at its lowest, meters; negative where
+    /// the mesh is in the way. Exact: the line is checked wherever it crosses a grid line or a
+    /// square's diagonal, where its lowest points over the flat triangles are, along its whole
+    /// length. The target stands on the ground, so within `contact` meters of it (across the
+    /// map) the ground may reach up to `contactDepth` meters above the line at the target,
+    /// tapering to none at `contact` away. Squares without terrain, and those the mesh leaves
+    /// to a sharper one in `hole`, are left out. Infinity when nothing is checked, as looking
+    /// straight down.
+    public func clearance(from eye: SIMD3<Double>, to target: SIMD3<Double>, contact: Double = 0, contactDepth: Double = 0,
+                          sink: Double = 0, hole: (low: SIMD2<Double>, high: SIMD2<Double>)? = nil) -> Double {
+        let run = SIMD2(target.x - eye.x, target.y - eye.y)
+        let length = (run * run).sum().squareRoot()
+        guard length > 0 else { return .infinity }
+        // Grid coordinates along the line: col(t) = col0 + dc·t, row(t) = row0 + dr·t.
+        let col0 = eye.x / cellSize + Double(cols - 1) / 2, row0 = Double(rows - 1) / 2 - eye.y / cellSize
+        let dc = run.x / cellSize, dr = -run.y / cellSize
+        // Where the allowance near the target begins: it's linear in t past there.
+        let near = contact > 0 ? max(0, 1 - contact / length) : 1
+        func allowance(_ t: Double) -> Double { t > near ? contactDepth * (t - near) / (1 - near) : 0 }
+        var ts: [Double] = [0, 1]
+        if near > 0, near < 1 { ts.append(near) }
+        func crossings(_ start: Double, _ step: Double) {
+            guard abs(step) > 1e-12 else { return }
+            let a = start, b = start + step
+            var k = (min(a, b)).rounded(.up)
+            while k <= max(a, b) {
+                let t = (k - start) / step
+                if t > 0, t < 1 { ts.append(t) }
+                k += 1
+            }
+        }
+        crossings(col0, dc)
+        crossings(row0, dr)
+        ts.sort()
+        /// The squares a coordinate's piece lies over: both sides when it runs along a grid line.
+        func squares(_ x: Double, _ count: Int) -> [Int] {
+            guard x >= 0, x <= Double(count - 1) else { return [] }
+            let k = x.rounded()
+            if abs(x - k) < 1e-9 { return [Int(k) - 1, Int(k)].filter { $0 >= 0 && $0 <= count - 2 } }
+            return [min(Int(x), count - 2)]
+        }
+        var lowest = Double.infinity
+        for i in 1..<ts.count {
+            let t0 = ts[i - 1], t1 = ts[i]
+            guard t1 - t0 > 1e-12 else { continue }
+            let tm = (t0 + t1) / 2
+            for r in squares(row0 + dr * tm, rows) {
+                for c in squares(col0 + dc * tm, cols) {
+                    if let hole {
+                        let a = position(row: Double(r + 1), col: Double(c)), b = position(row: Double(r), col: Double(c + 1))
+                        if a.x >= hole.low.x, a.y >= hole.low.y, b.x <= hole.high.x, b.y <= hole.high.y { continue }
+                    }
+                    func fx(_ t: Double) -> Double { min(1, max(0, col0 + dc * t - Double(c))) }
+                    func fy(_ t: Double) -> Double { min(1, max(0, row0 + dr * t - Double(r))) }
+                    var checks = [t0, t1]
+                    // Where it crosses the square's diagonal, between its two triangles.
+                    let nwToSe = h(r, c) + h(r + 1, c + 1) >= h(r, c + 1) + h(r + 1, c)
+                    let g0 = nwToSe ? fx(t0) - fy(t0) : fx(t0) + fy(t0) - 1
+                    let g1 = nwToSe ? fx(t1) - fy(t1) : fx(t1) + fy(t1) - 1
+                    if g0 * g1 < 0 { checks.append(t0 + (t1 - t0) * g0 / (g0 - g1)) }
+                    for t in checks {
+                        let ground = triangleHeight(r, c, fx: fx(t), fy: fy(t))
+                        guard ground.isFinite else { break }
+                        lowest = min(lowest, eye.z + (target.z - eye.z) * t - (ground - sink) + allowance(t))
+                    }
+                }
+            }
+        }
+        return lowest
+    }
+
+    /// The steepest slope of the mesh drawn from this grid (rise over run, of any of its
+    /// triangles), for bounding how much the ground under a moving line can change.
+    public var steepestSlope: Double {
+        var steepest = 0.0
+        for r in 0..<(rows - 1) {
+            for c in 0..<(cols - 1) {
+                let a = Double(h(r, c)), b = Double(h(r, c + 1)), cc = Double(h(r + 1, c)), d = Double(h(r + 1, c + 1))
+                guard a.isFinite, b.isFinite, cc.isFinite, d.isFinite else { continue }
+                // Each triangle's gradient from two of its edges along the grid.
+                let pairs = a + d >= b + cc ? [(b - a, d - b), (d - cc, cc - a)] : [(b - a, cc - a), (cc - d, b - d)]
+                for (east, south) in pairs { steepest = max(steepest, (east * east + south * south).squareRoot() / cellSize) }
+            }
+        }
+        return steepest
+    }
+
     /// The highest grid point of every grid square within `radius` meters of `p` (a square
     /// around it, to be safe), meters; NaN where none has terrain. The mesh's triangles never
     /// rise above their corners, so nothing drawn there is higher; the bilinear height can be

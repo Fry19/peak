@@ -134,6 +134,28 @@ final class LabelTests: XCTestCase {
         XCTAssertEqual(selected(y: -20).labels, [])
     }
 
+    /// With flipping on, a peak near the top gets its label below, keeps it there while it
+    /// fits, and only goes back above once there's room to come in; without it, none.
+    func testOthersFlipBelowWhenAsked() {
+        let below = LabelBox(minX: -45, minY: -6, maxX: 45, maxY: 70)
+        var thresholds = LabelLayout.Thresholds()
+        thresholds.flipsOthers = true
+        let layout = LabelLayout(bounds: screen, limit: 10, thresholds: thresholds)
+        func place(y: Double, previous: Set<Int64> = [], below previousBelow: Set<Int64> = []) -> LabelLayout.Result {
+            layout.place([LabelLayout.Candidate(id: 3, x: 200, y: y, score: 1, box: box, flippedBox: below)],
+                         previous: previous, previousBelow: previousBelow)
+        }
+        XCTAssertEqual(place(y: 400).below, [])
+        XCTAssertEqual(place(y: 40).labels, [3])
+        XCTAssertEqual(place(y: 40).below, [3])
+        // Above would fit within the keep margin (70 + 4) but not the enter margin (70 + 24).
+        XCTAssertEqual(place(y: 80, previous: [3], below: [3]).below, [3], "stays below")
+        XCTAssertEqual(place(y: 80, previous: [3]).below, [], "stays above")
+        XCTAssertEqual(LabelLayout(bounds: screen, limit: 10).place(
+            [LabelLayout.Candidate(id: 3, x: 200, y: 40, score: 1, box: box, flippedBox: below)], previous: []).labels, [],
+                       "off by default, as in the camera view")
+    }
+
     /// Pinching in adds labels one at a time, not six at once past 1.5×.
     func testLimitGrowsGraduallyWithZoom() {
         XCTAssertEqual(LabelLayout.limit(base: 10, zoom: 1), 10)
