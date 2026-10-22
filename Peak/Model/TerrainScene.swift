@@ -37,6 +37,9 @@ struct TerrainScene: @unchecked Sendable {
     let allPeaks: [Int64: PeakView]
     /// Peaks in `peaks` whose line of sight crosses coarse terrain too closely to tell: dots only.
     let uncertain: Set<Int64>
+    /// How many peaks within range have a prominence: views that rank them themselves rank
+    /// again when Wikidata's comes in, though no peak was added.
+    let prominent: Int
     /// You're standing on the base layer's coarse terrain (nothing finer is in yet).
     let isCoarse: Bool
 
@@ -51,11 +54,13 @@ struct TerrainScene: @unchecked Sendable {
     /// ground within it (up to 30 m), so a fix just off a crest doesn't hide the view.
     /// `altitude` is the GPS altitude, meters, if it is good: on the base layer's coarse
     /// terrain, whose ground is kilometers of average, it places the eye instead.
+    /// `prominence` is Wikidata's by item, meters (`DataStore.prominence`).
     static func build(terrain: Terrain, latitude: Double, longitude: Double, accuracy: Double, altitude: Double? = nil,
-                      peaks: [Peak]) -> TerrainScene {
-        // Peaks OpenStreetMap has no elevation for take the terrain's. Then give blunted
-        // summits their real tips before drawing skylines from them.
-        let peaks = terrain.fillElevations(peaks)
+                      peaks: [Peak], prominence: [String: Double] = [:]) -> TerrainScene {
+        // Peaks OpenStreetMap has no elevation for take the terrain's, and those it has no
+        // prominence for Wikidata's, for ranking. Then give blunted summits their real tips
+        // before drawing skylines from them.
+        let peaks = Wikidata.fillProminence(terrain.fillElevations(peaks), from: prominence)
         // Tiles are shared between scenes: no view from above may read them meanwhile.
         terrainWrites.lock()
         terrain.raiseSummits(peaks)
@@ -84,7 +89,7 @@ struct TerrainScene: @unchecked Sendable {
         let slim = view.horizon.withoutDepth()
         return TerrainScene(observer: eye, terrain: terrain, horizon: slim, matchingHorizon: slim, segments: view.segments,
                             peaks: view.peaks, scores: view.scores, allPeaks: view.allPeaks, uncertain: view.uncertain,
-                            isCoarse: isCoarse)
+                            prominent: view.prominent, isCoarse: isCoarse)
     }
 
     /// The terrain around this view's eye as triangles, out to its horizon's reach, for
@@ -145,7 +150,7 @@ struct TerrainScene: @unchecked Sendable {
         for v in visible where !uncertain.contains(v.id) { all[v.id]?.isVisible = true }
         return TerrainScene(observer: observer, terrain: terrain, horizon: horizon, matchingHorizon: horizon.withNearGround(),
                             segments: buckets, peaks: visible, scores: scores, allPeaks: all, uncertain: uncertain,
-                            isCoarse: isCoarse)
+                            prominent: all.values.filter { $0.peak.prominence != nil }.count, isCoarse: isCoarse)
     }
 
     /// A trail laid on the terrain as seen from here, with the stretches behind nearer

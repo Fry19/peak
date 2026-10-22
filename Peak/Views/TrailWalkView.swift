@@ -124,7 +124,8 @@ struct TrailWalkView: View {
             if let world, let cover = model.covers[trail.trail.id] { await world.tint(with: cover) }
         }
         // The mountains around, to label: those the camera view knows, as they arrive.
-        .task(id: LabelKey(world: world.map(ObjectIdentifier.init), peaks: model.scene?.allPeaks.count ?? 0)) {
+        .task(id: LabelKey(world: world.map(ObjectIdentifier.init), peaks: model.scene?.allPeaks.count ?? 0,
+                           prominent: model.scene?.prominent ?? 0)) {
             guard let world, let peaks = model.scene.map({ Array($0.allPeaks.values.map(\.peak)) }) else { return }
             let pool = await Task.detached(priority: .userInitiated) { world.peaksToLabel(from: peaks) }.value
             guard !Task.isCancelled else { return }
@@ -137,6 +138,8 @@ struct TrailWalkView: View {
     private struct LabelKey: Equatable {
         var world: ObjectIdentifier?
         var peaks: Int
+        /// Ranked again when Wikidata's prominence comes in.
+        var prominent: Int
     }
 
     private struct BuildKey: Equatable {

@@ -274,6 +274,19 @@ jobs:
           else
             echo "Wikidata unavailable; skipped" | tee live/facts.txt
           fi
+          # Prominence of a few summits, with the app's own query, from each SPARQL service.
+          $B prominence --query Q1374 Q685166 Q6921794 Q31663127 > live/prominence-query.txt
+          : > live/prominence.txt
+          for server in https://query.wikidata.org/sparql https://qlever.dev/api/wikidata; do
+            echo "From $server" >> live/prominence.txt
+            if curl -sSf -m 60 -A "$UA" -H "Accept: application/sparql-results+json" \
+                 --data-urlencode "query@live/prominence-query.txt" "$server" -o live/prominence.json; then
+              $B prominence live/prominence.json >> live/prominence.txt
+            else
+              echo "Unavailable; skipped" >> live/prominence.txt
+            fi
+          done
+          cat live/prominence.txt
           {
             echo '```'
             cat live/blocks.txt
@@ -285,6 +298,8 @@ jobs:
             cat live/area.txt
             echo
             cat live/facts.txt
+            echo
+            cat live/prominence.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

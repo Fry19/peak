@@ -130,7 +130,8 @@ struct PeakIn3DView: View {
             if let world, let cover = model.covers[coverKey] { await world.tint(with: cover) }
         }
         // The mountains around, to label: those the card's scene knows.
-        .task(id: LabelKey(world: world.map(ObjectIdentifier.init), peaks: scene?.allPeaks.count ?? 0)) {
+        .task(id: LabelKey(world: world.map(ObjectIdentifier.init), peaks: scene?.allPeaks.count ?? 0,
+                           prominent: scene?.prominent ?? 0)) {
             guard let world, let peaks = scene.map({ Array($0.allPeaks.values.map(\.peak)) }) else { return }
             let pool = await Task.detached(priority: .userInitiated) { world.peaksToLabel(from: peaks) }.value
             guard !Task.isCancelled else { return }
@@ -161,6 +162,8 @@ struct PeakIn3DView: View {
     private struct LabelKey: Equatable {
         var world: ObjectIdentifier?
         var peaks: Int
+        /// Ranked again when Wikidata's prominence comes in.
+        var prominent: Int
     }
 
     private func build() async {

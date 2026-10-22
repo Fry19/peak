@@ -264,6 +264,57 @@ final class PeakFactsTests: XCTestCase {
         XCTAssertEqual(Wikidata.labelsURL(["Q1", "Q2"]).absoluteString.contains("ids=Q1%7CQ2"), true)
     }
 
+    /// Prominence for many items in one query: only real item ids go in, values come back in
+    /// meters, a preferred statement beats normal ones, and what makes no sense is left out.
+    func testWikidataProminenceInBulk() throws {
+        let query = Wikidata.prominenceQuery(["Q685166", "Q1374", "Q685166", "Q1} . ?x ?y ?z . {", "q12", "Q", "Q12a", ""])
+        XCTAssertTrue(query.contains("VALUES ?item { wd:Q1374 wd:Q685166 }"))
+        XCTAssertFalse(query.contains("?x ?y ?z"))
+        XCTAssertTrue(query.contains("psn:P2660"))
+        XCTAssertTrue(Wikidata.isItemID("Q31663127"))
+        XCTAssertFalse(Wikidata.isItemID("Q１２"))  // full-width digits
+        XCTAssertFalse(Wikidata.isItemID("Q1234567890123"))
+
+        func row(_ id: String, _ rank: String, _ amount: String) -> String {
+            """
+            {"item":{"type":"uri","value":"http://www.wikidata.org/entity/\(id)"},
+             "rank":{"type":"uri","value":"http://wikiba.se/ontology#\(rank)"},
+             "amount":{"datatype":"http://www.w3.org/2001/XMLSchema#decimal","type":"literal","value":"\(amount)"}}
+            """
+        }
+        let rows = [
+            row("Q685166", "NormalRank", "1372.5171018"),       // from 4,503 ft
+            row("Q1374", "NormalRank", "1031"),
+            row("Q1374", "PreferredRank", "1040"),
+            row("Q1374", "NormalRank", "1100"),
+            row("Q7799150", "NormalRank", "331.3"),
+            row("Q7799150", "NormalRank", "331.3"),             // the same statement twice
+            row("Q6921794", "NormalRank", "414.5"),
+            row("Q6921794", "NormalRank", "420"),
+            row("Q2", "DeprecatedRank", "500"),
+            row("Q3", "NormalRank", "-12"),
+            row("Q4", "NormalRank", "NaN"),
+            row("Q5", "NormalRank", "12000"),
+            row("Q6", "NormalRank", "about 300"),
+            row("Q7} injected", "NormalRank", "300"),
+        ]
+        let json = #"{"head":{"vars":["item","rank","amount"]},"results":{"bindings":["# + rows.joined(separator: ",") + "]}}"
+        let table = try Wikidata.prominence(fromSPARQLJSON: Data(json.utf8))
+        XCTAssertEqual(table, ["Q685166": 1372.5171018, "Q1374": 1040, "Q7799150": 331.3, "Q6921794": 420])
+        XCTAssertEqual(try Wikidata.prominence(fromSPARQLJSON: Data(#"{"results":{"bindings":[]}}"#.utf8)), [:])
+        XCTAssertThrowsError(try Wikidata.prominence(fromSPARQLJSON: Data("<!DOCTYPE html><title>Error</title>".utf8)))
+
+        // A peak's card picks the same one: the preferred statement, in meters, over a normal one in feet.
+        func statement(_ amount: String, _ unit: String, _ rank: String) -> String {
+            #"{"mainsnak":{"datavalue":{"type":"quantity","value":{"amount":"\#(amount)","unit":"http://www.wikidata.org/entity/\#(unit)"}}},"rank":"\#(rank)"}"#
+        }
+        let entity = #"{"entities":{"Q1374":{"claims":{"P2660":["# + [
+            statement("+3609", "Q3710", "normal"), statement("+1040", "Q11573", "preferred"),
+            statement("+1100", "Q11573", "deprecated"), statement("+99999", "Q11573", "preferred"),
+        ].joined(separator: ",") + "]}}}}"
+        XCTAssertEqual(try Wikidata.facts(fromJSON: Data(entity.utf8), id: "Q1374").prominence, 1_040)
+    }
+
     func testWikipediaSummary() throws {
         var facts = PeakFacts()
         facts.articles = ["de": "Matterhorn"]

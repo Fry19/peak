@@ -115,24 +115,26 @@ public enum Wikidata {
         func statements(_ p: String) -> [Statement] {
             (claims[p] ?? []).filter { $0.rank != "deprecated" }.sorted { ($0.rank == "preferred" ? 0 : 1) < ($1.rank == "preferred" ? 0 : 1) }
         }
-        func meters(_ p: String) -> Double? {
-            for s in statements(p) {
-                guard case let .quantity(v, unit)? = s.mainsnak.datavalue else { continue }
+        // In meters, preferred first.
+        func lengths(_ p: String) -> [(preferred: Bool, meters: Double)] {
+            statements(p).compactMap { s in
+                guard case let .quantity(v, unit)? = s.mainsnak.datavalue else { return nil }
+                let meters: Double
                 switch unit.split(separator: "/").last {
-                case "Q11573": return v            // metre
-                case "Q828224": return v * 1_000    // kilometre
-                case "Q3710": return v * 0.3048     // foot
-                case "Q253276": return v * 1_609.344 // mile
-                default: continue
+                case "Q11573": meters = v            // metre
+                case "Q828224": meters = v * 1_000    // kilometre
+                case "Q3710": meters = v * 0.3048     // foot
+                case "Q253276": meters = v * 1_609.344 // mile
+                default: return nil
                 }
+                return (s.rank == "preferred", meters)
             }
-            return nil
         }
         func items(_ p: String) -> [String] {
             statements(p).compactMap { if case let .item(id)? = $0.mainsnak.datavalue { return id } else { return nil } }
         }
-        facts.prominence = meters("P2660")
-        facts.isolation = meters("P2659")
+        facts.prominence = prominence(of: lengths("P2660"))
+        facts.isolation = lengths("P2659").first?.meters
         facts.rangeID = items("P4552").first
         facts.parentID = items("P3137").first
         facts.countryIDs = Array(items("P17").prefix(3))
@@ -158,6 +160,82 @@ public enum Wikidata {
     public static func labels(fromJSON data: Data) throws -> [String: String] {
         let entities = try JSONDecoder().decode(Response.self, from: data).entities
         return entities.compactMapValues { $0.labels?["en"]?.value }
+    }
+
+    // MARK: Prominence in bulk
+
+    /// SPARQL endpoints that answer `prominenceQuery`, asked in turn: Wikidata's own query
+    /// service, then QLever's copy of Wikidata.
+    public static let queryEndpoints = [URL(string: "https://query.wikidata.org/sparql")!,
+                                        URL(string: "https://qlever.dev/api/wikidata")!]
+
+    /// Whether `id` is an item id, like "Q1374". OpenStreetMap's `wikidata` tags can hold
+    /// anything, and these go into a query.
+    public static func isItemID(_ id: String) -> Bool {
+        let digits = id.utf8.dropFirst()
+        return id.utf8.first == UInt8(ascii: "Q") && (1...12).contains(digits.count)
+            && digits.allSatisfy { $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }
+    }
+
+    /// One query for the prominence (P2660) of many items, in meters: Wikidata's own
+    /// conversion of each value (from feet and the like), with the statement's rank. What
+    /// isn't an item id is left out.
+    public static func prominenceQuery(_ ids: [String]) -> String {
+        let values = Set(ids.filter(isItemID)).sorted().map { "wd:" + $0 }.joined(separator: " ")
+        return """
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            PREFIX p: <http://www.wikidata.org/prop/>
+            PREFIX psn: <http://www.wikidata.org/prop/statement/value-normalized/>
+            PREFIX wikibase: <http://wikiba.se/ontology#>
+            SELECT ?item ?rank ?amount WHERE {
+              VALUES ?item { \(values) }
+              ?item p:P2660 ?statement .
+              ?statement wikibase:rank ?rank ; psn:P2660 ?value .
+              ?value wikibase:quantityAmount ?amount ; wikibase:quantityUnit wd:Q11573 .
+            }
+            """
+    }
+
+    /// The prominence an item's statements (not deprecated, in meters) give: a preferred one
+    /// wins over normal ones, and of several of the same rank the highest. Values no summit
+    /// could have don't count. The same for a peak's card (`facts`) and its ranking.
+    static func prominence(of statements: [(preferred: Bool, meters: Double)]) -> Double? {
+        let valid = statements.filter { $0.meters >= 0 && $0.meters <= 9_000 }
+        let best = valid.contains { $0.preferred } ? valid.filter(\.preferred) : valid
+        return best.map(\.meters).max()
+    }
+
+    /// Prominence by item id, meters, from a `prominenceQuery` answer (SPARQL results as
+    /// JSON), as `prominence(of:)` picks it; deprecated statements don't count.
+    public static func prominence(fromSPARQLJSON data: Data) throws -> [String: Double] {
+        struct Answer: Decodable {
+            struct Term: Decodable { var value: String }
+            struct Results: Decodable { var bindings: [[String: Term]] }
+            var results: Results
+        }
+        var statements: [String: [(preferred: Bool, meters: Double)]] = [:]
+        for row in try JSONDecoder().decode(Answer.self, from: data).results.bindings {
+            guard let item = row["item"]?.value, let id = item.split(separator: "/").last.map(String.init), isItemID(id),
+                  let amount = row["amount"]?.value, let meters = Double(amount) else { continue }
+            switch row["rank"]?.value {
+            case "http://wikiba.se/ontology#PreferredRank": statements[id, default: []].append((true, meters))
+            case "http://wikiba.se/ontology#NormalRank": statements[id, default: []].append((false, meters))
+            default: continue
+            }
+        }
+        return statements.compactMapValues(prominence(of:))
+    }
+
+    /// The peaks, with Wikidata's prominence (`table`, meters by item) where OpenStreetMap
+    /// has none.
+    public static func fillProminence(_ peaks: [Peak], from table: [String: Double]) -> [Peak] {
+        guard !table.isEmpty else { return peaks }
+        return peaks.map { peak in
+            guard peak.prominence == nil, let id = peak.wikidata, let meters = table[id] else { return peak }
+            var filled = peak
+            filled.prominence = meters
+            return filled
+        }
     }
 }
 

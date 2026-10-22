@@ -290,7 +290,8 @@ public enum PeakRanking {
 
     /// Higher ranks first. Each term is roughly one point per step that matters to the eye.
     public static func score(_ peak: Peak, rise: Double, distance: Double) -> Double {
-        // 100 m of prominence is 1, 1,000 m is 2; when OpenStreetMap doesn't say, a small one.
+        // 100 m of prominence is 1, 1,000 m is 2; when neither OpenStreetMap nor Wikidata
+        // says, a small one.
         let prominence = peak.prominence.map { log10(max($0, 10) / 10) } ?? 0.6
         // 0.25° above the cols is 1, 0.75° is 2, 1.75° is 3.
         let standsOut = log2(1 + rise / 0.25)

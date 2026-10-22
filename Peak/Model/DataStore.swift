@@ -795,15 +795,20 @@ actor DataStore {
     }
 
     /// Downloads the named peaks that can be seen from anywhere in an area, unless they're
-    /// on the phone already (resuming a download that stopped).
+    /// on the phone already (resuming a download that stopped), and Wikidata's prominence
+    /// for them, which the area doesn't wait for if it can't be had.
     func downloadAreaPeaks(_ area: OfflineArea) async throws {
-        if savedPeaks(of: area) != nil { return }
+        if let saved = savedPeaks(of: area) {
+            _ = await updateProminence(for: saved)
+            return
+        }
         let box = area.box(margin: TerrainScene.radius + 10_000)
         let data = try await overpass(Overpass.peaksQuery(south: box.south, west: box.west, north: box.north, east: box.east),
                                       timeout: 150)
         let peaks = try Overpass.peaks(fromJSON: data)
         try data.write(to: areaFile(area, "peaks"), options: .atomic)
         areaPeakCache[area.id] = peaks
+        _ = await updateProminence(for: peaks)
     }
 
     /// The boxes an area's hikes are fetched in, at most 30 km across: one query for a
@@ -951,7 +956,15 @@ actor DataStore {
             // kept only an hour, so it's completed soon rather than in a month.
             var partial = false
             if let id = peak.wikidata {
+                let generation = prominenceGeneration
                 facts = try Wikidata.facts(fromJSON: try await get(Wikidata.entityURL(id)), id: id)
+                // The ranking's table needn't ask about this one for a while (unless downloads
+                // were cleared meanwhile).
+                if Wikidata.isItemID(id), generation == prominenceGeneration {
+                    var index = loadedProminence()
+                    index[id] = ProminenceEntry(meters: facts.prominence, asked: Date())
+                    saveProminence(index)
+                }
                 let ids = facts.linkedIDs
                 if !ids.isEmpty {
                     if let labels = try? Wikidata.labels(fromJSON: try await get(Wikidata.labelsURL(ids))) {
@@ -999,6 +1012,108 @@ actor DataStore {
         return data
     }
 
+    // MARK: Prominence from Wikidata
+
+    /// What Wikidata says of an item's prominence, and when it was asked: no meters when
+    /// it has none.
+    private struct ProminenceEntry: Codable {
+        var meters: Double?
+        var asked: Date
+    }
+
+    /// Wikidata's prominence by item, kept with the facts and read once. Entries are never
+    /// dropped, only asked again after a month: offline, an old answer still ranks the peaks.
+    private var prominenceIndex: [String: ProminenceEntry]?
+    /// The query under way: a second load waits for it, then asks only for what it didn't.
+    private var prominenceQuery: Task<Bool, Never>?
+    /// Not asked again before this, after the query services failed.
+    private var prominenceHold = Date.distantPast
+    /// Counts up when downloads are cleared, so what was being asked then isn't kept.
+    private var prominenceGeneration = 0
+
+    private var prominenceFile: URL { factDirectory.appendingPathComponent("prominence.json") }
+
+    private func loadedProminence() -> [String: ProminenceEntry] {
+        if let prominenceIndex { return prominenceIndex }
+        let index = (try? Data(contentsOf: prominenceFile))
+            .flatMap { try? JSONDecoder().decode([String: ProminenceEntry].self, from: $0) } ?? [:]
+        prominenceIndex = index
+        return index
+    }
+
+    private func saveProminence(_ index: [String: ProminenceEntry]) {
+        prominenceIndex = index
+        if let data = try? JSONEncoder().encode(index) { try? data.write(to: prominenceFile, options: .atomic) }
+    }
+
+    /// Wikidata's prominence by item, meters, as far as the phone knows it: no network.
+    func prominence() -> [String: Double] {
+        loadedProminence().compactMapValues(\.meters)
+    }
+
+    /// Asks Wikidata, in one query, for the prominence of those of the peaks' items not
+    /// asked in the last month, and keeps the answers, "none" included. Returns whether
+    /// anything known changed. When it can't be asked, what's known stays.
+    func updateProminence(for peaks: [Peak]) async -> Bool {
+        var changed = false
+        while true {
+            let index = loadedProminence()
+            let fresh = Date().addingTimeInterval(-30 * 86_400)
+            let ids = Set(peaks.lazy.compactMap(\.wikidata).filter { Wikidata.isItemID($0) && !(index[$0].map { $0.asked > fresh } ?? false) })
+            guard !ids.isEmpty, Date() >= prominenceHold else { return changed }
+            // One under way may cover these peaks too.
+            if let running = prominenceQuery {
+                changed = await running.value || changed
+                continue
+            }
+            let query = Task { await self.queryProminence(ids.sorted()) }
+            prominenceQuery = query
+            return await query.value || changed
+        }
+    }
+
+    /// One query, to each service in turn until one answers. With no signal it's asked
+    /// again at the next load; after the services failed, not for 10 minutes.
+    private func queryProminence(_ ids: [String]) async -> Bool {
+        // Cleared before the task ends, so those waiting for it see it gone.
+        defer { prominenceQuery = nil }
+        let started = Date(), generation = prominenceGeneration
+        let body = Data(("query=" + (Wikidata.prominenceQuery(ids).addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")).utf8)
+        for endpoint in Wikidata.queryEndpoints {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 20
+            request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+            request.setValue("application/sparql-results+json", forHTTPHeaderField: "Accept")
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            request.httpBody = body
+            let found: [String: Double]
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                bytesDownloaded += data.count
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else { continue }
+                found = try Wikidata.prominence(fromSPARQLJSON: data)
+            } catch let error as URLError where [.notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff].contains(error.code) {
+                return false
+            } catch {
+                continue
+            }
+            guard generation == prominenceGeneration else { return false }
+            var index = loadedProminence()
+            var changed = false
+            let now = Date()
+            // Not over what a peak's card fetched meanwhile.
+            for id in ids where !(index[id].map { $0.asked >= started } ?? false) {
+                if index[id]?.meters != found[id] { changed = true }
+                index[id] = ProminenceEntry(meters: found[id], asked: now)
+            }
+            saveProminence(index)
+            return changed
+        }
+        if generation == prominenceGeneration { prominenceHold = Date().addingTimeInterval(600) }
+        return false
+    }
+
     // MARK: Storage
 
     /// Bytes of everything kept on the phone.
@@ -1019,5 +1134,8 @@ actor DataStore {
         }
         layouts.removeAll()
         coverCells.removeAll()
+        prominenceIndex = nil
+        prominenceHold = .distantPast
+        prominenceGeneration += 1
     }
 }

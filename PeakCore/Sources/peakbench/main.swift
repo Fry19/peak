@@ -93,6 +93,9 @@ peakbench: desk test harness for skyline matching.
   peakbench facts ENTITY.json --id Q [--labels LABELS.json] [--summary SUMMARY.json]
       Read a peak's facts from Wikidata and Wikipedia responses.
 
+  peakbench prominence --query Q… [Q…]     or     peakbench prominence ANSWER.json
+      The app's one query for many peaks' prominence (P2660), and what it reads from the answer.
+
   peakbench case PHOTO.jpg [--out CASE.json]          (macOS only)
       Make a case file from an iPhone photo's location, compass heading and lens data.
 """
@@ -575,6 +578,17 @@ func factsCommand(_ args: Arguments) throws {
     print("picture: \(facts.pictureURL?.absoluteString ?? "-")")
 }
 
+func prominenceCommand(_ args: Arguments) throws {
+    if let first = args.string("query") {
+        print(Wikidata.prominenceQuery([first] + args.positional))
+        return
+    }
+    guard let path = args.positional.first else { throw HarnessError("prominence --query Q… or prominence ANSWER.json") }
+    let table = try Wikidata.prominence(fromSPARQLJSON: try Data(contentsOf: URL(fileURLWithPath: path)))
+    for (id, meters) in table.sorted(by: { $0.key < $1.key }) { print("\(id): \(f(meters, 0)) m") }
+    print("\(table.count) with prominence")
+}
+
 // MARK: - scene
 
 /// Times what the app does to build its view from a point: the horizon, the ridgelines and
@@ -1009,6 +1023,7 @@ do {
     case "scene": try sceneCommand(args)
     case "trails": try trailsCommand(args)
     case "facts": try factsCommand(args)
+    case "prominence": try prominenceCommand(args)
     case "sun": try sunCommand(args)
     case "relief": try reliefCommand(args)
     case "base": try baseCommand(args)

@@ -11,7 +11,8 @@ public struct Peak: Codable, Sendable, Hashable, Identifiable {
     public var elevation: Double
     /// The elevation is the terrain model's, since OpenStreetMap has none for this peak.
     public var estimatedElevation = false
-    /// Topographic prominence when OpenStreetMap has it, meters.
+    /// Topographic prominence, meters: OpenStreetMap's, or where it has none, Wikidata's once
+    /// that is known (`Wikidata.fillProminence`).
     public var prominence: Double?
     /// Wikidata item ("Q1374") and Wikipedia article ("en:Matterhorn"), for facts.
     public var wikidata: String?

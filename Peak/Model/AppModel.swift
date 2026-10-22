@@ -311,6 +311,8 @@ final class AppModel {
     /// The revision `scene` was built from.
     @ObservationIgnored private var sceneRevision = 0
     @ObservationIgnored private var peaks: [Peak] = []
+    /// Wikidata's prominence by item, meters, for ranking the peaks OpenStreetMap gives none.
+    @ObservationIgnored private var prominence: [String: Double] = [:]
     @ObservationIgnored private var rebuilding = false
     @ObservationIgnored private var rebuildAgain = false
     @ObservationIgnored private(set) var lastBuildSeconds = 0.0
@@ -542,6 +544,7 @@ final class AppModel {
         terrainBackoff.reset()
         retryMissing()
         if case .retrying = peaksState, let place = peaksPlace { loadPeaks(place.lat, place.lon, generation: place.generation) }
+        if peaksState == .loaded { updateProminence() }
         // Peak cards that couldn't get their facts or hikes.
         for d in details.values { retryFailed(d, place: nil) }
     }
@@ -602,6 +605,8 @@ final class AppModel {
         let store = self.store
         progress("Finding peaks…")
         let found = try? await store.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
+        // Wikidata's prominence for those it hasn't been asked about, alongside the terrain.
+        let asking = found.map { peaks in Task { await store.updateProminence(for: peaks) } }
         let keys = DataStore.tiles(latitude: lat, longitude: lon, radius: TerrainScene.radius)
             .sorted { DataStore.distance(from: lat, lon, to: $0) < DataStore.distance(from: lat, lon, to: $1) }
         let here = DataStore.Key(south: Int(lat.rounded(.down)), west: Int(lon.rounded(.down)))
@@ -639,8 +644,10 @@ final class AppModel {
         progress("Drawing the view…")
         let terrain = Terrain(tiles: tiles.values.compactMap { $0 }, detail: detail, missingIsSea: false)
         let peaks = found ?? []
+        _ = await asking?.value
+        let prominence = await store.prominence()
         let built = await Task.detached(priority: .userInitiated) {
-            TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, accuracy: accuracy, peaks: peaks)
+            TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, accuracy: accuracy, peaks: peaks, prominence: prominence)
         }.value
         return (built, found != nil)
     }
@@ -1137,13 +1144,16 @@ final class AppModel {
             while !Task.isCancelled {
                 do {
                     let found = try await store.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
+                    let known = await store.prominence()
                     guard !Task.isCancelled else { return }
                     // A newer load's peaks win, but these, from a few km away, do until then.
                     let current = generation == loadGeneration
                     guard current || peaks.isEmpty else { return }
                     peaks = found
+                    prominence = known
                     if current { peaksState = .loaded }
                     if scene != nil { await rebuild() }
+                    if current { updateProminence() }
                     return
                 } catch {
                     guard generation == loadGeneration, !Task.isCancelled else { return }
@@ -1169,7 +1179,26 @@ final class AppModel {
     private func useBasePeaks(_ lat: Double, _ lon: Double, generation: Int) {
         guard let baseLayer, generation == loadGeneration, peaks.isEmpty, peaksState != .loaded else { return }
         peaks = baseLayer.peaks(latitude: lat, longitude: lon, radius: TerrainScene.radius)
-        if scene != nil { Task { @MainActor in await rebuild() } }
+        let store = self.store
+        Task { @MainActor in
+            // Ranked with the prominence the phone knows, then (with a signal) the rest.
+            prominence = await store.prominence()
+            if scene != nil { await rebuild() }
+            updateProminence()
+        }
+    }
+
+    /// Asks Wikidata for the prominence of the peaks around that it hasn't been asked about
+    /// (`DataStore.updateProminence`), in the background, and ranks them again with it: one
+    /// rebuild, and only if something new came.
+    private func updateProminence() {
+        let store = self.store, peaks = self.peaks
+        guard !peaks.isEmpty else { return }
+        Task { @MainActor in
+            guard await store.updateProminence(for: peaks) else { return }
+            prominence = await store.prominence()
+            if scene != nil { await rebuild() }
+        }
     }
 
     /// Tries again for terrain that failed after a wait that grows each time.
@@ -1501,14 +1530,15 @@ final class AppModel {
                 Terrain(tiles: Array(tiles.values), detail: detailTiles, ground: groundTiles, base: $0, latitude: lat, longitude: lon,
                         radius: TerrainScene.radius + 10_000)
             } ?? Terrain(tiles: Array(tiles.values), detail: detailTiles, ground: groundTiles, missingIsSea: false)
-            let peaks = self.peaks
+            let peaks = self.peaks, prominence = self.prominence
             let accuracy = center.horizontalAccuracy
             // Only used on coarse ground, where it beats kilometers of averaged terrain.
             let altitude = center.verticalAccuracy > 0 && center.verticalAccuracy < 50 ? center.altitude : nil
             let started = Date()
             // Below the interface's priority, so building never makes the screen stutter.
             let built = await Task.detached(priority: .utility) {
-                TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, accuracy: accuracy, altitude: altitude, peaks: peaks)
+                TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, accuracy: accuracy, altitude: altitude, peaks: peaks,
+                                   prominence: prominence)
             }.value
             lastBuildSeconds = Date().timeIntervalSince(started)
             // Moved far on while building, or somewhere the terrain isn't in yet: not from the old spot.

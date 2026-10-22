@@ -226,6 +226,45 @@ final class LabelTests: XCTestCase {
         XCTAssertEqual(views.sorted { $0.0.elevation > $1.0.elevation }.firstIndex { $0.0.name == "Matterhorn" }, 4)
     }
 
+    /// From Alcoa, Tennessee: OpenStreetMap has no prominence for the Smokies' summits, so a
+    /// minor one nearer by, rising well clear of the low ridges in front, outranks Kuwohi, the
+    /// range's highest, barely above the crest 50 km off. Wikidata's prominence for Kuwohi
+    /// (1,372 m; none for Blanket Mountain) puts it ahead by more than a shown label's
+    /// hold, so it takes the one label from Blanket Mountain.
+    func testWikidataProminenceRanksTheRangesHighest() {
+        let osm = [
+            Peak(id: 1, name: "Blanket Mountain", latitude: 35.62, longitude: -83.71, elevation: 1_100, wikidata: "Q31663127"),
+            Peak(id: 2, name: "Kuwohi", latitude: 35.5628, longitude: -83.4985, elevation: 2_025, wikidata: "Q685166"),
+            Peak(id: 3, name: "Mount Le Conte", latitude: 35.6544, longitude: -83.4383, elevation: 2_010, prominence: 400,
+                 wikidata: "Q6921794"),
+        ]
+        let seen: [Int64: (rise: Double, distance: Double)] = [1: (0.9, 20_000), 2: (0.2, 50_000), 3: (0.3, 45_000)]
+        func scores(_ peaks: [Peak]) -> [String: Double] {
+            Dictionary(uniqueKeysWithValues: peaks.map { ($0.name, PeakRanking.score($0, rise: seen[$0.id]!.rise, distance: seen[$0.id]!.distance)) })
+        }
+        let wikidata = ["Q685166": 1_372.5, "Q6921794": 414.5]
+        let filled = Wikidata.fillProminence(osm, from: wikidata)
+        XCTAssertEqual(filled.map(\.prominence), [nil, 1_372.5, 400], "OpenStreetMap's own prominence stays")
+
+        let before = scores(osm), after = scores(filled)
+        XCTAssertGreaterThan(before["Blanket Mountain"]!, before["Kuwohi"]!)
+        XCTAssertGreaterThan(after["Kuwohi"]!, after["Blanket Mountain"]! + LabelLayout.Thresholds().stickiness)
+        // Unknown prominence keeps the default, and the scores of what didn't change stay.
+        XCTAssertEqual(after["Blanket Mountain"], before["Blanket Mountain"])
+        XCTAssertEqual(after["Mount Le Conte"], before["Mount Le Conte"])
+        XCTAssertEqual(Wikidata.fillProminence(osm, from: [:]), osm)
+
+        // One label, Blanket Mountain's shown: Kuwohi takes it once its prominence is known.
+        let layout = LabelLayout(bounds: ScreenRect(x: 0, y: 0, width: 400, height: 800), limit: 1)
+        func shown(_ s: [String: Double]) -> [Int64] {
+            let box = LabelBox(minX: -40, minY: -30, maxX: 40, maxY: -6)
+            let candidates = osm.map { LabelLayout.Candidate(id: $0.id, x: 100 + Double($0.id) * 100, y: 400, score: s[$0.name]!, box: box) }
+            return layout.place(candidates, previous: [1]).labels
+        }
+        XCTAssertEqual(shown(before), [1])
+        XCTAssertEqual(shown(after), [2])
+    }
+
     /// All else equal, a peak on Wikidata outranks one that isn't, and a nearer one a farther one.
     func testRankingTieBreaks() {
         let plain = Peak(id: 1, name: "A", latitude: 46, longitude: 7, elevation: 3000)
