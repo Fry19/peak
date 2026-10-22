@@ -9,6 +9,9 @@ final class SkylineCorrector: @unchecked Sendable {
     struct Outcome {
         /// Corrections relative to the ones the frame was matched with, degrees.
         var delta: Double
+        /// The heading correction the frame was matched with (north included), so a match
+        /// can be compared with ones made under other corrections.
+        var from: Double
         var pitchDelta: Double
         var rollDelta: Double
         /// The phone was held sideways; pitch and roll belong to that way of holding it.
@@ -50,18 +53,21 @@ final class SkylineCorrector: @unchecked Sendable {
     private var horizon: HorizonProfile?
     private var upright = ViewCorrection()
     private var sideways = ViewCorrection()
+    private var positionUncertainty = LocationQuality.matchingAccuracy
     private let matcher = SkylineMatcher()
     /// The long side frames are matched at. What counts is pixels per degree: a far ridge in
     /// haze may stand only half a degree over a nearer one in front, a few pixels at this size.
     private static let workingSide = 960
 
-    /// What to match against, and the corrections in use for the phone held upright and
-    /// sideways. Call on any thread.
-    func update(horizon: HorizonProfile?, upright: ViewCorrection, sideways: ViewCorrection) {
+    /// What to match against, the corrections in use for the phone held upright and
+    /// sideways, and how far you may be from where the horizon was rendered, meters
+    /// (`LocationQuality.positionUncertainty`). Call on any thread.
+    func update(horizon: HorizonProfile?, upright: ViewCorrection, sideways: ViewCorrection, positionUncertainty: Double) {
         lock.lock()
         self.horizon = horizon
         self.upright = upright
         self.sideways = sideways
+        self.positionUncertainty = positionUncertainty
         lock.unlock()
     }
 
@@ -88,6 +94,7 @@ final class SkylineCorrector: @unchecked Sendable {
         // The correction covers both the compass's north (magnetic or true) and its error.
         let isSideways = CameraGeometry.isSideways(pose)
         let correction = isSideways ? sideways : upright
+        let uncertainty = positionUncertainty
         let capture = self.capture
         self.capture = nil
         lock.unlock()
@@ -111,11 +118,14 @@ final class SkylineCorrector: @unchecked Sendable {
             prior.pitch += correction.pitch
             prior.roll += correction.roll
             var matcher = self.matcher
+            // Near ridges shift with the position, so they count for less the less sure it is.
+            matcher.settings.positionUncertainty = uncertainty
             let (w, h) = (upright.image.width, upright.image.height)
             matcher.workingWidth = w >= h ? Self.workingSide : Self.workingSide * w / h
             let m = matcher.match(upright.image, intrinsics: upright.camera.intrinsics, prior: prior, horizon: horizon)
             let a = m.alignment
-            let outcome = Outcome(delta: a.headingCorrection, pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
+            let outcome = Outcome(delta: a.headingCorrection, from: correction.heading,
+                                  pitchDelta: a.pitchCorrection, rollDelta: a.rollCorrection,
                                   sideways: isSideways, accepted: a.accepted, rms: a.rms, reason: a.rejectionReason,
                                   seconds: m.seconds)
             if let capture, let frame = Self.testFrame(upright, correction: correction, horizon: horizon,

@@ -29,6 +29,9 @@ final class AppModel {
         /// misread mountain, or to make up for the compass, mustn't stay with the phone.
         var byHandLevel = [Level(), Level()]
         var matches = 0
+        /// Which matches move the heading: two must agree before the first lock, and a lone
+        /// jump waits for the next match to repeat it.
+        var lock = HeadingLock()
         var lastMatch: Date?
         var lastRMS = 0.0
         /// When the view was last lined up by hand.
@@ -48,12 +51,17 @@ final class AppModel {
                                   roll: level[i].roll + byHandLevel[i].roll)
         }
 
-        mutating func add(_ o: SkylineCorrector.Outcome) {
-            // Take the first match half whole; after that, move part of the way each time so
-            // a single odd frame can't make the labels jump. The level is steadier than the
-            // compass, so it moves more slowly.
+        /// Takes an accepted match; `north` is the compass's north correction now. Returns
+        /// whether it moved anything: a match no other one has confirmed yet doesn't.
+        @discardableResult
+        mutating func add(_ o: SkylineCorrector.Outcome, north: Double) -> Bool {
+            // The heading this match measured, under the same north as `heading`. The lock
+            // takes the first one once two agree, then moves part of the way each time so a
+            // single odd frame can't make the labels jump. The level is steadier than the
+            // compass, so it moves more slowly, and only with matches the lock took.
+            guard let next = lock.add(o.from - north + o.delta, current: heading) else { return false }
             let first = matches == 0
-            heading += first ? o.delta : 0.5 * o.delta
+            heading = next
             let i = o.sideways ? 1 : 0
             let gain = first ? 0.5 : 0.3
             // The match measures the whole level, the part from lining up by hand included:
@@ -67,6 +75,7 @@ final class AppModel {
             matches += 1
             lastMatch = Date()
             lastRMS = o.rms
+            return true
         }
 
         static func bounded(_ degrees: Double) -> Double {
@@ -237,7 +246,13 @@ final class AppModel {
         sideways.heading += north
         // Matching against the horizon from a rough fix would lock onto the wrong one.
         let horizon = sceneAccuracy < LocationQuality.matchingAccuracy ? scene?.horizon : nil
-        corrector.update(horizon: horizon, upright: upright, sideways: sideways)
+        // How far you may be from where the horizon was rendered: near ridges count for less.
+        var uncertainty = LocationQuality.positionUncertainty(accuracy: sceneAccuracy, moved: 0)
+        if let scene, let location {
+            let built = CLLocation(latitude: scene.observer.latitude, longitude: scene.observer.longitude)
+            uncertainty = LocationQuality.positionUncertainty(accuracy: location.horizontalAccuracy, moved: location.distance(from: built))
+        }
+        corrector.update(horizon: horizon, upright: upright, sideways: sideways, positionUncertainty: uncertainty)
     }
 
     func start() {
@@ -287,8 +302,7 @@ final class AppModel {
             guard let self else { return }
             self.lastOutcome = outcome
             guard outcome.accepted, self.frozen == nil else { return }
-            self.correction.add(outcome)
-            self.updateCorrector()
+            if self.correction.add(outcome, north: self.motion.northCorrection) { self.updateCorrector() }
         }
         setActive(true)
     }
@@ -460,6 +474,7 @@ final class AppModel {
         }
         correction.lastMatch = nil
         correction.byHand = nil
+        correction.lock.reset()
         saveCalibration()
     }
 
@@ -570,6 +585,7 @@ final class AppModel {
         if let old = location, new.timestamp.timeIntervalSince(old.timestamp) < 60, old.horizontalAccuracy < new.horizontalAccuracy,
            new.distance(from: old) < old.horizontalAccuracy { return }
         location = new
+        updateCorrector()
         // Tiles are 1° wide, so a rough first fix is enough to start downloading.
         guard LocationQuality.usableForLoading(accuracy: new.horizontalAccuracy, precise: preciseLocation) else { return }
         // After a failed load, nearby fixes leave it to the retries.
@@ -1045,10 +1061,11 @@ final class AppModel {
             let terrain = Terrain(tiles: Array(tiles.values), detail: detail.values.flatMap { $0.values }, missingIsSea: false)
             let peaks = self.peaks
             let lat = center.coordinate.latitude, lon = center.coordinate.longitude
+            let accuracy = center.horizontalAccuracy
             let started = Date()
             // Below the interface's priority, so building never makes the screen stutter.
             let built = await Task.detached(priority: .utility) {
-                TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, peaks: peaks)
+                TerrainScene.build(terrain: terrain, latitude: lat, longitude: lon, accuracy: accuracy, peaks: peaks)
             }.value
             lastBuildSeconds = Date().timeIntervalSince(started)
             // Moved far on while building, or somewhere the terrain isn't in yet: not from the old spot.

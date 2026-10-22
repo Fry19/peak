@@ -275,7 +275,7 @@ public final class Terrain: @unchecked Sendable {
         var k = k
         let end = patchStart[cell + 1]
         while k < end {
-            if let (h, edge) = patches[k].interiorSample(latitude, longitude) {
+            if let (h, edge) = detailSample(patches[k], latitude, longitude) {
                 let w = edge / Self.patchBlend
                 if w >= 1 { return h }
                 let below = patchHeight(latitude, longitude, cell: cell, from: k + 1)
@@ -284,6 +284,97 @@ public final class Terrain: @unchecked Sendable {
             k += 1
         }
         return baseHeight(latitude, longitude, cell: cell)
+    }
+
+    /// Bilinear height from patch `p` and how far in from its nearest real edge, in pixels;
+    /// nil where it has no data. Patches are cut per 1° cell, so two of them often meet on
+    /// a cell's boundary: a side with data on the same pixel grid carrying on past it (the
+    /// next cell's patch or tile) isn't an edge, and the last strip of the cell, past the
+    /// patch's last pixels, is read across into that data. Otherwise the terrain would fall
+    /// back to the coarse tile along every 1° line, notching ridges that cross it.
+    @inline(__always)
+    func detailSample(_ p: ElevationTile, _ latitude: Double, _ longitude: Double) -> (height: Double, edge: Double)? {
+        let y = (p.originLatitude - latitude) / p.stepLatitude
+        let x = (longitude - p.originLongitude) / p.stepLongitude
+        let height: Double
+        if let s = p.interiorSample(latitude, longitude) {
+            if s.edge >= Self.patchBlend { return s }
+            height = s.height
+        } else {
+            guard y >= 0, x >= 0 else { return nil }
+            let r0 = Int(y), c0 = Int(x)
+            guard r0 < p.rows, c0 < p.cols,
+                  let a = gridValue(p, r0, c0), let b = gridValue(p, r0, c0 + 1),
+                  let c = gridValue(p, r0 + 1, c0), let d = gridValue(p, r0 + 1, c0 + 1) else { return nil }
+            let fy = y - Double(r0), fx = x - Double(c0)
+            height = (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
+        }
+        // Each side within reach of the blend counts unless the same grid carries on past it.
+        let reach = Self.patchBlend
+        let lastRow = p.originLatitude - Double(p.rows - 1) * p.stepLatitude
+        let lastCol = p.originLongitude + Double(p.cols - 1) * p.stepLongitude
+        var edge = Double.infinity
+        let sides = [(y, p.originLatitude + reach * p.stepLatitude, longitude),
+                     (Double(p.rows - 1) - y, lastRow - reach * p.stepLatitude, longitude),
+                     (x, latitude, p.originLongitude - reach * p.stepLongitude),
+                     (Double(p.cols - 1) - x, latitude, lastCol + reach * p.stepLongitude)]
+        for (distance, lat, lon) in sides where distance < min(edge, reach) {
+            if !continues(p, lat, lon) { edge = distance }
+        }
+        return (height, max(0, edge))
+    }
+
+    /// Whether data on `p`'s pixel grid, other than `p`, covers a point: another patch at
+    /// the same spacing, or a tile at the same spacing.
+    func continues(_ p: ElevationTile, _ latitude: Double, _ longitude: Double) -> Bool {
+        let south = Int(latitude.rounded(.up)) - 1, west = Int(longitude.rounded(.down))
+        let li = south - minSouth, wi = west - minWest
+        guard li >= 0, li < latCount, wi >= 0, wi < lonCount else { return false }
+        let cell = li * lonCount + wi
+        for k in patchStart[cell]..<patchStart[cell + 1] where patches[k] !== p && sameGrid(patches[k], p) {
+            if patches[k].interiorHeight(latitude, longitude) != nil { return true }
+        }
+        if let tile = grid[cell], tile !== p, sameGrid(tile, p) { return true }
+        return false
+    }
+
+    /// The same pixel spacing and pixel centers.
+    func sameGrid(_ a: ElevationTile, _ b: ElevationTile) -> Bool {
+        guard abs(a.stepLatitude - b.stepLatitude) < 1e-9 * b.stepLatitude,
+              abs(a.stepLongitude - b.stepLongitude) < 1e-9 * b.stepLongitude else { return false }
+        let dr = (a.originLatitude - b.originLatitude) / b.stepLatitude
+        let dc = (a.originLongitude - b.originLongitude) / b.stepLongitude
+        return abs(dr - dr.rounded()) < 1e-3 && abs(dc - dc.rounded()) < 1e-3
+    }
+
+    /// Height of pixel (row, col) on `p`'s grid: from `p` itself, or past its last pixels
+    /// from other data on the same grid (see `detailSample`). Nil where there's none.
+    func gridValue(_ p: ElevationTile, _ row: Int, _ col: Int) -> Double? {
+        if row >= 0, col >= 0, row < p.rows, col < p.cols {
+            let v = p.value(row: row, col: col)
+            return v == ElevationTile.noData ? nil : Double(v)
+        }
+        let lat = p.originLatitude - Double(row) * p.stepLatitude
+        let lon = p.originLongitude + Double(col) * p.stepLongitude
+        // A cell owns latitudes in (south, south + 1] and longitudes in [west, west + 1); a
+        // pixel center can sit right on a boundary, so nudge into the right cell by its spacing.
+        let south = Int((lat - 0.25 * p.stepLatitude).rounded(.up)) - 1
+        let west = Int((lon + 0.25 * p.stepLongitude).rounded(.down))
+        let li = south - minSouth, wi = west - minWest
+        guard li >= 0, li < latCount, wi >= 0, wi < lonCount else { return nil }
+        let cell = li * lonCount + wi
+        func value(in t: ElevationTile) -> Double? {
+            guard t !== p, sameGrid(t, p) else { return nil }
+            let r = Int(((t.originLatitude - lat) / t.stepLatitude).rounded())
+            let c = Int(((lon - t.originLongitude) / t.stepLongitude).rounded())
+            guard r >= 0, c >= 0, r < t.rows, c < t.cols else { return nil }
+            let v = t.value(row: r, col: c)
+            return v == ElevationTile.noData ? nil : Double(v)
+        }
+        for k in patchStart[cell]..<patchStart[cell + 1] {
+            if let v = value(in: patches[k]) { return v }
+        }
+        return grid[cell].flatMap(value(in:))
     }
 
     /// The height from the cell's 1° tile.

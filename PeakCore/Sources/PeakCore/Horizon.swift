@@ -95,9 +95,35 @@ public final class HorizonRenderer: @unchecked Sendable {
 
     /// An observer standing on the terrain: the DEM height plus `eyeHeight`.
     /// The DEM height is used rather than GPS altitude, which is far less accurate.
-    public func observer(latitude: Double, longitude: Double, eyeHeight: Double = 1.6) -> GeoPoint {
-        let ground = terrain.height(latitude: latitude, longitude: longitude)
+    ///
+    /// `accuracy` is how far off the position may be, meters. The ground is then the
+    /// highest DEM height within that distance (at most `maxGroundSearch`): a fix a few
+    /// meters off a knife-edge crest would otherwise put the eye down its side, with the
+    /// crest blocking half the view, while people looking at the view mostly stand on top.
+    public func observer(latitude: Double, longitude: Double, eyeHeight: Double = 1.6, accuracy: Double = 0) -> GeoPoint {
+        let ground = groundHeight(latitude: latitude, longitude: longitude, within: min(max(accuracy, 0), Self.maxGroundSearch))
         return GeoPoint(latitude: latitude, longitude: longitude, height: (ground.isNaN ? 0 : ground) + eyeHeight)
+    }
+
+    /// The furthest `observer` looks for higher ground, meters.
+    public static let maxGroundSearch = 30.0
+
+    /// The highest DEM height within `radius` meters of a point, sampled about every 3 m;
+    /// NaN where there is no terrain.
+    public func groundHeight(latitude: Double, longitude: Double, within radius: Double) -> Double {
+        var top = terrain.height(latitude: latitude, longitude: longitude)
+        guard radius > 0 else { return top }
+        let n = Int((radius / 3).rounded(.up))
+        let step = radius / Double(n)
+        let metersPerLat = 111_320.0, metersPerLon = 111_320 * max(cos(latitude * .pi / 180), 0.05)
+        for i in -n...n {
+            for j in -n...n where i * i + j * j <= n * n {
+                let h = terrain.height(latitude: latitude + Double(i) * step / metersPerLat,
+                                       longitude: longitude + Double(j) * step / metersPerLon)
+                if h.isFinite, !(h <= top) { top = h }
+            }
+        }
+        return top
     }
 
     /// Ray-marches the DEM in every direction from `observer`.
