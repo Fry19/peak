@@ -87,8 +87,19 @@ struct TerrainScene: @unchecked Sendable {
                             isCoarse: isCoarse)
     }
 
+    /// The terrain around this view's eye as triangles, out to its horizon's reach, for
+    /// drawing the views from above in 3D: one mesh for every height, since only the eye moves.
+    func panorama() -> PanoramaMesh {
+        var settings = PanoramaMeshSettings()
+        settings.maxDistance = horizon.settings.maxDistance
+        settings.refraction = horizon.settings.refraction
+        Self.terrainWrites.lock()
+        defer { Self.terrainWrites.unlock() }
+        return PanoramaMesh.build(terrain: terrain, from: observer, settings: settings)
+    }
+
     /// Held while summits are raised in the shared tiles (`build`) and while a view from above
-    /// reads them (`risen`): the live view's rebuild may raise new ones as tiles arrive.
+    /// reads them (`risen`, `panorama`): the live view's rebuild may raise new ones as tiles arrive.
     private static let terrainWrites = NSLock()
 
     private static func view(from observer: GeoPoint, terrain: Terrain, peaks: [Peak], settings: HorizonSettings,
