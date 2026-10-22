@@ -17,7 +17,7 @@ struct ViewshedRow: View {
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "eye")
-                    .foregroundStyle(ViewshedView.tint)
+                    .foregroundStyle(.amber)
                     .accessibilityHidden(true)
                 Text("Where you can see it from")
                     .foregroundStyle(.primary)
@@ -73,7 +73,7 @@ struct ViewshedView: View {
             let safe = geo.safeAreaInsets
             let content = EdgeInsets(top: safe.top + 76, leading: 12, bottom: safe.bottom + 92, trailing: 12)
             ZStack {
-                TrailFromAboveView.background
+                Color.sheetBackground
                     .ignoresSafeArea()
                 if let map {
                     GeometryReader { screen in
@@ -147,7 +147,7 @@ struct ViewshedView: View {
         .padding(.trailing, 8)
         .padding(.vertical, 8)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: Capsule())
+        .glassBackground(in: Capsule())
         .environment(\.colorScheme, .dark)
     }
 
@@ -174,7 +174,7 @@ struct ViewshedView: View {
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(.white.opacity(0.85))
                     .frame(width: 30, height: 30)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .glassBackground(in: Circle())
                     .environment(\.colorScheme, .dark)
                     .accessibilityLabel("North is up")
             }
@@ -296,7 +296,7 @@ private struct ProbeCard: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .frame(maxWidth: 420, alignment: .leading)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .glassBackground(in: RoundedRectangle(cornerRadius: 16))
         .environment(\.colorScheme, .dark)
         .accessibilityElement(children: .combine)
     }
@@ -520,7 +520,7 @@ private struct ViewshedLayer: View, Animatable {
                     context.stroke(line, with: .color((seen ? ViewshedView.tint : .white).opacity(seen ? 0.7 : 0.3)),
                                    style: StrokeStyle(lineWidth: 1, dash: seen ? [] : [2, 3]))
                     let dot = Path(ellipseIn: CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10))
-                    context.fill(dot, with: .color(TrailFromAboveView.background))
+                    context.fill(dot, with: .color(Color.sheetBackground))
                     context.stroke(dot, with: .color(seen ? ViewshedView.tint : .white.opacity(0.8)), lineWidth: 2)
                 }
             }
@@ -552,7 +552,7 @@ private struct ViewshedLayer: View, Animatable {
             .foregroundStyle(.white.opacity(0.6))
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .background(TrailFromAboveView.background.opacity(0.8), in: Capsule())
+            .background(Color.sheetBackground.opacity(0.8), in: Capsule())
             .position(top)
             .allowsHitTesting(false)
     }
