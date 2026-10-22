@@ -118,7 +118,8 @@ final class AppModel {
     }
 
     enum Sheet: Identifiable, Equatable {
-        case peak(Int64)
+        /// A peak's card; `fromLabel` when it opened from a tap on the peak's label in the view.
+        case peak(Int64, fromLabel: Bool = false)
         case list
         case settings
 
@@ -774,10 +775,11 @@ final class AppModel {
         peaks.isEmpty && peaksState != .loaded
     }
 
-    /// Opens a peak's card and highlights it in the view.
-    func select(_ id: Int64) {
+    /// Opens a peak's card and highlights it in the view; `fromLabel` when its label in the
+    /// view was tapped, so the card needn't offer to find it there.
+    func select(_ id: Int64, fromLabel: Bool = false) {
         selectedPeakID = id
-        sheet = .peak(id)
+        sheet = .peak(id, fromLabel: fromLabel)
     }
 
     /// Facts and hikes for a peak, loading in the background. Kept for the session; what

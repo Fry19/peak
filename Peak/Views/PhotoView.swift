@@ -46,7 +46,8 @@ struct PhotoView: View {
         .animation(.easeInOut(duration: 0.2), value: photo.adjusting)
         .sheet(item: $card, onDismiss: { photo.selectedID = nil }) { link in
             NavigationStack {
-                PeakDetailView(model: model, peakID: link.id, place: photo.scene)
+                // Opened only from a tap on the peak's label in the photo.
+                PeakDetailView(model: model, peakID: link.id, place: photo.scene, fromLabel: true)
                     .navigationDestination(for: TrailLink.self) { TrailDetailView(model: model, link: $0, place: photo.scene) }
             }
             .presentationDetents([.medium, .large])

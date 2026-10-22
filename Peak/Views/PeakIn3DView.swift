@@ -1,8 +1,8 @@
 import PeakCore
 import SwiftUI
 
-/// The row on a peak's card that opens it in 3D.
-struct PeakIn3DRow: View {
+/// The button on a peak's card that opens it in 3D.
+struct PeakIn3DButton: View {
     let model: AppModel
     let peak: Peak
     /// The scene the card belongs to: the live view's or a photo's.
@@ -15,22 +15,8 @@ struct PeakIn3DRow: View {
         Button {
             showing = true
         } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "view.3d")
-                    .foregroundStyle(.amber)
-                    .accessibilityHidden(true)
-                Text("See it in 3D")
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 8)
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                    .accessibilityHidden(true)
-            }
-            .font(.subheadline)
-            .contentShape(Rectangle())
+            Label("See it in 3D", systemImage: "view.3d")
         }
-        .tint(.primary)
         .fullScreenCover(isPresented: $showing) {
             PeakIn3DView(model: model, peak: peak, scene: scene, isPhoto: isPhoto)
         }

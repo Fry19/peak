@@ -206,7 +206,7 @@ final class CameraScreenView: UIView, UIGestureRecognizerDelegate {
         guard let model, !model.aligning else { return }
         if let id = overlay.peak(at: gesture.location(in: overlay)) {
             UISelectionFeedbackGenerator().selectionChanged()
-            model.select(id)
+            model.select(id, fromLabel: true)
         } else if model.sheet == nil {
             model.selectedPeakID = nil
         }

@@ -1,8 +1,8 @@
 import PeakCore
 import SwiftUI
 
-/// The row on a peak's card that opens the map of where the summit can be seen from.
-struct ViewshedRow: View {
+/// The button on a peak's card that opens the map of where the summit can be seen from.
+struct ViewshedButton: View {
     let model: AppModel
     let peak: Peak
     /// The scene the card belongs to: the live view's or a photo's.
@@ -15,22 +15,8 @@ struct ViewshedRow: View {
         Button {
             showing = true
         } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "eye")
-                    .foregroundStyle(.amber)
-                    .accessibilityHidden(true)
-                Text("Where you can see it from")
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 8)
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                    .accessibilityHidden(true)
-            }
-            .font(.subheadline)
-            .contentShape(Rectangle())
+            Label("Where you can see it from", systemImage: "eye")
         }
-        .tint(.primary)
         .fullScreenCover(isPresented: $showing) {
             ViewshedView(peak: peak, terrain: scene?.terrain, you: scene?.position,
                          youLabel: isPhoto ? "Photo spot" : "You", units: model.settings.units)

@@ -170,9 +170,9 @@ private struct SheetContent: View {
 
     var body: some View {
         switch sheet {
-        case let .peak(id):
+        case let .peak(id, fromLabel):
             NavigationStack {
-                PeakDetailView(model: model, peakID: id)
+                PeakDetailView(model: model, peakID: id, fromLabel: fromLabel)
                     .navigationDestination(for: TrailLink.self) { TrailDetailView(model: model, link: $0) }
             }
             // Tapping another label swaps the card's content in place; the sheet stays up.

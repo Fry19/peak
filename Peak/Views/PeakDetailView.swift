@@ -7,8 +7,12 @@ struct PeakDetailView: View {
     let peakID: Int64
     /// The scene the peak is seen in when it's a photo's, not the live view's.
     var place: TerrainScene? = nil
+    /// Opened from a tap on the peak's label, so it's already marked in the view: no button
+    /// to find it there.
+    var fromLabel = false
     @State private var details: PeakDetails?
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         Group {
@@ -54,6 +58,11 @@ struct PeakDetailView: View {
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 4, trailing: 4))
 
+                actions(peak, view)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 4, trailing: 0))
+
                 if let url = facts?.pictureURL {
                     // A photo that doesn't load leaves no empty box behind.
                     AsyncImage(url: url) { phase in
@@ -79,28 +88,11 @@ struct PeakDetailView: View {
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
-
-                Button {
-                    if place == nil { model.selectedPeakID = peak.id }
-                    close()
-                } label: {
-                    Label(place != nil ? "Show in the photo" : view?.isVisible == false ? "Show where it is" : "Find in view",
-                          systemImage: "scope")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(Color.amber)
-                .foregroundStyle(.black)
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             }
             .sheetSection()
 
             Section {
                 PeakSunRow(model: model, peak: peak)
-                ViewshedRow(model: model, peak: peak, scene: scene, isPhoto: place != nil)
-                PeakIn3DRow(model: model, peak: peak, scene: scene, isPhoto: place != nil)
             }
             .sheetSection()
 
@@ -136,6 +128,32 @@ struct PeakDetailView: View {
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
         .background(.sheetBackground)
+    }
+
+    /// The ways to look at the peak, as tiles side by side (stacked when the text is large),
+    /// and finding it in the view unless that's where it was tapped.
+    private func actions(_ peak: Peak, _ view: TerrainScene.PeakView?) -> some View {
+        let tiles = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 8)) : AnyLayout(HStackLayout(spacing: 8))
+        return VStack(spacing: 8) {
+            tiles {
+                PeakIn3DButton(model: model, peak: peak, scene: scene, isPhoto: place != nil)
+                ViewshedButton(model: model, peak: peak, scene: scene, isPhoto: place != nil)
+            }
+            .labelStyle(TileLabelStyle())
+            .fixedSize(horizontal: false, vertical: true)
+
+            if !fromLabel {
+                Button {
+                    if place == nil { model.selectedPeakID = peak.id }
+                    close()
+                } label: {
+                    Label(place != nil ? "Show in the photo" : view?.isVisible == false ? "Show where it is" : "Find in view",
+                          systemImage: "scope")
+                        .font(.subheadline.weight(.semibold))
+                }
+            }
+        }
+        .buttonStyle(TileButtonStyle())
     }
 
     private func subtitle(_ view: TerrainScene.PeakView?) -> String {
@@ -257,6 +275,33 @@ struct DifficultyBadge: View {
         case .mountainHiking, .demandingMountainHiking: return Color(red: 0.95, green: 0.4, blue: 0.35)
         case .alpineHiking: return Color(red: 0.45, green: 0.65, blue: 1.0)
         case .demandingAlpineHiking, .difficultAlpineHiking: return Color(red: 0.2, green: 0.3, blue: 0.75)
+        }
+    }
+}
+
+/// Something to do on a card, in amber on a tile of the stats' slate.
+struct TileButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(Color.amber)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, minHeight: 44, maxHeight: .infinity)
+            .background(Color.sheetSurface, in: RoundedRectangle(cornerRadius: 12))
+            .contentShape(RoundedRectangle(cornerRadius: 12))
+            .opacity(configuration.isPressed ? 0.6 : 1)
+    }
+}
+
+/// An action's symbol over its name, for a tile.
+struct TileLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(spacing: 6) {
+            configuration.icon
+                .font(.title3)
+            configuration.title
+                .font(.subheadline.weight(.semibold))
+                .multilineTextAlignment(.center)
         }
     }
 }
