@@ -34,11 +34,19 @@ extension AppModel {
         /// Its peaks hidden behind nearer terrain from the ground. Peaks whose line of sight
         /// coarse terrain can't settle, from either eye, don't count.
         var revealed: Set<Int64>
+        /// Its peaks past the ground view's reach, as seen from the ground (`TerrainScene.sight`).
+        var far: [Int64: TerrainScene.PeakView]
         var height: Double
         /// How long it took to build, for diagnostics.
         var seconds: Double
         /// The live view (`sceneGeneration`) it's seen from, for its terrain in 3D.
         var generation: Int
+    }
+
+    /// The terrain and peaks past a live view's reach, for its views from above.
+    struct RiseBeyond {
+        var beyond: TerrainScene.Beyond
+        var seconds: Double
     }
 
     /// The terrain in 3D around a live view, shared by its views from above.
@@ -54,9 +62,14 @@ extension AppModel {
         var views: [RisenView?] = []
         /// The views of the live view before last, shown while new ones are built.
         var stale: [RisenView?] = []
+        /// The terrain and peaks past the live view's reach that `views` are built over.
+        var beyond: RiseBeyond?
         /// The terrain in 3D for `views`, and every generation still used by `stale`.
         var mesh: RiseMesh?
         var staleMeshes: [RiseMesh] = []
+        /// The peak past the ground view's reach whose card was opened from above, kept for the
+        /// card while the views from above come and go (`farPeak`).
+        var picked: (peak: Peak, ground: TerrainScene.PeakView?)?
         /// The live view (`sceneGeneration`) `views` are seen from.
         var generation = -1
         /// The height the next tap goes up to: the one chosen last.
@@ -77,9 +90,9 @@ extension AppModel {
         }
     }
 
-    /// Heights above your eye, meters: round numbers in the units you read. The terrain
-    /// reaches 80 km, so from the highest it fades into haze about 2.5° below level, where
-    /// mountains farther out would stand.
+    /// Heights above your eye, meters: round numbers in the units you read. The views reach
+    /// farther than the ground view (`TerrainScene.reach(lift:)`): 150 km, and 250 km from the
+    /// highest, where the skyline is otherwise often the edge of the terrain.
     static func riseHeights(_ units: AppSettings.Units) -> [Double] {
         units == .metric ? [100, 300, 1_000, 3_000] : [300, 1_000, 3_000, 10_000].map { $0 * 0.3048 }
     }
@@ -108,6 +121,24 @@ extension AppModel {
     /// The terrain in 3D under the view from above on screen, once it's built.
     var risenMesh: RiseMesh? {
         risenView.flatMap { riseWork.mesh(for: $0.generation) }
+    }
+
+    /// A peak that only the views from above show, past the ground view's reach, and how it's
+    /// seen from the ground: the one whose card was opened from up there, else from the views
+    /// built (the one on screen first).
+    func farPeak(_ id: Int64) -> (peak: Peak, ground: TerrainScene.PeakView?)? {
+        if let picked = riseWork.picked, picked.peak.id == id { return picked }
+        guard scene?.allPeaks[id] == nil else { return nil }
+        let order = [rise.level - 1] + Array(riseWork.views.indices)
+        for i in order where i >= 0 {
+            if let view = riseWork.view(i), let v = view.scene.allPeaks[id] { return (v.peak, view.far[id]) }
+        }
+        return nil
+    }
+
+    /// Keeps the peak picked from above for its card, if only the views from above have it.
+    func pickFarPeak(_ id: Int64) {
+        riseWork.picked = farPeak(id)
     }
 
     /// What the overlay draws: the view from above while risen, else the live view.
@@ -173,6 +204,7 @@ extension AppModel {
         riseWork.build = nil
         riseWork.views = []
         riseWork.stale = []
+        riseWork.beyond = nil
         riseWork.mesh = nil
         riseWork.staleMeshes = []
         riseWork.generation = -1
@@ -243,6 +275,7 @@ extension AppModel {
             let generations = Set(riseWork.stale.compactMap { $0?.generation })
             riseWork.staleMeshes = ([riseWork.mesh].compactMap { $0 } + riseWork.staleMeshes)
                 .filter { generations.contains($0.generation) }
+            riseWork.beyond = nil
             riseWork.mesh = nil
             riseWork.views = Array(repeating: nil, count: heights.count)
             riseWork.heights = heights
@@ -250,11 +283,23 @@ extension AppModel {
         }
         guard riseWork.build == nil, riseWork.views.contains(where: { $0 == nil }) || riseWork.mesh == nil else { return }
         let generation = sceneGeneration
+        let base = baseLayer, prominence = self.prominence
+        let reach = heights.map(TerrainScene.reach(lift:)).max() ?? TerrainScene.radius
         riseWork.build = Task { @MainActor [weak self] in
-            // The terrain in 3D first: it's quick, and every height uses it.
+            // The terrain and peaks past the live view's reach, then the terrain in 3D over
+            // them: both quick, and every height uses them.
+            if let self, self.riseWork.beyond == nil {
+                let started = Date()
+                let beyond = await Task.detached(priority: .userInitiated) {
+                    scene.beyond(reach, base: base, prominence: prominence)
+                }.value
+                guard !Task.isCancelled, self.riseWork.generation == generation else { return }
+                self.riseWork.beyond = RiseBeyond(beyond: beyond, seconds: Date().timeIntervalSince(started))
+            }
+            guard let beyond = self?.riseWork.beyond?.beyond else { return }
             if let self, self.riseWork.mesh == nil {
                 let started = Date()
-                let mesh = await Task.detached(priority: .userInitiated) { scene.panorama() }.value
+                let mesh = await Task.detached(priority: .userInitiated) { scene.panorama(over: beyond) }.value
                 guard !Task.isCancelled, self.riseWork.generation == generation else { return }
                 self.riseWork.mesh = RiseMesh(mesh: mesh, generation: generation, seconds: Date().timeIntervalSince(started))
                 self.screen?.overlay.setNeedsUpdate()
@@ -265,12 +310,15 @@ extension AppModel {
                 let height = heights[i]
                 let started = Date()
                 let view = await Task.detached(priority: .userInitiated) {
-                    let up = scene.risen(by: height)
+                    let up = scene.risen(by: height, beyond: beyond)
+                    // The peaks it shows past the ground view's reach, as seen from the ground.
+                    let far = scene.sight(ofFar: up.peaks.map(\.peak).filter { scene.allPeaks[$0.id] == nil }, over: beyond,
+                                          reach: up.reach)
                     let revealed = Set(up.peaks.map(\.id).filter { id in
-                        guard !up.uncertain.contains(id), let below = scene.allPeaks[id] else { return false }
+                        guard !up.uncertain.contains(id), let below = scene.allPeaks[id] ?? far[id] else { return false }
                         return !below.isVisible && !below.isUncertain
                     })
-                    return RisenView(scene: up, revealed: revealed, height: height, seconds: 0, generation: generation)
+                    return RisenView(scene: up, revealed: revealed, far: far, height: height, seconds: 0, generation: generation)
                 }.value
                 guard !Task.isCancelled, self.riseWork.generation == generation else { return }
                 var built = view
@@ -293,15 +341,19 @@ extension AppModel {
         }
     }
 
-    /// For diagnostics: how long each view from above took.
+    /// For diagnostics: how long each view from above took, and how far it reaches.
     var riseDiagnostics: String? {
         let built = riseWork.views.compactMap { $0 }
         guard !built.isEmpty || riseWork.mesh != nil else { return nil }
+        let beyond = riseWork.beyond.map {
+            String(format: "beyond %.2f s, %ld peaks; ", $0.seconds, $0.beyond.peaks.count)
+        } ?? ""
         let mesh = riseWork.mesh.map {
             String(format: "3D %.2f s, %ld k triangles; ", $0.seconds, $0.mesh.indices.count / 3_000)
         } ?? ""
-        return "from above: " + mesh + built.map {
-            String(format: "%@ %.2f s, %ld more", Format.elevation($0.height, settings.units), $0.seconds, $0.revealed.count)
+        return "from above: " + beyond + mesh + built.map {
+            String(format: "%@ %.2f s, %.0f km, %ld more", Format.elevation($0.height, settings.units), $0.seconds,
+                   $0.scene.reach / 1_000, $0.revealed.count)
         }.joined(separator: "; ")
     }
 }

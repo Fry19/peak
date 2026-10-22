@@ -43,7 +43,8 @@ struct PeakDetailView: View {
 
     private func content(_ peak: Peak) -> some View {
         let units = model.settings.units
-        let view = scene?.allPeaks[peak.id]
+        // Past the ground view's reach (picked from above), as seen from the ground.
+        let view = scene?.allPeaks[peak.id] ?? (place == nil ? model.farPeak(peak.id)?.ground : nil)
         let facts = details?.facts
         return List {
             Section {

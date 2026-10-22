@@ -27,6 +27,8 @@ struct TerrainCamera {
     var lens: SIMD4<Float>
     /// How far above the mesh's center the eye is, meters.
     var lift: Float
+    /// How far the view reaches, meters: the terrain fades into the sky before then.
+    var reach: Float
     var opacity: Float
     /// The night sky high up, and the paler sky along the horizon, which haze takes: level
     /// and below, turning to `sky` by `skyHeight` up (the sine of that elevation).
@@ -219,7 +221,7 @@ final class LineRenderer {
         guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return nil }
         var uniforms = TerrainUniforms(
             right: SIMD4(camera.right, 0), down: SIMD4(camera.down, 0), forward: SIMD4(camera.forward, 0),
-            eye: SIMD4(0, 0, camera.lift, terrainReach), lens: camera.lens,
+            eye: SIMD4(0, 0, camera.lift, min(camera.reach, terrainReach)), lens: camera.lens,
             view: SIMD4(Float(size.width), Float(size.height), 1, 0), haze: SIMD4(camera.haze, camera.hazeHeight, 0, 0),
             sky: SIMD4(camera.sky, camera.opacity), horizon: SIMD4(camera.horizon, camera.skyHeight),
             dark: SIMD4(camera.dark, 1), light: SIMD4(camera.light, 1))

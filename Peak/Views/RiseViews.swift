@@ -97,7 +97,7 @@ struct RiseChip: View {
         switch rise.revealed {
         case 0: return up
         case 1: return up + " · 1 more peak around you"
-        default: return up + " · \(rise.revealed) more peaks around you"
+        default: return up + " · \(rise.revealed.formatted()) more peaks around you"
         }
     }
 

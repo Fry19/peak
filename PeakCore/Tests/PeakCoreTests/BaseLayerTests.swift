@@ -150,6 +150,132 @@ final class BaseLayerTests: XCTestCase {
                        .ready(note: nil))
     }
 
+    /// Peaks far past the tiles, on coarse terrain behind a wall about 84 km away, as the
+    /// views from above see them: from 10,000 ft up, one clearing the wall by 0.5° is in sight,
+    /// one by 0.03° can't be told, one 0.5° under it is hidden; from the ground all three are
+    /// hidden by a wide margin. Only peaks within the reach (`maxDistance`) are looked at, and
+    /// a peak on the fine tile near you is never uncertain. A rendered horizon sparing peaks
+    /// deep behind the wall their own lines of sight changes none of that.
+    func testFarPeaksOverCoarseTerrainAreCertainOnlyWithAMargin() {
+        let wall = 8.3
+        func cell(_ south: Int, _ west: Int) -> ElevationTile {
+            let coarse = (south, west) != (46, 7)
+            let tile = ElevationTile(south: south, west: west, size: coarse ? 120 : 600) { _, lon in
+                coarse ? (abs(lon - wall) < 0.04 ? 3_200 : 300) : 500
+            }
+            tile.isCoarse = coarse
+            return tile
+        }
+        let terrain = Terrain(tiles: [(46, 7), (45, 7), (45, 8), (46, 8), (45, 9), (46, 9)].map { cell($0.0, $0.1) },
+                              missingIsSea: false)
+        let renderer = HorizonRenderer(terrain: terrain)
+        let ground = renderer.observer(latitude: 46.5, longitude: 7.2)
+        var above = ground
+        above.height += 3_048
+        var settings = HorizonSettings()
+        settings.maxDistance = 250_000
+        settings.nearAllowance = 10
+
+        // Peaks 150 km east, their heights set by how far they clear the wall from above.
+        let distance = 150_000.0
+        let at = destination(from: ground, azimuth: 90, distance: distance)
+        let blocking = renderer.maxElevation(from: above, azimuth: 90, upTo: distance - 250, settings: settings)
+        let frame = LocalFrame(origin: above)
+        func peak(_ id: Int64, clearing margin: Double) -> Peak {
+            var low = 0.0, high = 10_000.0
+            for _ in 0..<60 {
+                let mid = (low + high) / 2
+                let look = frame.look(at: GeoPoint(latitude: at.latitude, longitude: at.longitude, height: mid), refraction: 0.13)
+                if look.elevation < blocking + margin { low = mid } else { high = mid }
+            }
+            return Peak(id: id, name: "\(id)", latitude: at.latitude, longitude: at.longitude, elevation: low)
+        }
+        let near = destination(from: ground, azimuth: 90, distance: 15_000)
+        let peaks = [peak(1, clearing: 0.5), peak(2, clearing: 0.03), peak(3, clearing: -0.5), peak(5, clearing: -3),
+                     Peak(id: 4, name: "Near", latitude: near.latitude, longitude: near.longitude, elevation: 900)]
+
+        func seen(from eye: GeoPoint, _ settings: HorizonSettings) -> [Int64: (visible: Bool, unsure: Bool)] {
+            var out: [Int64: (visible: Bool, unsure: Bool)] = [:]
+            for (p, v, unsure) in renderer.sightings(peaks, from: eye, settings: settings) {
+                out[p.id] = (v.isVisible, unsure)
+            }
+            // The same with the horizon from there sparing the peaks deep behind the wall.
+            let rendered = renderer.render(from: eye, settings: settings)
+            let spared = renderer.sightings(peaks, from: eye, settings: settings, rendered: rendered)
+            XCTAssertEqual(spared.count, out.count)
+            for (p, v, unsure) in spared {
+                XCTAssertEqual(v.isVisible, out[p.id]?.visible, "peak \(p.id)")
+                XCTAssertEqual(unsure, out[p.id]?.unsure, "peak \(p.id)")
+            }
+            return out
+        }
+        let up = seen(from: above, settings)
+        XCTAssertEqual(up[1]?.visible, true)
+        XCTAssertEqual(up[1]?.unsure, false)
+        XCTAssertEqual(up[2]?.unsure, true)
+        XCTAssertEqual(up[3]?.visible, false)
+        XCTAssertEqual(up[3]?.unsure, false)
+        XCTAssertEqual(up[5]?.visible, false)
+        XCTAssertEqual(up[5]?.unsure, false)
+        XCTAssertEqual(up[4]?.unsure, false)
+        let below = seen(from: ground, settings)
+        for id: Int64 in [1, 2, 3, 5] {
+            XCTAssertEqual(below[id]?.visible, false, "peak \(id) from the ground")
+            XCTAssertEqual(below[id]?.unsure, false, "peak \(id) from the ground")
+        }
+        XCTAssertEqual(below[4]?.visible, true)
+        XCTAssertEqual(below[4]?.unsure, false)
+        // The ground view's reach: the far peaks aren't looked at.
+        settings.maxDistance = 80_000
+        XCTAssertEqual(Set(seen(from: above, settings).keys), [4])
+    }
+
+    /// The neighbouring 0.1° rays see a wall, but the peak's own bearing passes through a
+    /// narrow opening. A rendered horizon may suggest an obstruction, never prove it.
+    func testHiddenShortcutDoesNotCloseAGapBetweenHorizonRays() {
+        let eye = GeoPoint(latitude: 46.5, longitude: 7.2, height: 2)
+        let frame = LocalFrame(origin: eye)
+        let azimuth = 90.05
+        let wall = destination(from: eye, azimuth: azimuth, distance: 20_000)
+        let step = 2.0 / 111_320
+        let rows = 401, cols = 601
+        let north = wall.latitude + 400.0 / 111_320
+        let west = wall.longitude - 600.0 / 111_320
+        var heights = [Int16](repeating: 0, count: rows * cols)
+        for r in 0..<rows {
+            for c in 0..<cols {
+                let lat = north - Double(r) * step, lon = west + Double(c) * step
+                let look = frame.look(at: GeoPoint(latitude: lat, longitude: lon))
+                if abs(lon - wall.longitude) * 111_320 < 100,
+                   abs(azimuthDifference(look.azimuth, azimuth)) > 0.025 {
+                    heights[r * cols + c] = 1_000
+                }
+            }
+        }
+        let patch = ElevationTile(south: 46, west: 7, rows: rows, cols: cols,
+                                  originLatitude: north, originLongitude: west,
+                                  stepLatitude: step, stepLongitude: step, heights: heights)
+        let terrain = Terrain(tiles: (45...47).flatMap { south in (6...10).map { west in
+            let tile = ElevationTile(south: south, west: west, size: 2) { _, _ in 0 }
+            tile.isCoarse = west >= 8
+            return tile
+        } }, detail: [patch])
+        let renderer = HorizonRenderer(terrain: terrain)
+        var settings = HorizonSettings()
+        settings.maxDistance = 150_000
+        let at = destination(from: eye, azimuth: azimuth, distance: 120_000)
+        let peak = Peak(id: 1, name: "Through the gap", latitude: at.latitude, longitude: at.longitude, elevation: 2_000)
+        let exact = renderer.sightings([peak], from: eye, settings: settings)
+        let rendered = renderer.render(from: eye, settings: settings)
+        let look = frame.look(at: peak.point, refraction: settings.refraction)
+        XCTAssertGreaterThan(rendered.blocking(azimuth: look.azimuth, nearerThan: 119_750).elevation - look.elevation, 0.5)
+        let shortcut = renderer.sightings([peak], from: eye, settings: settings, rendered: rendered)
+        XCTAssertEqual(exact.first?.visibility.isVisible, true)
+        XCTAssertEqual(exact.first?.isUncertain, false)
+        XCTAssertEqual(shortcut.first?.visibility.isVisible, exact.first?.visibility.isVisible)
+        XCTAssertEqual(shortcut.first?.isUncertain, exact.first?.isUncertain)
+    }
+
     func testNearOrMarginalSightlinesOverCoarseTerrainAreUncertain() {
         XCTAssertTrue(CoarseSight.isUncertain(distance: 8_000, clearance: 3))
         XCTAssertTrue(CoarseSight.isUncertain(distance: 40_000, clearance: 0.2))

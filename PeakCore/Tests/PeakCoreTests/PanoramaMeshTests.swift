@@ -11,14 +11,18 @@ final class PanoramaMeshTests: XCTestCase {
     }
 
     /// Over flat ground, each vertex lies where `LocalFrame.look` (exact ellipsoid geometry
-    /// plus refraction) sees that point on the ground, near and far, from the eye and from
-    /// a kilometer and 10,000 ft (the highest view from above) over it.
+    /// plus refraction) sees that point on the ground, near and far (out to 250 km, the
+    /// farthest a view from above reaches), from the eye and from a kilometer and 10,000 ft
+    /// (the highest view from above) over it.
     func testVerticesSitWhereTheGroundIsSeen() {
-        let flat = TestTerrain.cones([], base: 0)
+        // Sea-level tiles 3° around the eye, past the mesh's reach in every direction.
+        let flat = Terrain(tiles: (43..<49).flatMap { south in (3..<13).map { west in
+            ElevationTile(south: south, west: west, size: 2) { _, _ in 0 }
+        } }, missingIsSea: false)
         let eye = GeoPoint(latitude: 46, longitude: 8, height: 300)
         var settings = PanoramaMeshSettings()
         settings.azimuthStep = 30
-        settings.maxDistance = 60_000
+        settings.maxDistance = 250_000
         let mesh = PanoramaMesh.build(terrain: flat, from: eye, settings: settings)
         XCTAssertEqual(mesh.rays, 12)
         XCTAssertEqual(mesh.vertices.count, mesh.rays * mesh.rings.count + 1)
@@ -30,6 +34,7 @@ final class PanoramaMeshTests: XCTestCase {
                 for ring in [0, 40, mesh.rings.count / 2, mesh.rings.count - 1] {
                     let v = mesh.vertex(ray: ray, ring: ring)
                     let at = destination(from: eye, azimuth: Double(ray) * 30, distance: mesh.rings[ring])
+                    XCTAssertTrue(flat.height(latitude: at.latitude, longitude: at.longitude).isFinite)
                     let look = frame.look(at: GeoPoint(latitude: at.latitude, longitude: at.longitude, height: 0), refraction: 0.13)
                     XCTAssertEqual(azimuthDifference(azimuth(v), look.azimuth), 0, accuracy: 0.01, "ray \(ray) ring \(ring)")
                     XCTAssertEqual(elevation(v, lift: lift), look.elevation, accuracy: 0.01, "ray \(ray) ring \(ring) lift \(lift)")

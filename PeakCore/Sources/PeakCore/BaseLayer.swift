@@ -256,6 +256,11 @@ public enum CoarseSight {
     public static let nearDistance = 20_000.0
     /// Height error allowed for the ridges in front of a farther peak, meters.
     public static let heightError = 150.0
+    /// A peak this far or farther, confirmed this many degrees under terrain on its own
+    /// bearing, is certainly hidden (`HorizonRenderer.sightings`). There the uncertainty
+    /// above is at most half of that. Neighbouring horizon rays only suggest where to check.
+    public static let hiddenMargin = 0.5
+    public static var hiddenDistance: Double { 2 * heightError / tan(hiddenMargin / 2 * .pi / 180) }
 
     /// Whether a peak `distance` meters away that clears the terrain in front by `clearance`
     /// degrees (negative: hidden) may as well be hidden as in sight, or the other way round.
@@ -292,5 +297,74 @@ extension HorizonRenderer {
             }
         }
         return zip(near, results).map { ($0, $1!) }
+    }
+
+    /// Line of sight to every peak between 200 m and `settings.maxDistance` away, as
+    /// `sightlines`, and whether it is uncertain: it crosses the base layer's coarse terrain,
+    /// near or marginally (`CoarseSight`), so the peak may as well be in sight as hidden.
+    ///
+    /// `rendered`, a horizon seen from the same eye with the same settings (out to any reach)
+    /// and its depth map, spares far peaks deep behind nearer terrain a full march: one
+    /// at least `CoarseSight.hiddenDistance` away that lies `CoarseSight.hiddenMargin` or more
+    /// under what that horizon's rays either side of it see nearer than it is checked on
+    /// its own bearing as far as that terrain. Only a confirmed obstruction skips the rest
+    /// of the march: there can be an opening between the rendered rays.
+    public func sightings(_ peaks: [Peak], from observer: GeoPoint, settings: HorizonSettings,
+                          rendered: HorizonProfile? = nil) -> [(peak: Peak, visibility: Visibility, isUncertain: Bool)] {
+        let here = LatLon(observer.latitude, observer.longitude)
+        guard let rendered, !rendered.envelope.isEmpty else {
+            return sightlines(peaks, from: observer, maxDistance: settings.maxDistance, settings: settings).map { p, v in
+                (p, v, terrain.isCoarse(between: here, and: p.position) &&
+                    CoarseSight.isUncertain(distance: v.distance, clearance: v.clearance))
+            }
+        }
+        let frame = LocalFrame(origin: observer)
+        let near = peaks.filter {
+            let d = groundDistance(from: observer, to: $0.point)
+            return d > 200 && d < settings.maxDistance
+        }
+        typealias Sighting = (peak: Peak, visibility: Visibility, isUncertain: Bool)
+        var results = [Sighting?](repeating: nil, count: near.count)
+        results.withUnsafeMutableBufferPointer { out in
+            DispatchQueue.concurrentPerform(iterations: near.count) { i in
+                let p = near[i], d = groundDistance(from: observer, to: p.point)
+                if d >= CoarseSight.hiddenDistance {
+                    let look = frame.look(at: p.point, refraction: settings.refraction)
+                    let candidate = rendered.blocking(azimuth: look.azimuth, nearerThan: d - 250)
+                    if look.elevation <= candidate.elevation - CoarseSight.hiddenMargin {
+                        // Include the candidate's last sample despite Float distance rounding.
+                        let end = min(d - 250, candidate.distance + max(settings.nearStep, settings.relativeStep * candidate.distance))
+                        var check = settings
+                        check.maxDistance = end
+                        let blocking = maxElevation(from: observer, azimuth: look.azimuth, upTo: end, settings: check)
+                        if look.elevation <= blocking - CoarseSight.hiddenMargin {
+                            out[i] = (p, Visibility(azimuth: look.azimuth, elevation: look.elevation, distance: d,
+                                                   clearance: look.elevation - blocking, isVisible: false), false)
+                            return
+                        }
+                    }
+                }
+                let v = visibility(of: p.point, from: observer, settings: settings)
+                out[i] = (p, v, terrain.isCoarse(between: here, and: p.position) &&
+                    CoarseSight.isUncertain(distance: v.distance, clearance: v.clearance))
+            }
+        }
+        return results.map { $0! }
+    }
+}
+
+extension HorizonProfile {
+    /// The highest the terrain nearer than `distance` stands on the rays either side of
+    /// `azimuth`, the lower of the two, in degrees (−90 where nothing is seen that near),
+    /// and how far a confirming march must reach to include both candidates. Needs the depth map.
+    func blocking(azimuth: Double, nearerThan distance: Double) -> (elevation: Double, distance: Double) {
+        let x = normalizedAzimuth(azimuth) / settings.azimuthStep
+        let i = Int(x) % count, j = (i + 1) % count
+        func top(_ ray: Int) -> EnvelopePoint {
+            // The envelope rises with distance: its last point nearer than that is the highest.
+            envelope(ofRay: ray).last { Double($0.distance) < distance } ?? EnvelopePoint(elevation: -90, distance: 0, startsSegment: false)
+        }
+        let a = top(i), b = top(j)
+        return (Double(min(a.elevation, b.elevation)), Double(max(a.distance, b.distance)))
     }
 }

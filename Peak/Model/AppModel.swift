@@ -332,7 +332,7 @@ final class AppModel {
     @ObservationIgnored private var sceneRevision = 0
     @ObservationIgnored private var peaks: [Peak] = []
     /// Wikidata's prominence by item, meters, for ranking the peaks OpenStreetMap gives none.
-    @ObservationIgnored private var prominence: [String: Double] = [:]
+    @ObservationIgnored private(set) var prominence: [String: Double] = [:]
     @ObservationIgnored private var rebuilding = false
     @ObservationIgnored private var rebuildAgain = false
     @ObservationIgnored private(set) var lastBuildSeconds = 0.0
@@ -962,7 +962,7 @@ final class AppModel {
     // MARK: Peaks and trails
 
     func peak(_ id: Int64) -> Peak? {
-        scene?.allPeaks[id]?.peak ?? peaks.first { $0.id == id }
+        scene?.allPeaks[id]?.peak ?? peaks.first { $0.id == id } ?? farPeak(id)?.peak
     }
 
     /// No peaks to show yet because they're still on their way, not because there are none.
@@ -974,6 +974,8 @@ final class AppModel {
     /// view was tapped, so the card needn't offer to find it there.
     func select(_ id: Int64, fromLabel: Bool = false) {
         selectedPeakID = id
+        // A peak seen only from above, past the ground view's reach, is kept for its card.
+        pickFarPeak(id)
         sheet = .peak(id, fromLabel: fromLabel)
     }
 

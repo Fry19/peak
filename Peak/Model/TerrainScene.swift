@@ -109,41 +109,119 @@ struct TerrainScene: @unchecked Sendable {
                     surface: surface)
     }
 
+    /// How far this view sees, meters: `radius` on the ground; from above, farther.
+    var reach: Double { horizon.settings.maxDistance }
+
+    /// How far the view from `lift` meters above the eye reaches, meters (on the base layer
+    /// past the tiles, `Beyond`). Seen from high up, a skyline at the edge of the terrain is
+    /// that edge, not the real one: from 3 km up an edge 80 km away lies about 2.5° below
+    /// level and up to 1–2° under the mountains beyond it. A rule of thumb rather than a bound:
+    /// 1.2 times as far as the horizon over ground at your own level is from that height (121 km
+    /// from 1 km up, 210 km from 3 km), at least 150 km and at most 250 km. Against views out
+    /// to 450 km over the Smokies and from Zermatt, 150 km leaves the skyline at the edge on
+    /// at most 3% of bearings from 1 km up, and 250 km on 0.5–9% from 3 km, there within 0.15°.
+    static func reach(lift: Double) -> Double {
+        let flat = (2 * WGS84.a / (1 - HorizonSettings().refraction) * max(0, lift)).squareRoot()
+        return min(250_000, max(150_000, 1.2 * flat))
+    }
+
+    /// What the views from above see past the ground view's reach: the view's terrain
+    /// (`viewTerrain`), with the base layer's coarse tiles past the ones loaded, and every
+    /// peak, out to `reach`.
+    struct Beyond: Sendable {
+        let terrain: Terrain
+        /// This view's own peaks, then the base layer's past `radius` (which this view has none of).
+        let peaks: [Peak]
+        let reach: Double
+    }
+
+    /// The terrain and peaks out to `reach` for the views from above (`risen(by:beyond:)`):
+    /// this view's own, and past them the base layer's, its peaks' prominence filled from
+    /// Wikidata's (`prominence`) as the live view's are. Without a base layer, only this view's,
+    /// out to `radius`.
+    func beyond(_ reach: Double, base: BaseLayer?, prominence: [String: Double]) -> Beyond {
+        let own = allPeaks.values.map(\.peak)
+        guard let base, reach > Self.radius else { return Beyond(terrain: viewTerrain, peaks: own, reach: Self.radius) }
+        let wide = Terrain(tiles: viewTerrain.tiles, detail: viewTerrain.detail, ground: viewTerrain.groundPatches, base: base,
+                           latitude: observer.latitude, longitude: observer.longitude, radius: reach + 10_000)
+        // Within `radius` the peaks are this view's (`allPeaks`, as far as it reaches), so that from
+        // above no peak shows up nearer than that which the ground view doesn't have.
+        let frame = LocalFrame(origin: observer)
+        let refraction = horizon.settings.refraction
+        let far = base.peaks(latitude: observer.latitude, longitude: observer.longitude, radius: reach + 1_000).filter {
+            allPeaks[$0.id] == nil && frame.look(at: $0.point, refraction: refraction).distance >= Self.radius
+        }
+        Self.terrainWrites.lock()
+        let filled = wide.fillElevations(far)
+        Self.terrainWrites.unlock()
+        return Beyond(terrain: wide, peaks: own + Wikidata.fillProminence(filled, from: prominence), reach: reach)
+    }
+
     /// The view from `lift` meters above this one's eye, for seeing over the ridges in front
-    /// (`AppModel+Rise`): the same terrain, peaks and horizon settings. It is only drawn, so
-    /// its horizon keeps no depth map, and nothing is matched or draped against it.
-    func risen(by lift: Double) -> TerrainScene {
+    /// (`AppModel+Rise`): the same horizon settings, out to `reach(lift:)` over `beyond`'s terrain
+    /// and peaks. It is only drawn, so its horizon keeps no depth map, and nothing is matched or
+    /// draped against it.
+    func risen(by lift: Double, beyond: Beyond) -> TerrainScene {
         var eye = observer
         eye.height += lift
+        var settings = horizon.settings
+        settings.maxDistance = min(beyond.reach, Self.reach(lift: lift))
         Self.terrainWrites.lock()
         defer { Self.terrainWrites.unlock() }
-        let view = Self.view(from: eye, terrain: terrain, viewTerrain: viewTerrain, peaks: allPeaks.values.map(\.peak),
-                             settings: horizon.settings, isCoarse: isCoarse)
+        let view = Self.view(from: eye, terrain: terrain, viewTerrain: beyond.terrain, peaks: beyond.peaks, settings: settings,
+                             isCoarse: isCoarse, spareHidden: true)
         let slim = view.horizon.withoutDepth()
-        return TerrainScene(observer: eye, terrain: terrain, viewTerrain: viewTerrain, standsOnGround: standsOnGround, horizon: slim,
+        return TerrainScene(observer: eye, terrain: terrain, viewTerrain: beyond.terrain, standsOnGround: standsOnGround, horizon: slim,
                             surfaceHorizon: slim, matchingHorizon: slim, segments: view.segments, peaks: view.peaks, scores: view.scores,
                             allPeaks: view.allPeaks, uncertain: view.uncertain, prominent: view.prominent, isCoarse: isCoarse)
     }
 
-    /// The terrain around this view's eye as triangles, out to its horizon's reach, for
-    /// drawing the views from above in 3D: one mesh for every height, since only the eye moves.
-    func panorama() -> PanoramaMesh {
+    /// `peaks` past this view's reach (shown from above) as seen from here, out to `reach` over
+    /// `beyond`'s terrain: in sight, hidden, or uncertain over coarse terrain, as `allPeaks` has
+    /// the nearer ones.
+    func sight(ofFar peaks: [Peak], over beyond: Beyond, reach: Double) -> [Int64: PeakView] {
+        guard !peaks.isEmpty else { return [:] }
+        var settings = horizon.settings
+        settings.maxDistance = reach
+        let frame = LocalFrame(origin: observer)
+        Self.terrainWrites.lock()
+        // Seen from the ground most lie deep behind the ridges this view sees (out to `radius`).
+        let found = HorizonRenderer(terrain: beyond.terrain).sightings(peaks, from: observer, settings: settings,
+                                                                       rendered: horizon)
+        Self.terrainWrites.unlock()
+        var seen: [Int64: PeakView] = [:]
+        for (p, v, unsure) in found {
+            let look = frame.look(at: p.point, refraction: settings.refraction)
+            seen[p.id] = PeakView(peak: p, azimuth: look.azimuth, elevation: look.elevation, distance: look.distance,
+                                  isVisible: v.isVisible && !unsure, isUncertain: unsure)
+        }
+        return seen
+    }
+
+    /// The terrain around this view's eye as triangles, out to `beyond`'s reach, for drawing the
+    /// views from above in 3D: one mesh for every height, since only the eye moves (each fades
+    /// it out at its own reach).
+    func panorama(over beyond: Beyond) -> PanoramaMesh {
         var settings = PanoramaMeshSettings()
-        settings.maxDistance = horizon.settings.maxDistance
+        settings.maxDistance = beyond.reach
         settings.refraction = horizon.settings.refraction
         Self.terrainWrites.lock()
         defer { Self.terrainWrites.unlock() }
-        return PanoramaMesh.build(terrain: viewTerrain, from: observer, settings: settings)
+        return PanoramaMesh.build(terrain: beyond.terrain, from: observer, settings: settings)
     }
 
     /// Held while summits are raised in the shared tiles (`build`) and while a view from above
-    /// reads them (`risen`, `panorama`): the live view's rebuild may raise new ones as tiles arrive.
+    /// reads them (`beyond`, `risen`, `sight`, `panorama`): the live view's rebuild may raise
+    /// new ones as tiles arrive.
     private static let terrainWrites = NSLock()
 
     /// The view from `observer` over `viewTerrain`; `surface` is the view on the surface model
-    /// alone (`surfaceHorizon`) when that isn't this one.
+    /// alone (`surfaceHorizon`) when that isn't this one. `spareHidden`: far peaks deep behind
+    /// the ridges in front stop their line of sight at a confirmed obstruction
+    /// (`HorizonRenderer.sightings`), for views from above with thousands of peaks.
     private static func view(from observer: GeoPoint, terrain: Terrain, viewTerrain: Terrain, peaks: [Peak],
-                             settings: HorizonSettings, isCoarse: Bool, surface: HorizonProfile? = nil) -> TerrainScene {
+                             settings: HorizonSettings, isCoarse: Bool, surface: HorizonProfile? = nil,
+                             spareHidden: Bool = false) -> TerrainScene {
         let renderer = HorizonRenderer(terrain: viewTerrain)
         let horizon = renderer.render(from: observer, settings: settings)
         var buckets = [[RidgeSegment]](repeating: [], count: 360)
@@ -152,20 +230,19 @@ struct TerrainScene: @unchecked Sendable {
         }
         // Over coarse terrain, near peaks and those just clearing (or just hidden by) the
         // ridges in front can't be told apart: they get dots, as if in sight, but no label.
+        // Peaks are seen out to the horizon's reach: `radius` on the ground.
         var found: [VisiblePeak] = []
         var uncertain = Set<Int64>()
         if viewTerrain.hasCoarse {
-            let here = LatLon(observer.latitude, observer.longitude)
-            for (p, v) in renderer.sightlines(peaks, from: observer, maxDistance: radius, settings: settings) {
-                let unsure = viewTerrain.isCoarse(between: here, and: p.position) &&
-                    CoarseSight.isUncertain(distance: v.distance, clearance: v.clearance)
+            for (p, v, unsure) in renderer.sightings(peaks, from: observer, settings: settings,
+                                                     rendered: spareHidden ? horizon : nil) {
                 if unsure { uncertain.insert(p.id) }
                 if v.isVisible || unsure {
                     found.append(VisiblePeak(peak: p, azimuth: v.azimuth, elevation: v.elevation, distance: v.distance))
                 }
             }
         } else {
-            found = renderer.visiblePeaks(peaks, from: observer, maxDistance: radius, settings: settings)
+            found = renderer.visiblePeaks(peaks, from: observer, maxDistance: settings.maxDistance, settings: settings)
         }
         var scores: [Int64: Double] = [:]
         for v in found {
@@ -177,7 +254,7 @@ struct TerrainScene: @unchecked Sendable {
         var all: [Int64: PeakView] = [:]
         for p in peaks {
             let look = frame.look(at: p.point, refraction: settings.refraction)
-            if look.distance < radius {
+            if look.distance < settings.maxDistance {
                 all[p.id] = PeakView(peak: p, azimuth: look.azimuth, elevation: look.elevation, distance: look.distance,
                                      isVisible: false, isUncertain: uncertain.contains(p.id))
             }
