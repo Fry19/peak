@@ -131,6 +131,84 @@ final class GeoTIFFTests: XCTestCase {
     func testRejectsNonTIFF() {
         XCTAssertThrowsError(try GeoTIFF.elevationTile(Data("hello".utf8)))
     }
+
+    /// A USGS 3DEP-like tile: LZW with the floating-point predictor, reaching past its 1°
+    /// cell on every side. It belongs to the cell its middle is in, not its first pixel's.
+    func testLZWTileReachingPastItsCell() throws {
+        let bytes = [UInt8](Fixtures.lzwTIFF)
+        let layout = try GeoTIFF.layout(bytes)
+        XCTAssertEqual(layout.south, 35)
+        XCTAssertEqual(layout.west, -84)
+        let tile = try GeoTIFF.decode(layout, level: 0, bytes: bytes, base: 0)
+        XCTAssertEqual(tile.south, 35)
+        XCTAssertEqual(tile.west, -84)
+        let step = 1.0 / 36
+        XCTAssertEqual(tile.stepLatitude, step, accuracy: 1e-12)
+        // The tie point is the first pixel's corner, two pixels past the cell.
+        XCTAssertEqual(tile.originLatitude, 36 + 1.5 * step, accuracy: 1e-12)
+        XCTAssertEqual(tile.originLongitude, -84 - 1.5 * step, accuracy: 1e-12)
+        let h = tile.heightValues
+        for r in 0..<40 {
+            for c in 0..<40 {
+                let expected = r == 5 && c == 7 ? ElevationTile.noData : Int16((1000 + 3 * Double(r) - 2 * Double(c) + 0.25).rounded(.toNearestOrEven))
+                XCTAssertEqual(h[r * 40 + c], expected, "row \(r) col \(c)")
+            }
+        }
+        // The overview, from its own bytes.
+        let range = layout.images[1].byteRange
+        let overview = try GeoTIFF.decode(layout, level: 1, bytes: Array(bytes[range]), base: range.lowerBound)
+        XCTAssertEqual(overview.rows, 20)
+        XCTAssertEqual(overview.south, 35)
+        XCTAssertEqual(overview.heightValues[3 * 20 + 4], Int16(1000 + 6 * 3 - 4 * 4))
+        // Blocks are found for an area of the cell, and one block decodes on its own.
+        let blocks = layout.blocks(level: 0, south: 35.0, north: 35.12, west: -83.12, east: -83.0)
+        XCTAssertEqual(blocks, [8])
+        let one = try GeoTIFF.decode(layout, level: 0, blocks: blocks) { bytes[layout.images[0].byteRange(ofBlock: $0)] }
+        XCTAssertEqual(one.heightValues[0], h[32 * 40 + 32])
+    }
+
+    func testLZWStripsWithoutPredictor() throws {
+        let tile = try GeoTIFF.elevationTile(Fixtures.lzwStripTIFF)
+        XCTAssertEqual(tile.rows, 10)
+        XCTAssertEqual(tile.cols, 12)
+        let h = tile.heightValues
+        for r in 0..<10 {
+            for c in 0..<12 { XCTAssertEqual(h[r * 12 + c], Int16(2500 + 10 * r + c)) }
+        }
+    }
+}
+
+final class LZWTests: XCTestCase {
+    /// A stream long enough to widen codes to 12 bits and clear the table, from Python's
+    /// imagecodecs (libtiff's encoder).
+    func testDecodesAcrossWidthsAndClears() throws {
+        var state: UInt32 = 12345
+        var expected = [UInt8]()
+        for _ in 0..<48_000 {
+            state = (state &* 1_103_515_245 &+ 12345) & 0x7FFF_FFFF
+            expected.append(65 + UInt8((state >> 16) % 2))
+        }
+        let packed = [UInt8](Fixtures.lzwStream)
+        XCTAssertGreaterThan(packed.count * 8 / 12, 4096, "the stream should need a clear")
+        XCTAssertEqual(try LZW.decode(packed[...], expectedSize: expected.count), expected)
+    }
+
+    func testSmallStreams() throws {
+        // Clear, "A", "B", "AB" (code 258, defined from the first two), end; 9-bit codes.
+        func pack(_ codes: [Int]) -> [UInt8] {
+            var bits = [Bool]()
+            for c in codes { for k in (0..<9).reversed() { bits.append(c >> k & 1 == 1) } }
+            while bits.count % 8 != 0 { bits.append(false) }
+            return stride(from: 0, to: bits.count, by: 8).map { i in
+                bits[i..<(i + 8)].reduce(0) { $0 << 1 | ($1 ? 1 : 0) }
+            }
+        }
+        XCTAssertEqual(try LZW.decode(pack([256, 65, 66, 258, 257])[...]), Array("ABAB".utf8))
+        // A code used in the same step that defines it: "A", then 258 = "A" + "A".
+        XCTAssertEqual(try LZW.decode(pack([256, 65, 258, 257])[...]), Array("AAA".utf8))
+        // A code from beyond the table is an error, not garbage.
+        XCTAssertThrowsError(try LZW.decode(pack([256, 65, 300, 257])[...]))
+    }
 }
 
 final class PeakDataTests: XCTestCase {

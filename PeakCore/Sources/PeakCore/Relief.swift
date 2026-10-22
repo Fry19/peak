@@ -84,8 +84,9 @@ public struct ReliefMap: Sendable {
     /// Heights row by row from the north, NaN where there's no terrain.
     public let heights: [Float]
 
-    /// Samples `terrain` over `extent` every `cellSize` meters.
+    /// Samples the ground of `terrain` (`Terrain.ground`) over `extent` every `cellSize` meters.
     public init(terrain: Terrain, extent: MapExtent, cellSize: Double) {
+        let terrain = terrain.ground
         projection = MapProjection(center: extent.center)
         self.cellSize = cellSize
         cols = max(3, Int((extent.width / cellSize).rounded(.up)) + 1)

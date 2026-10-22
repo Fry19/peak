@@ -20,6 +20,8 @@ public final class ElevationTile: @unchecked Sendable {
     public let stepLatitude: Double
     public let stepLongitude: Double
     let heights: UnsafeMutableBufferPointer<Int16>
+    /// How many pixels in from its edges the tile, as a patch, blends into what's under it.
+    let blendPixels: Double
     /// From the worldwide base layer (`BaseLayer`): kilometers between pixels, so good for
     /// far skylines but not for what's near.
     public internal(set) var isCoarse = false
@@ -50,6 +52,7 @@ public final class ElevationTile: @unchecked Sendable {
         self.stepLatitude = stepLatitude
         self.stepLongitude = stepLongitude
         heights = buffer
+        blendPixels = max(Terrain.patchBlend, Terrain.patchBlendMeters / (stepLatitude * 111_320))
     }
 
     /// A Copernicus-style 1° tile filled by `height(latitude, longitude)`, for tests.
@@ -185,6 +188,28 @@ public final class ElevationTile: @unchecked Sendable {
 
     /// All heights, row by row from the north.
     public var heightValues: [Int16] { Array(heights) }
+
+    /// Whether this patch already has every height `other` has, the same, so `other` would
+    /// add nothing: not a block this one is missing (it couldn't be fetched then), nor a newer
+    /// version of the data. Patches on different pixel grids never hold each other.
+    public func holds(_ other: ElevationTile) -> Bool {
+        guard south == other.south, west == other.west,
+              abs(stepLatitude - other.stepLatitude) < 1e-9 * other.stepLatitude,
+              abs(stepLongitude - other.stepLongitude) < 1e-9 * other.stepLongitude else { return false }
+        let dr = (originLatitude - other.originLatitude) / stepLatitude
+        let dc = (other.originLongitude - originLongitude) / stepLongitude
+        guard abs(dr - dr.rounded()) < 1e-3, abs(dc - dc.rounded()) < 1e-3 else { return false }
+        let r0 = Int(dr.rounded()), c0 = Int(dc.rounded())
+        for r in 0..<other.rows {
+            for c in 0..<other.cols {
+                let v = other.heights[r * other.cols + c]
+                guard v != Self.noData else { continue }
+                let rr = r + r0, cc = c + c0
+                guard rr >= 0, cc >= 0, rr < rows, cc < cols, heights[rr * cols + cc] == v else { return false }
+            }
+        }
+        return true
+    }
 }
 
 public enum TerrainError: Error, CustomStringConvertible {
@@ -220,12 +245,19 @@ public final class Terrain: @unchecked Sendable {
     let patchStart: [Int]
     /// Some of the terrain is the base layer's coarse tiles.
     public let hasCoarse: Bool
+    /// Bare-ground patches: terrain models that leave out trees and buildings, such as USGS
+    /// 3DEP's. Used where the ground itself matters (`ground`); see there.
+    public let groundPatches: [ElevationTile]
+    private let groundTerrain: Terrain?
 
     /// `detail` patches are used wherever they have data, finest first; elsewhere, and
-    /// within a pixel of their edges, the 1° `tiles` are.
-    public init(tiles: [ElevationTile], detail: [ElevationTile] = [], missingIsSea: Bool = true) {
+    /// within a pixel of their edges, the 1° `tiles` are. `ground` patches make `ground`.
+    public init(tiles: [ElevationTile], detail: [ElevationTile] = [], ground: [ElevationTile] = [],
+                missingIsSea: Bool = true) {
         self.tiles = tiles
         self.detail = detail
+        groundPatches = ground
+        groundTerrain = ground.isEmpty ? nil : Terrain(tiles: tiles, detail: detail + ground, missingIsSea: missingIsSea)
         missing = missingIsSea ? 0 : .nan
         let all = tiles + detail
         minSouth = all.map(\.south).min() ?? 0
@@ -246,6 +278,18 @@ public final class Terrain: @unchecked Sendable {
         self.patches = patches
         patchStart = start
         hasCoarse = tiles.contains(where: \.isCoarse)
+    }
+
+    /// The ground itself, for trails, their climbs and the maps: the bare-ground patches
+    /// over this terrain where there are any, blended into it at their edges. Elsewhere,
+    /// and with none, the same as this terrain. Skylines and lines of sight stay on this
+    /// terrain: Copernicus heights take in much of the trees on a forested ridge, which is
+    /// the outline the camera sees, while a bare-ground ridge would sit below it.
+    public var ground: Terrain { groundTerrain ?? self }
+
+    /// Whether bare ground (`groundPatches`) covers a point, for crediting its source.
+    public func hasGround(latitude: Double, longitude: Double) -> Bool {
+        groundPatches.contains { $0.interiorHeight(latitude, longitude) != nil }
     }
 
     /// Loads every .pkdem file in a directory.
@@ -273,10 +317,14 @@ public final class Terrain: @unchecked Sendable {
         return baseHeight(latitude, longitude, cell: cell)
     }
 
-    /// Patches blend into what lies under them over this many of their pixels from their
-    /// edges. A hard switch from sharp to coarse terrain leaves a step along the patch's
-    /// edge, which the horizon renderer sees as a ridge: a straight line drawn across the view.
+    /// Patches blend into what lies under them over at least this many of their pixels from
+    /// their edges, and at least as many as span `patchBlendMeters` north to south (pixels are
+    /// narrower east to west, by the cosine of the latitude). A hard switch from sharp to
+    /// coarse terrain leaves a step along the patch's edge, which the horizon renderer sees as
+    /// a ridge: a straight line drawn across the view, or a climb that isn't there on a trail.
     static let patchBlend = 8.0
+    /// 8 of Copernicus's 30 m pixels; 23 of USGS 3DEP's 10 m ones.
+    static let patchBlendMeters = 240.0
 
     /// The height from patch `k` of the cell onward (finest first), blended near each
     /// patch's edges into the ones under it and finally the 1° tile.
@@ -285,7 +333,7 @@ public final class Terrain: @unchecked Sendable {
         let end = patchStart[cell + 1]
         while k < end {
             if let (h, edge) = detailSample(patches[k], latitude, longitude) {
-                let w = edge / Self.patchBlend
+                let w = edge / patches[k].blendPixels
                 if w >= 1 { return h }
                 let below = patchHeight(latitude, longitude, cell: cell, from: k + 1)
                 return below.isFinite ? h * w + below * (1 - w) : h
@@ -307,7 +355,7 @@ public final class Terrain: @unchecked Sendable {
         let x = (longitude - p.originLongitude) / p.stepLongitude
         let height: Double
         if let s = p.interiorSample(latitude, longitude) {
-            if s.edge >= Self.patchBlend { return s }
+            if s.edge >= p.blendPixels { return s }
             height = s.height
         } else {
             guard y >= 0, x >= 0 else { return nil }
@@ -319,7 +367,7 @@ public final class Terrain: @unchecked Sendable {
             height = (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
         }
         // Each side within reach of the blend counts unless the same grid carries on past it.
-        let reach = Self.patchBlend
+        let reach = p.blendPixels
         let lastRow = p.originLatitude - Double(p.rows - 1) * p.stepLatitude
         let lastCol = p.originLongitude + Double(p.cols - 1) * p.stepLongitude
         var edge = Double.infinity

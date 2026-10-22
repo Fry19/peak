@@ -32,10 +32,16 @@ final class TrailTracker {
     static let elsewhereDistance = 2_000.0
 
     /// Starts following a trail, or carries on with it, matching along the profile once
-    /// there is one (it needs the terrain).
-    func follow(_ trail: Trail, profile: TrailProfile?) {
-        if trailID == trail.id, hasProfile || profile == nil { return }
+    /// there is one (it needs the terrain). With `replacing`, a new profile of the same trail
+    /// (from sharper terrain) takes over from the one followed.
+    func follow(_ trail: Trail, profile: TrailProfile?, replacing: Bool = false) {
+        if trailID == trail.id, hasProfile && !replacing || profile == nil { return }
         let usable = profile.flatMap { $0.points.count > 1 ? $0 : nil }
+        // The same line with new elevations: where you are on it and which way you're going stay.
+        if trailID == trail.id, hasProfile, let usable, let same = matcher?.withElevations(of: usable) {
+            matcher = same
+            return
+        }
         let carryOn = trailID == trail.id
         self.trail = trail
         trailID = trail.id

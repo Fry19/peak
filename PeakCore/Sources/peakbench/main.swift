@@ -54,11 +54,13 @@ peakbench: desk test harness for skyline matching.
       Decode a Copernicus GeoTIFF with PeakCore's own reader (what the app does). --blocks
       also decodes each block of the level on its own and checks it against the whole.
 
-  peakbench trails OVERPASS.json --lat L --lon L [--dem DIR] [--from-lat L --from-lon L]
+  peakbench trails OVERPASS.json --lat L --lon L [--dem DIR] [--ground DIR] [--from-lat L --from-lon L]
   peakbench trails --query --lat L --lon L
       Read hiking routes and paths from an Overpass response (Overpass.trailsQuery) near a
       peak at --lat/--lon. With --dem, climb from the terrain; with --from-*, how much of
-      each trail is in sight from there, as the app draws it on the mountain.
+      each trail is in sight from there, as the app draws it on the mountain. --ground adds
+      bare ground (Tools/fetch_ground.py) for the climb as the app does, and compares it with
+      --dem alone.
 
   peakbench relief --dem DIR --lat L --lon L [--size-km K] [--cell M] [--image FILE]
       The terrain seen from above around a point, as the app draws it under a trail:
@@ -156,6 +158,16 @@ func loadTerrain(_ path: String?) throws -> Terrain {
     let terrain = try Terrain(directory: URL(fileURLWithPath: dir))
     log(String(format: "Loaded %d DEM tiles from %@ in %.1f s", terrain.tiles.count, dir, Date().timeIntervalSince(start)))
     return terrain
+}
+
+/// Bare-ground patches: every .pkdem file in a directory (Tools/fetch_ground.py).
+func loadGround(_ dir: String) throws -> [ElevationTile] {
+    let files = try FileManager.default.contentsOfDirectory(at: URL(fileURLWithPath: dir), includingPropertiesForKeys: nil)
+        .filter { $0.pathExtension == "pkdem" }
+    guard !files.isEmpty else { throw TerrainError.empty(dir) }
+    let patches = try files.map { try ElevationTile(contentsOf: $0) }
+    log("Loaded \(patches.count) bare-ground patches from \(dir)")
+    return patches
 }
 
 func log(_ s: String) {
@@ -488,7 +500,13 @@ func trailsCommand(_ args: Arguments) throws {
     let trails = try Overpass.trails(fromJSON: data)
         .map { ($0, $0.distance(to: peak)) }
         .sorted { ($0.1 < 250 ? 0 : 1, $0.1) < ($1.1 < 250 ? 0 : 1, $1.1) }
-    let terrain = try args.string("dem").map { try loadTerrain($0) }
+    var terrain = try args.string("dem").map { try loadTerrain($0) }
+    // With bare ground (Tools/fetch_ground.py), the climb follows it, as in the app, and is
+    // compared with the Copernicus terrain alone.
+    let surface = terrain
+    if let ground = try args.string("ground").map(loadGround), let t = terrain {
+        terrain = Terrain(tiles: t.tiles, detail: t.detail, ground: ground)
+    }
     var drape: ((Trail) -> [[DrapedPoint]])?
     if let terrain, let lat = args.double("from-lat"), let lon = args.double("from-lon") {
         let renderer = HorizonRenderer(terrain: terrain)
@@ -507,6 +525,9 @@ func trailsCommand(_ args: Arguments) throws {
         line += ", \(t.difficulty?.grade ?? "no grade"), \(d < 250 ? "reaches the summit" : "\(f(d / 1000, 1)) km from it")"
         if let terrain, let p = t.profile(on: terrain) {
             line += ", climb \(f(p.gain, 0)) m, descent \(f(p.loss, 0)) m, \(f(p.lowest, 0))–\(f(p.highest, 0)) m"
+            if let surface, surface !== terrain, let q = t.profile(on: surface) {
+                line += " (Copernicus alone: climb \(f(q.gain, 0)) m, descent \(f(q.loss, 0)) m, \(f(q.lowest, 0))–\(f(q.highest, 0)) m)"
+            }
         }
         if let drape {
             let runs = drape(t)

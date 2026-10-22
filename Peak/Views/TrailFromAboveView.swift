@@ -212,9 +212,9 @@ struct TrailFromAboveView: View {
             } else if satellite, !hasImagery, imageryState == .failed {
                 note("The satellite imagery didn't load, so this is the terrain.")
             }
-            Text(hasImagery
-                 ? "Imagery © Apple Maps · Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors"
-                 : "Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors")
+            let usgs = model.scene?.terrain.hasGround(under: trail.trail) == true
+            Text((hasImagery ? "Imagery © Apple Maps · " : "") + "Terrain © Copernicus DEM (DLR, Airbus)" + (usgs ? ", USGS 3DEP" : "") +
+                 " · Map data © OpenStreetMap contributors")
                 .font(.system(size: 9))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.white.opacity(hasImagery ? 0.7 : 0.45))

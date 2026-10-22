@@ -72,7 +72,7 @@ public struct TrailProgress: Sendable, Equatable {
 public struct TrailMatcher: Sendable {
     /// The grid: points about `spacing` apart along the line, their distance along it, and
     /// elevations (zero without a profile).
-    let profile: TrailProfile
+    private(set) var profile: TrailProfile
     let xy: [SIMD2<Double>]
     let projection: MapProjection
     public let spacing: Double
@@ -134,6 +134,21 @@ public struct TrailMatcher: Sendable {
         let heights = points.map(\.elevation)
         profile = TrailProfile(points: points, gain: 0, loss: 0, highest: heights.max() ?? 0, lowest: heights.min() ?? 0)
         xy = points.map { [projection] in projection.point($0.position) }
+    }
+
+    /// The same matcher, with where you are on the trail and which way you're going, but
+    /// `profile`'s elevations: for a profile of the same line from sharper terrain. Nil when
+    /// `profile` is of another line, or of this one the other way round, which needs a
+    /// matcher of its own.
+    public func withElevations(of profile: TrailProfile) -> TrailMatcher? {
+        let other = TrailMatcher(profile: profile, spacing: spacing)
+        guard other.profile.points.count == self.profile.points.count,
+              zip(other.profile.points, self.profile.points).allSatisfy({
+                  abs($0.position.latitude - $1.position.latitude) < 1e-9 && abs($0.position.longitude - $1.position.longitude) < 1e-9
+              }) else { return nil }
+        var matcher = self
+        matcher.profile = other.profile
+        return matcher
     }
 
     public mutating func reset() {

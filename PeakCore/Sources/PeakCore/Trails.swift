@@ -268,13 +268,25 @@ public struct TrailProfile: Sendable {
     public var trailhead: LatLon? { points.first?.position }
 }
 
+extension Terrain {
+    /// Whether any of a trail, sampled every 200 m, lies on bare ground (`groundPatches`), for
+    /// crediting its source.
+    public func hasGround(under trail: Trail) -> Bool {
+        guard !groundPatches.isEmpty else { return false }
+        return trail.lines.contains { line in
+            Trail.densify(line, spacing: 200).contains { hasGround(latitude: $0.latitude, longitude: $0.longitude) }
+        }
+    }
+}
+
 extension Trail {
-    /// Samples the terrain every `spacing` meters along the trail. For the climb, heights
-    /// are smoothed over `smoothing` meters and changes smaller than `threshold` meters
-    /// are ignored, since the terrain model's noise would otherwise add up to hundreds of
-    /// meters. Nil when the terrain doesn't cover the trail.
+    /// Samples the ground (`Terrain.ground`) every `spacing` meters along the trail. For the
+    /// climb, heights are smoothed over `smoothing` meters and changes smaller than
+    /// `threshold` meters are ignored, since the terrain model's noise would otherwise add up
+    /// to hundreds of meters. Nil when the terrain doesn't cover the trail.
     public func profile(on terrain: Terrain, spacing: Double = 25, smoothing: Double = 100,
                         threshold: Double = 8) -> TrailProfile? {
+        let terrain = terrain.ground
         func sample(_ line: [LatLon]) -> [TrailProfile.Point] {
             var out: [TrailProfile.Point] = []
             var along = 0.0

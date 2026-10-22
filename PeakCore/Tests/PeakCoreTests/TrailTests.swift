@@ -168,6 +168,60 @@ final class TrailTests: XCTestCase {
         let summit = LatLon(46.05, 8.0).distance(to: LatLon(46.2, 8.0))
         XCTAssertEqual(Double(over[0][firstHidden].distance), summit, accuracy: 100)
     }
+
+    /// Bare ground under a forested surface (a gentle hill in open country, its surface 30 m
+    /// of trees above the ground, as Copernicus has much of a forest's height): a trail's
+    /// climb follows the ground. Its line on the mountain stays on the surface, as the
+    /// skylines and the eye are: one consistent view, until the eye can stand on the ground.
+    func testTrailClimbsFollowTheGroundUnderTrees() throws {
+        let top = (latitude: 46.5, longitude: 8.5)
+        func distance(_ lat: Double, _ lon: Double) -> Double {
+            let dy = (lat - top.latitude) * 111_200, dx = (lon - top.longitude) * 111_200 * cos(top.latitude * .pi / 180)
+            return (dx * dx + dy * dy).squareRoot()
+        }
+        func bare(_ lat: Double, _ lon: Double) -> Double { 500 + 600 * max(0, 1 - distance(lat, lon) / 4_000) }
+        let surface = [(45, 7), (45, 8), (46, 7), (46, 8)].map { south, west in
+            ElevationTile(south: south, west: west, size: 600) { bare($0, $1) + (distance($0, $1) < 4_000 ? 30 : 0) }
+        }
+        // The ground at 1 arc-second, around the hill, in its 1° cell.
+        let step = 1.0 / 3600, rows = 361, cols = 481
+        var heights = [Int16](repeating: 0, count: rows * cols)
+        for r in 0..<rows {
+            for c in 0..<cols {
+                heights[r * cols + c] = Int16(bare(46.55 - Double(r) * step, 8.43 + Double(c) * step).rounded())
+            }
+        }
+        let patch = ElevationTile(south: 46, west: 8, rows: rows, cols: cols, originLatitude: 46.55, originLongitude: 8.43,
+                                  stepLatitude: step, stepLongitude: step, heights: heights)
+        let forest = Terrain(tiles: surface)
+        let terrain = Terrain(tiles: surface, ground: [patch])
+
+        // Straight up the south face, drawn top down.
+        func line(_ fromKm: Double, _ toKm: Double, azimuth: Double) -> [LatLon] {
+            [fromKm, toKm].map {
+                let p = destination(from: GeoPoint(latitude: top.latitude, longitude: top.longitude), azimuth: azimuth, distance: $0 * 1_000)
+                return LatLon(p.latitude, p.longitude)
+            }
+        }
+        let trail = Trail(id: "t", name: "Hill", kind: .path, lines: [line(0, 3, azimuth: 180)])
+        let profile = try XCTUnwrap(trail.profile(on: terrain))
+        XCTAssertEqual(profile.highest, 1_100, accuracy: 8)
+        XCTAssertEqual(profile.points.first!.elevation, bare(profile.trailhead!.latitude, profile.trailhead!.longitude), accuracy: 2)
+        XCTAssertEqual(try XCTUnwrap(trail.profile(on: forest)).highest, 1_130, accuracy: 8)
+        XCTAssertTrue(terrain.hasGround(under: trail))
+        XCTAssertFalse(forest.hasGround(under: trail))
+
+        // On the mountain, as on the surface alone.
+        let renderer = HorizonRenderer(terrain: terrain)
+        let observer = renderer.observer(latitude: 46.35, longitude: 8.5)
+        var settings = HorizonSettings()
+        settings.maxDistance = 40_000
+        let horizon = renderer.render(from: observer, settings: settings)
+        let draped = renderer.drape([line(0.5, 3.5, azimuth: 175)], from: observer, horizon: horizon)
+        let onTrees = HorizonRenderer(terrain: forest).drape([line(0.5, 3.5, azimuth: 175)], from: observer, horizon: horizon)
+        XCTAssertGreaterThan(draped.first?.count ?? 0, 150)
+        XCTAssertEqual(draped.map { $0.map(\.elevation) }, onTrees.map { $0.map(\.elevation) })
+    }
 }
 
 final class PeakFactsTests: XCTestCase {

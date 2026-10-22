@@ -90,7 +90,8 @@ struct TrailWalkView: View {
                     .padding(.horizontal, 12)
                 Spacer()
                 if let world {
-                    WalkControls(world: world, player: player, draped: draped)
+                    WalkControls(world: world, player: player, draped: draped,
+                                 usgs: model.scene?.terrain.hasGround(under: trail.trail) == true)
                         .padding(.horizontal, 16)
                         .padding(.bottom, 12)
                 }
@@ -1031,6 +1032,8 @@ private struct WalkControls: View {
     let world: WalkWorld
     let player: WalkPlayer
     let draped: Bool
+    /// Some of the ground is USGS 3DEP's, to credit.
+    let usgs: Bool
 
     var body: some View {
         VStack(spacing: 8) {
@@ -1052,7 +1055,8 @@ private struct WalkControls: View {
             Text(player.playing ? " " : "Drag to look around")
                 .font(.system(size: 11))
                 .foregroundStyle(.white.opacity(0.6))
-            Text((draped ? "Imagery © Apple Maps · " : "") + "Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors")
+            Text((draped ? "Imagery © Apple Maps · " : "") + "Terrain © Copernicus DEM (DLR, Airbus)" + (usgs ? ", USGS 3DEP" : "") +
+                 " · Map data © OpenStreetMap contributors")
                 .font(.system(size: 9))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.white.opacity(draped ? 0.7 : 0.45))

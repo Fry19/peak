@@ -181,4 +181,25 @@ final class TrailMatchTests: XCTestCase {
         XCTAssertEqual(p.y, 333, accuracy: 1)
         XCTAssertEqual(p.x, 0, accuracy: 0.5)
     }
+
+    /// Sharper terrain comes in while you're on the switchbacks: the climbs come from it,
+    /// and where you are and which way you're going stay, so the next fix doesn't jump to
+    /// another leg. A profile of the line the other way round can't take over.
+    func testNewElevationsKeepYourPlace() throws {
+        let line = switchbacks
+        let coarse = profile(line) { 1_500 + 0.12 * $0 }
+        let sharp = profile(line) { 1_500 + 0.2 * $0 }
+        var matcher = TrailMatcher(profile: coarse)
+        let fixes = walk(line, duration: 900, seed: 11) { 1_000 + 1.2 * $0 }
+        for f in fixes.prefix(60) { matcher.update(f.fix) }
+        XCTAssertEqual(matcher.direction, .forward)
+        var updated = try XCTUnwrap(matcher.withElevations(of: sharp))
+        XCTAssertEqual(updated.direction, .forward)
+        let p = try XCTUnwrap(updated.update(fixes[60].fix))
+        XCTAssertEqual(p.along, fixes[60].along, accuracy: 40)
+        XCTAssertEqual(p.direction, .forward)
+        XCTAssertEqual(p.climbToTop, 0.2 * (coarse.points.last!.distance - p.along), accuracy: 10)
+        let reversed = TrailProfile(points: sharp.points.reversed(), gain: 0, loss: 0, highest: sharp.highest, lowest: sharp.lowest)
+        XCTAssertNil(matcher.withElevations(of: reversed))
+    }
 }

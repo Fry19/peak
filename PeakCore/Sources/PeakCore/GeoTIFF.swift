@@ -1,8 +1,9 @@
 import Foundation
 
-/// Reads single-band elevation GeoTIFFs such as the Copernicus GLO-30 tiles: little-endian
-/// TIFF, tiled or in strips, uncompressed or DEFLATE, with no predictor, horizontal
-/// differencing or the floating-point predictor, and 16-bit integer or 32-bit float samples.
+/// Reads single-band elevation GeoTIFFs such as the Copernicus GLO-30 and USGS 3DEP tiles:
+/// little-endian TIFF, tiled or in strips, uncompressed, DEFLATE or LZW, with no predictor,
+/// horizontal differencing or the floating-point predictor, and 16-bit integer or 32-bit
+/// float samples.
 ///
 /// Cloud-optimized GeoTIFFs keep reduced-resolution copies (overviews) of the image, each
 /// in one contiguous byte range. Read the `Layout` from the start of the file, then fetch
@@ -52,9 +53,10 @@ public enum GeoTIFF {
         var stepLatitude: Double
         var stepLongitude: Double
 
-        /// The 1° cell the file covers.
-        public var south: Int { Int(originLatitude.rounded(.up)) - 1 }
-        public var west: Int { Int(originLongitude.rounded(.down)) }
+        /// The 1° cell the file covers: the one its middle is in. (USGS 3DEP tiles reach a
+        /// few pixels past their cell on every side, so their first pixel is in the next one.)
+        public var south: Int { Int((originLatitude - stepLatitude * Double(images[0].height - 1) / 2).rounded(.down)) }
+        public var west: Int { Int((originLongitude + stepLongitude * Double(images[0].width - 1) / 2).rounded(.down)) }
 
         /// First pixel center and pixel size of image `level`, degrees. An overview covers
         /// the same area with bigger pixels, so its first pixel center sits half of the
@@ -153,7 +155,11 @@ public enum GeoTIFF {
                 throw Failure("block \(index) is outside the data given")
             }
             var block = Array(stored)
-            if img.compression != 1 { block = try Inflate.zlib(block, expectedSize: blockRows * rowBytes) }
+            switch img.compression {
+            case 1: break
+            case 5: block = try LZW.decode(stored, expectedSize: blockRows * rowBytes)
+            default: block = try Inflate.zlib(block, expectedSize: blockRows * rowBytes)
+            }
             guard block.count >= blockRows * rowBytes else { throw Failure("block \(index) is short") }
             for r in 0..<blockRows {
                 let row = r * rowBytes
@@ -218,7 +224,7 @@ public enum GeoTIFF {
         let compression = one(259) ?? 1
         let sampleFormat = one(339) ?? 1
         guard (one(277) ?? 1) == 1 else { throw Failure("only single-band images are supported") }
-        guard [1, 8, 32946].contains(compression) else { throw Failure("compression \(compression) is not supported") }
+        guard [1, 5, 8, 32946].contains(compression) else { throw Failure("compression \(compression) is not supported") }
         guard (sampleFormat == 3 && bitsPerSample == 32) || (sampleFormat != 3 && bitsPerSample == 16) else {
             throw Failure("\(bitsPerSample)-bit samples of format \(sampleFormat) are not supported")
         }

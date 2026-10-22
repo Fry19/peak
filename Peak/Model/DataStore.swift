@@ -79,9 +79,23 @@ struct OfflineArea: Codable, Identifiable, Hashable {
 /// a tile can be fetched at 240 m (about 0.6 MB), 120 m (2 MB) or 60 m (8 MB) with one range
 /// request. The full 30 m image is stored in 16 blocks of about 2.5 MB, so just the blocks
 /// around you can be fetched at full detail.
+///
+/// Where USGS has it (the United States and its territories), the bare ground under trails
+/// comes from USGS 3DEP's 1/3 arc-second (about 10 m) terrain model, fetched the same way
+/// in its 512-pixel blocks of about 0.8 MB (`Source.usgs`, `Terrain.ground`). Its heights
+/// are NAVD88 (local datums in some territories), within a meter or two of Copernicus's
+/// EGM2008 heights in the lower 48, and its positions NAD83, within about 1.5 m of WGS 84.
+/// Both are left as they are: a fraction of a pixel, and close to the whole meters heights
+/// are kept in.
 actor DataStore {
     /// Pixel size: 0 is the full 30 m, 1 is 60 m, 2 is 120 m, 3 is 240 m.
     typealias Level = Int
+
+    /// Where terrain comes from: Copernicus's surface model everywhere, or USGS 3DEP's bare
+    /// ground where USGS has a tile (only its full 10 m level is used).
+    enum Source: Sendable {
+        case copernicus, usgs
+    }
 
     struct Key: Hashable, Sendable {
         var south: Int
@@ -91,6 +105,8 @@ actor DataStore {
 
     enum Failure: LocalizedError {
         case download(String)
+        /// The file on the server isn't the one whose header is on the phone any more.
+        case changed
         case busy
         /// The server has no such page.
         case missing
@@ -98,6 +114,7 @@ actor DataStore {
         var errorDescription: String? {
             switch self {
             case let .download(what): return "Couldn't download \(what). Check your connection."
+            case .changed: return "The terrain was updated on the server. Trying again."
             case .busy: return "The OpenStreetMap server is busy. Try again in a minute."
             case .missing: return "Not found."
             }
@@ -113,8 +130,16 @@ actor DataStore {
     private let factDirectory: URL
     private let areaDirectory: URL
     private let coverDirectory: URL
-    /// Tile headers read this session, by tile.
-    private var layouts: [Key: GeoTIFF.Layout] = [:]
+    /// USGS 3DEP's bare ground, apart from Copernicus's terrain.
+    private let groundDirectory: URL
+    private struct LayoutKey: Hashable {
+        var key: Key
+        var source: Source
+    }
+    /// Tile headers read this session, by tile and source.
+    private var layouts: [LayoutKey: GeoTIFF.Layout] = [:]
+    /// Which version (S3's ETag) of a USGS file each header read this session is from.
+    private var versions: [LayoutKey: String] = [:]
 
     init() {
         baseDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -125,7 +150,8 @@ actor DataStore {
         factDirectory = baseDirectory.appendingPathComponent("Facts", isDirectory: true)
         areaDirectory = baseDirectory.appendingPathComponent("Areas", isDirectory: true)
         coverDirectory = baseDirectory.appendingPathComponent("LandCover", isDirectory: true)
-        for dir in [demDirectory, peakDirectory, trailDirectory, factDirectory, areaDirectory, coverDirectory] {
+        groundDirectory = baseDirectory.appendingPathComponent("Ground", isDirectory: true)
+        for dir in [demDirectory, peakDirectory, trailDirectory, factDirectory, areaDirectory, coverDirectory, groundDirectory] {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         // Everything here can be downloaded again: keep it out of iCloud backups, which it
@@ -172,15 +198,17 @@ actor DataStore {
     /// Bytes downloaded so far, for showing progress.
     private(set) var bytesDownloaded = 0
 
-    /// The bucket said it has no such tile, not too long ago (then it's asked again).
-    func isSea(_ key: Key) -> Bool {
-        age(of: seaURL(key)) < CopernicusBucket.seaLifetime
+    /// The bucket said it has no such tile, not too long ago (then it's asked again). For
+    /// Copernicus that's open sea; USGS just has no bare ground there, which says nothing
+    /// about what's there.
+    func isSea(_ key: Key, source: Source = .copernicus) -> Bool {
+        age(of: seaURL(key, source)) < CopernicusBucket.seaLifetime
     }
 
     /// The bucket said it has no such tile, however long ago: what to go by when it can't
     /// be asked again (no signal), rather than having no terrain there.
-    private func wasSea(_ key: Key) -> Bool {
-        FileManager.default.fileExists(atPath: seaURL(key).path)
+    private func wasSea(_ key: Key, _ source: Source) -> Bool {
+        FileManager.default.fileExists(atPath: seaURL(key, source).path)
     }
 
     /// A whole tile at `level` or finer: from the phone if there, otherwise downloaded. Nil
@@ -212,21 +240,23 @@ actor DataStore {
 
     /// The part of a tile at `level` within `radius` meters of a point, fetched block by
     /// block (blocks already on the phone aren't fetched again). Nil for open sea or when
-    /// the area misses the tile. Blocks that can't be fetched are left out, unless `strict`
-    /// (saving an area), when blocks that can't be fetched or kept are a failure.
+    /// the area misses the tile, and from USGS where it has no tile. Blocks that can't be
+    /// fetched are left out, unless `strict` (saving an area), when blocks that can't be
+    /// fetched or kept are a failure.
     func patch(_ key: Key, level: Level, latitude: Double, longitude: Double, radius: Double,
-               strict: Bool = false) async throws -> ElevationTile? {
-        if isSea(key) { return nil }
+               source: Source = .copernicus, strict: Bool = false) async throws -> ElevationTile? {
+        if isSea(key, source: source) { return nil }
         // A whole tile at this level or finer makes a patch pointless.
-        if let have = cachedLevel(key), have <= level { return nil }
+        if source == .copernicus, let have = cachedLevel(key), have <= level { return nil }
         let dlat = radius / 111_000, dlon = radius / (111_000 * max(cos(latitude * .pi / 180), 0.05))
         let layout: GeoTIFF.Layout
         do {
-            guard let found = try await self.layout(key, strict: strict), found.images.indices.contains(level) else { return nil }
+            guard let found = try await self.layout(key, source: source, strict: strict),
+                  found.images.indices.contains(level) else { return nil }
             layout = found
         } catch {
             // No header on the phone and no signal: the blocks that are here still do.
-            if !strict, let blocks = cachedBlocks(key, level, south: latitude - dlat, north: latitude + dlat,
+            if !strict, let blocks = cachedBlocks(key, level, source, south: latitude - dlat, north: latitude + dlat,
                                                   west: longitude - dlon, east: longitude + dlon) {
                 return blocks
             }
@@ -235,22 +265,28 @@ actor DataStore {
         let blocks = layout.blocks(level: level, south: latitude - dlat, north: latitude + dlat,
                                    west: longitude - dlon, east: longitude + dlon)
         guard !blocks.isEmpty else { return nil }
-        let url = remoteURL(key)
+        let url = remoteURL(key, source)
+        // USGS replaces its tiles in place as new surveys come in: blocks are asked for only
+        // from the version whose header is on the phone, and none without knowing it.
+        let version = versions[LayoutKey(key: key, source: source)]
         var parts: [ElevationTile] = []
         var failure: Error?
+        var versionChanged = false
         await withTaskGroup(of: Result<ElevationTile, Error>.self) { group in
             for block in blocks {
-                let file = blockURL(key, level, block)
+                let file = blockURL(key, level, block, source)
                 if let cached = try? ElevationTile(contentsOf: file) {
                     parts.append(cached)
                     continue
                 }
                 try? FileManager.default.removeItem(at: file)   // unreadable, if there at all
+                if source == .usgs, version == nil { continue }
                 let range = layout.images[level].byteRange(ofBlock: block)
                 group.addTask {
                     do {
-                        let (data, response) = try await self.fetch(url, range: range)
+                        let (data, response) = try await self.fetch(url, range: range, ifMatch: version)
                         let status = response?.statusCode ?? 0
+                        if status == 412 { throw Failure.changed }
                         guard status == 206 else { throw Failure.download("terrain (HTTP \(status))") }
                         let bytes = [UInt8](data)
                         let tile = try GeoTIFF.decode(layout, level: level, blocks: [block]) { _ in bytes[...] }
@@ -265,20 +301,41 @@ actor DataStore {
             for await result in group {
                 switch result {
                 case let .success(tile): parts.append(tile)
-                case let .failure(error): failure = error
+                case let .failure(error):
+                    if case .changed? = error as? Failure { versionChanged = true }
+                    failure = error
                 }
             }
+        }
+        if versionChanged {
+            // Start over with the new version next time: its header and all of its blocks.
+            forget(key, level, source)
         }
         if let failure, strict || parts.isEmpty { throw failure }
         return ElevationTile(merging: parts)
     }
 
+    /// Deletes a tile's header and blocks at `level` on the phone.
+    private func forget(_ key: Key, _ level: Level, _ source: Source) {
+        layouts[LayoutKey(key: key, source: source)] = nil
+        versions[LayoutKey(key: key, source: source)] = nil
+        for file in [headURL(key, source), versionURL(key, source)] { try? FileManager.default.removeItem(at: file) }
+        let first = blockURL(key, level, 0, source)
+        let prefix = String(first.lastPathComponent.dropLast("0.pkdem".count))
+        let files = (try? FileManager.default.contentsOfDirectory(at: first.deletingLastPathComponent(),
+                                                                  includingPropertiesForKeys: nil)) ?? []
+        for file in files where file.lastPathComponent.hasPrefix(prefix) { try? FileManager.default.removeItem(at: file) }
+    }
+
     /// The blocks of a tile at `level` on the phone that overlap a box, joined; nil when
     /// there are none. For when the tile's header (which says which blocks there are) is
     /// missing and can't be fetched.
-    private func cachedBlocks(_ key: Key, _ level: Level, south: Double, north: Double, west: Double, east: Double) -> ElevationTile? {
-        let prefix = "\(key.name).L\(level).b"
-        let files = (try? FileManager.default.contentsOfDirectory(at: demDirectory, includingPropertiesForKeys: nil)) ?? []
+    private func cachedBlocks(_ key: Key, _ level: Level, _ source: Source,
+                              south: Double, north: Double, west: Double, east: Double) -> ElevationTile? {
+        let first = blockURL(key, level, 0, source)
+        let prefix = String(first.lastPathComponent.dropLast("0.pkdem".count))
+        let files = (try? FileManager.default.contentsOfDirectory(at: first.deletingLastPathComponent(),
+                                                                  includingPropertiesForKeys: nil)) ?? []
         let parts = files.filter { $0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension == "pkdem" }
             .compactMap { try? ElevationTile(contentsOf: $0) }
             .filter { t in
@@ -292,31 +349,45 @@ actor DataStore {
     /// The tile's image directories, from the phone or the first 16 KB of the file. Nil
     /// for open sea. With `strict`, a header that can't be kept on the phone is a failure,
     /// so a saved area never needs the network for it.
-    private func layout(_ key: Key, strict: Bool = false) async throws -> GeoTIFF.Layout? {
-        if let layout = layouts[key] {
-            if strict, !FileManager.default.fileExists(atPath: headURL(key).path) {
-                layouts[key] = nil   // read this session but not kept: fetch and keep it
+    private func layout(_ key: Key, source: Source = .copernicus, strict: Bool = false) async throws -> GeoTIFF.Layout? {
+        let id = LayoutKey(key: key, source: source)
+        if let layout = layouts[id] {
+            if strict, !FileManager.default.fileExists(atPath: headURL(key, source).path) {
+                layouts[id] = nil   // read this session but not kept: fetch and keep it
             } else {
                 return layout
             }
         }
-        let file = headURL(key)
+        let file = headURL(key, source)
+        // A USGS header without the version it's from can't vouch for blocks fetched now: it's
+        // asked for again, and used for the blocks on the phone only while it can't be.
+        var unversioned: GeoTIFF.Layout?
         if let data = try? Data(contentsOf: file), let layout = try? GeoTIFF.layout([UInt8](data)) {
-            layouts[key] = layout
-            return layout
+            if source == .copernicus {
+                layouts[id] = layout
+                return layout
+            }
+            if let tag = try? String(contentsOf: versionURL(key, source), encoding: .utf8), !tag.isEmpty {
+                layouts[id] = layout
+                versions[id] = tag
+                return layout
+            }
+            unversioned = layout
         }
         let head: Data, response: HTTPURLResponse?
         do {
-            (head, response) = try await fetch(remoteURL(key), range: 0..<16_384)
+            (head, response) = try await fetch(remoteURL(key, source), range: 0..<16_384)
         } catch {
             // No signal: open sea stays sea, however long ago the bucket said so.
-            if wasSea(key) { return nil }
+            if wasSea(key, source) { return nil }
+            if !strict, let unversioned { return unversioned }
             throw error
         }
         let status = response?.statusCode ?? 0
+        // USGS's bucket is on S3 too, and says it has no tile the same way.
         switch CopernicusBucket.answer(status: status, server: response?.value(forHTTPHeaderField: "Server"), body: head) {
         case .sea:
-            if !FileManager.default.createFile(atPath: seaURL(key).path, contents: nil), strict {
+            if !FileManager.default.createFile(atPath: seaURL(key, source).path, contents: nil), strict {
                 throw CocoaError(.fileWriteOutOfSpace)
             }
             return nil
@@ -326,20 +397,39 @@ actor DataStore {
             break
         }
         let layout = try GeoTIFF.layout([UInt8](head.prefix(16_384)))
-        try? FileManager.default.removeItem(at: seaURL(key))
-        do { try head.prefix(16_384).write(to: file, options: .atomic) } catch { if strict { throw error } }
-        layouts[key] = layout
+        try? FileManager.default.removeItem(at: seaURL(key, source))
+        let tag = source == .usgs ? response?.value(forHTTPHeaderField: "ETag") : nil
+        // USGS blocks on the phone are kept only if they're known to be of this version.
+        if source == .usgs, (try? String(contentsOf: versionURL(key, source), encoding: .utf8)) != tag { forget(key, 0, source) }
+        versions[id] = tag
+        do {
+            try head.prefix(16_384).write(to: file, options: .atomic)
+            // Which version of the file the header is from (S3's ETag), for asking for its blocks.
+            if let tag { try tag.write(to: versionURL(key, source), atomically: true, encoding: .utf8) }
+        } catch { if strict { throw error } }
+        layouts[id] = layout
         return layout
     }
 
-    private func headURL(_ key: Key) -> URL {
-        demDirectory.appendingPathComponent(key.name + ".head")
+    private func headURL(_ key: Key, _ source: Source = .copernicus) -> URL {
+        switch source {
+        case .copernicus: demDirectory.appendingPathComponent(key.name + ".head")
+        case .usgs: groundDirectory.appendingPathComponent("USGS13_\(key.name).head")
+        }
     }
 
-    private func remoteURL(_ key: Key) -> URL {
-        let ns = key.south >= 0 ? "N" : "S", ew = key.west >= 0 ? "E" : "W"
-        let stem = String(format: "Copernicus_DSM_COG_10_%@%02d_00_%@%03d_00_DEM", ns, abs(key.south), ew, abs(key.west))
-        return URL(string: "https://copernicus-dem-30m.s3.amazonaws.com/\(stem)/\(stem).tif")!
+    private func remoteURL(_ key: Key, _ source: Source = .copernicus) -> URL {
+        switch source {
+        case .copernicus:
+            let ns = key.south >= 0 ? "N" : "S", ew = key.west >= 0 ? "E" : "W"
+            let stem = String(format: "Copernicus_DSM_COG_10_%@%02d_00_%@%03d_00_DEM", ns, abs(key.south), ew, abs(key.west))
+            return URL(string: "https://copernicus-dem-30m.s3.amazonaws.com/\(stem)/\(stem).tif")!
+        case .usgs:
+            // Named after the tile's north-west corner: n36w084 is 35–36°N, 84–83°W.
+            let north = key.south + 1
+            let stem = String(format: "%@%02d%@%03d", north >= 0 ? "n" : "s", abs(north), key.west >= 0 ? "e" : "w", abs(key.west))
+            return URL(string: "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/13/TIFF/current/\(stem)/USGS_13_\(stem).tif")!
+        }
     }
 
     private func tileURL(_ key: Key, _ level: Level) -> URL {
@@ -350,18 +440,33 @@ actor DataStore {
         return demDirectory.appendingPathComponent("\(key.name).L\(level).pkdem")
     }
 
-    private func blockURL(_ key: Key, _ level: Level, _ block: Int) -> URL {
-        demDirectory.appendingPathComponent("\(key.name).L\(level).b\(block).pkdem")
+    private func blockURL(_ key: Key, _ level: Level, _ block: Int, _ source: Source = .copernicus) -> URL {
+        switch source {
+        case .copernicus: demDirectory.appendingPathComponent("\(key.name).L\(level).b\(block).pkdem")
+        case .usgs: groundDirectory.appendingPathComponent("USGS13_\(key.name).L\(level).b\(block).pkdem")
+        }
     }
 
-    private func seaURL(_ key: Key) -> URL {
-        demDirectory.appendingPathComponent(key.name + ".sea")
+    /// The version (ETag) of the file a USGS tile's header came from.
+    private func versionURL(_ key: Key, _ source: Source) -> URL {
+        headURL(key, source).appendingPathExtension("etag")
     }
 
-    private func fetch(_ url: URL, range: Range<Int>?) async throws -> (body: Data, response: HTTPURLResponse?) {
+    /// Marks a tile the bucket doesn't have.
+    private func seaURL(_ key: Key, _ source: Source = .copernicus) -> URL {
+        switch source {
+        case .copernicus: demDirectory.appendingPathComponent(key.name + ".sea")
+        case .usgs: groundDirectory.appendingPathComponent("USGS13_\(key.name).none")
+        }
+    }
+
+    /// With `ifMatch`, the server answers 412 rather than the bytes when the file isn't that
+    /// version any more.
+    private func fetch(_ url: URL, range: Range<Int>?, ifMatch: String? = nil) async throws -> (body: Data, response: HTTPURLResponse?) {
         var request = URLRequest(url: url)
         request.timeoutInterval = 60
         if let range { request.setValue("bytes=\(range.lowerBound)-\(range.upperBound - 1)", forHTTPHeaderField: "Range") }
+        if let ifMatch { request.setValue(ifMatch, forHTTPHeaderField: "If-Match") }
         let (data, response) = try await URLSession.shared.data(for: request)
         bytesDownloaded += data.count
         return (data, response as? HTTPURLResponse)
@@ -756,7 +861,7 @@ actor DataStore {
         for file in files where names.contains(String(file.lastPathComponent.prefix(7))) {
             try? FileManager.default.removeItem(at: file)
         }
-        for key in layouts.keys where names.contains(key.name) { layouts[key] = nil }
+        for id in layouts.keys where id.source == .copernicus && names.contains(id.key.name) { layouts[id] = nil }
         var keptCells = Set(others.flatMap(Self.landCoverCells))
         if let here { keptCells.formUnion(LandCoverCell.covering(GeoBox(around: here, radius: Self.hikeRadius + AppModel.coverMargin))) }
         for cell in Self.landCoverCells(area) where !keptCells.contains(cell) {
@@ -908,7 +1013,7 @@ actor DataStore {
 
     /// Deletes everything downloaded.
     func clear() {
-        for dir in [demDirectory, peakDirectory, trailDirectory, factDirectory, areaDirectory, coverDirectory] {
+        for dir in [demDirectory, peakDirectory, trailDirectory, factDirectory, areaDirectory, coverDirectory, groundDirectory] {
             try? FileManager.default.removeItem(at: dir)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }

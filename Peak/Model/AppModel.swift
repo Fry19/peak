@@ -123,6 +123,8 @@ final class AppModel {
         /// Line 0 is the main line, as `profile` has it.
         var runs: [[DrapedPoint]]?
         var profile: TrailProfile?
+        /// The terrain (`AppModel.sceneRevision`) the profile was worked out on.
+        var profileRevision: Int?
         /// Where the runs are seen from.
         var observer: GeoPoint?
 
@@ -246,9 +248,21 @@ final class AppModel {
     /// The best location so far, and the one the scene is built for.
     @ObservationIgnored private(set) var location: CLLocation?
     @ObservationIgnored private var center: CLLocation?
-    @ObservationIgnored private var tiles: [DataStore.Key: ElevationTile] = [:]
+    @ObservationIgnored private var tiles: [DataStore.Key: ElevationTile] = [:] {
+        didSet { terrainRevision += 1 }
+    }
     /// Sharper patches of tiles near the viewer, by tile and level.
-    @ObservationIgnored private var detail: [DataStore.Key: [Int: ElevationTile]] = [:]
+    @ObservationIgnored private var detail: [DataStore.Key: [Int: ElevationTile]] = [:] {
+        didSet { terrainRevision += 1 }
+    }
+    /// USGS 3DEP's bare ground near the viewer, by tile (`Terrain.ground`).
+    @ObservationIgnored private var ground: [DataStore.Key: ElevationTile] = [:] {
+        didSet { terrainRevision += 1 }
+    }
+    /// Counts up as the terrain changes, so the trail shown gets its climb again from it.
+    @ObservationIgnored private var terrainRevision = 0
+    /// The revision `scene` was built from.
+    @ObservationIgnored private var sceneRevision = 0
     @ObservationIgnored private var peaks: [Peak] = []
     @ObservationIgnored private var rebuilding = false
     @ObservationIgnored private var rebuildAgain = false
@@ -756,7 +770,9 @@ final class AppModel {
             return
         }
         draping = true
-        let known = arTrail?.profile
+        // A profile from before sharper terrain came in is worked out again.
+        let revision = sceneRevision
+        let known = arTrail?.profileRevision == revision ? arTrail?.profile : nil
         let here = tracker.progress != nil ? tracker.here : nil
         Task { @MainActor in
             let (profile, draped) = await Task.detached(priority: .utility) {
@@ -765,10 +781,14 @@ final class AppModel {
             }.value
             draping = false
             if arTrail?.trail.id == trail.id {
-                arTrail?.profile = profile
                 arTrail?.runs = draped.runs
                 arTrail?.observer = draped.observer
-                tracker.follow(trail, profile: profile)
+                // Sharper terrain came in meanwhile: the next drape works it out again.
+                if revision == sceneRevision {
+                    arTrail?.profile = profile
+                    arTrail?.profileRevision = revision
+                    tracker.follow(trail, profile: profile, replacing: known == nil)
+                }
             }
             if drapeAgain {
                 drapeAgain = false
@@ -938,6 +958,7 @@ final class AppModel {
                 if !keys.contains(key) { detail[key] = nil; continue }
                 for level in patches.keys where d > (level == 0 ? 25_000 : 60_000) { detail[key]?[level] = nil }
             }
+            for key in ground.keys where DataStore.distance(from: lat, lon, to: key) > 25_000 { ground[key] = nil }
             if tiles[here] == nil {
                 // Not loaded after all: tried again with a growing wait, when the connection
                 // comes back, and when Peak comes back to the front.
@@ -961,6 +982,7 @@ final class AppModel {
             await sharpen(keys, lat, lon, level: 1, radius: 35_000, generation: generation)
             let wide = generous ? keys : keys.filter { saved.contains($0) || DataStore.distance(from: lat, lon, to: $0) < 60_000 }
             await upgrade(wide, lat, lon, toLevel: 2, within: TerrainScene.radius + 50_000, generation: generation)
+            await sharpenGround(keys, lat, lon, radius: generous ? Self.groundDetail : Self.groundDetail / 2, generation: generation)
             if generous { await sharpen(keys, lat, lon, level: 0, radius: onWiFi ? 25_000 : 15_000, generation: generation) }
             guard !superseded else { return }
             // Tiles that failed further out (the passes above only reach so far on mobile data).
@@ -1088,10 +1110,40 @@ final class AppModel {
             do {
                 if let patch = try await store.patch(key, level: level, latitude: lat, longitude: lon, radius: radius) {
                     guard generation == loadGeneration else { return }
-                    // Keep an earlier patch only if it already covers all of this one (a wider
-                    // pass here); one from where you were before gives way.
-                    if let old = detail[key]?[level], Self.covers(old, patch) { continue }
+                    // Keep an earlier patch only if it already holds all of this one (a wider
+                    // pass here, with no blocks that failed then); one from where you were
+                    // before gives way.
+                    if let old = detail[key]?[level], await Self.holds(old, patch) { continue }
+                    guard generation == loadGeneration else { return }
                     detail[key, default: [:]][level] = patch
+                    changed = true
+                }
+            } catch {
+                continue   // keep what we have; the next visit tries again
+            }
+            bytesDownloaded = await store.bytesDownloaded
+        }
+        if changed { await rebuild() }
+    }
+
+    /// How far around you USGS 3DEP's bare ground is fetched, meters, on Wi-Fi or with terrain on
+    /// mobile data; half as far otherwise. About 25 MB for the whole radius, in 0.8 MB blocks.
+    static let groundDetail = 10_000.0
+
+    /// Fetches USGS 3DEP's bare ground for the part of each tile within `radius` of the
+    /// point, where USGS has it (elsewhere there's none, and nothing changes).
+    @MainActor private func sharpenGround(_ keys: [DataStore.Key], _ lat: Double, _ lon: Double, radius: Double,
+                                          generation: Int) async {
+        var changed = false
+        for key in keys where DataStore.distance(from: lat, lon, to: key) < radius {
+            guard generation == loadGeneration else { return }
+            do {
+                if let patch = try await store.patch(key, level: 0, latitude: lat, longitude: lon, radius: radius, source: .usgs) {
+                    guard generation == loadGeneration else { return }
+                    // Also gives way to a newer version of USGS's tile.
+                    if let old = ground[key], await Self.holds(old, patch) { continue }
+                    guard generation == loadGeneration else { return }
+                    ground[key] = patch
                     changed = true
                 }
             } catch {
@@ -1318,11 +1370,13 @@ final class AppModel {
             guard let center else { break }
             let lat = center.coordinate.latitude, lon = center.coordinate.longitude
             let detailTiles = detail.values.flatMap { $0.values }
+            let groundTiles = Array(ground.values)
+            let revision = terrainRevision
             // The base layer wherever no tile is in (yet), else nothing there.
             let terrain = baseLayer.map {
-                Terrain(tiles: Array(tiles.values), detail: detailTiles, base: $0, latitude: lat, longitude: lon,
+                Terrain(tiles: Array(tiles.values), detail: detailTiles, ground: groundTiles, base: $0, latitude: lat, longitude: lon,
                         radius: TerrainScene.radius + 10_000)
-            } ?? Terrain(tiles: Array(tiles.values), detail: detailTiles, missingIsSea: false)
+            } ?? Terrain(tiles: Array(tiles.values), detail: detailTiles, ground: groundTiles, missingIsSea: false)
             let peaks = self.peaks
             let accuracy = center.horizontalAccuracy
             // Only used on coarse ground, where it beats kilometers of averaged terrain.
@@ -1336,6 +1390,7 @@ final class AppModel {
             // Moved far on while building, or somewhere the terrain isn't in yet: not from the old spot.
             guard let now = self.center, now.distance(from: center) < Self.reloadDistance else { continue }
             scene = built
+            sceneRevision = revision
             sceneAccuracy = center.horizontalAccuracy
             refreshAlpenglow()
             updateCorrector()
@@ -1345,16 +1400,13 @@ final class AppModel {
         rebuilding = false
     }
 
-    /// 0 for a full 30 m tile, 1 for 60 m, 2 for 120 m, 3 for 240 m.
-    /// Whether patch `a` covers all of patch `b` (both of one tile, at one level).
-    private static func covers(_ a: ElevationTile, _ b: ElevationTile) -> Bool {
-        let ey = a.stepLatitude / 2, ex = a.stepLongitude / 2
-        return a.originLatitude + ey >= b.originLatitude &&
-            a.originLongitude - ex <= b.originLongitude &&
-            a.originLatitude - Double(a.rows - 1) * a.stepLatitude - ey <= b.originLatitude - Double(b.rows - 1) * b.stepLatitude &&
-            a.originLongitude + Double(a.cols - 1) * a.stepLongitude + ex >= b.originLongitude + Double(b.cols - 1) * b.stepLongitude
+    /// Whether patch `old` already holds all of `new` (`ElevationTile.holds`), checked off the
+    /// main thread.
+    private static func holds(_ old: ElevationTile, _ new: ElevationTile) async -> Bool {
+        await Task.detached(priority: .utility) { old.holds(new) }.value
     }
 
+    /// 0 for a full 30 m tile, 1 for 60 m, 2 for 120 m, 3 for 240 m.
     static func level(of tile: ElevationTile) -> Int {
         let pixel = tile.stepLatitude * 3600
         return pixel < 1.5 ? 0 : pixel < 3 ? 1 : pixel < 6 ? 2 : 3

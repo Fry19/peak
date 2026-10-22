@@ -25,6 +25,8 @@ The overlay costs the main thread about a millisecond a frame: the lines are dra
 
 **Tap a label or a dot** for the peak's card: elevation, prominence, distance, bearing, how far above you it is, its range, first ascent and a Wikipedia summary and picture, and the **hikes nearby**: OpenStreetMap hiking routes and named paths within 8 km of the summit, plus unnamed paths up to it, with length, climb, difficulty on the SAC scale (T1–T6) and how far the start is from you. Those that reach the summit come first. A hike's card has a map of it from above, drawn from the terrain on the phone and faintly tinted where OpenStreetMap maps glaciers, water, bare rock and scree (tap it for the full map: satellite imagery by default while there's a connection, or the terrain, a choice Peak keeps; zoom out to see where you are, or tap the arrow pointing your way; from there **Walk in 3D**, over the same imagery, or tinted the same way), an elevation profile and directions to the start. **Show on the mountain** lays the trail on the real slope in the camera view, leaving out the parts hidden behind nearer terrain.
 
+**The ground under trails, in the United States.** Copernicus is a surface model: in a forest its heights take in much of the trees, and at 30 m it rounds off sharp crests and fills narrow gullies. Within 10 km of you (5 km on mobile data unless terrain on mobile data is on), Peak also fetches USGS 3DEP's 10 m bare-earth terrain model and uses it for a hike's climb, descent and profile, what's left to climb while you walk it, the maps from above and the walk in 3D. On the 49 hikes of Mount Le Conte in the Smokies, climbs change by 9 m (median) and up to 36 m, and the lowest point of a hike comes out 19 m lower (median) under the trees. The camera view stays on Copernicus: skylines, ridgelines, labels, what is hidden, skyline matching and the trail drawn on the mountain, all seen from an eye on the same surface. A forested ridge's outline is its treetops, and drawing the trail on the bare ground needs the eye on the ground too: on the Alum Cave Trail, Copernicus puts it 23 m up, and with only the trail moved to the ground it was drawn up to 2.5° too low around you. Moving the eye for the whole view is for a later change, measured on photos. Elsewhere, there is no bare ground and nothing changes.
+
 **Labeled pictures.** Tap the pill to pause the view, then the **share button** beside it: the frame on screen opens full size, turned upright the way you held the phone, with the ridgelines and labels drawn in the picture's own resolution (labels scaled to it, with a soft halo so they read on snow and bright sky) and a small attribution line. Choose **Labels** or **Lines only**, then **save to Photos** (Peak only asks to add pictures, never to see your library) or **share**. Tap a label for the peak's card.
 
 **Label a photo** (Settings) does the same for a photo from your library, through the system photo picker, so Peak sees only the photo you pick. It reads where the photo was taken, which way the camera faced (true or magnetic; a magnetic heading gets the local declination from the IGRF model), the lens and the orientation; downloads the terrain and peaks there if they aren't on the phone; and matches the photo's skyline to correct the compass, pitch and roll. A photo without a heading is matched all the way around, and only counts when no other direction fits about as well. When there's no clear match, drag the lines onto the mountains and turn them with two fingers; **Done** then matches again from there, which snaps the lines onto the skyline when it can.
@@ -45,13 +47,13 @@ Labels stand upright in the world whichever way you hold the phone, even with th
 
 **Tap the pill** to pause the view so you can lower the phone and look; tap it again to go live. **Long-press the pill** for diagnostics (sensor rate, heading, corrections, last skyline match, GPS, terrain detail, lens, frame timing); a screenshot of them says a lot when something looks off. A light tick marks a labeled peak crossing the middle of the screen.
 
-**Downloads:** the Copernicus tiles have lower-resolution copies built in, and the full 30 m image is stored in blocks of about 2.5 MB. Peak starts downloading as soon as it has a rough position, fetching tiles at 240 m (about 0.6 MB each) and 120 m within 30 km (2 MB), all at once, and shows the view as soon as the tile you're in arrives. Then it sharpens the terrain block by block: the full 30 m within 10 km, 60 m within 35 km and 120 m everywhere, and 30 m within 15–25 km on Wi-Fi (or on mobile data, unless you turn that off). Peaks, hikes and land cover come from OpenStreetMap through the Overpass API, facts from Wikidata and Wikipedia. Land cover (`natural=glacier|water|bare_rock|scree`, `waterway=riverbank`) is fetched in 0.1° cells, a block of up to 3 by 3 per query, with each area's whole outline so its rings close, and kept in a compact form (about 80 KB a cell in the Alps, a sixth of the Overpass answer); it's fetched only with a signal, and drawn from what's on the phone without one. Everything is cached on the phone. Overpass searches ask two servers at once (the main one and OpenStreetMap France's) and take the first good answer, then try the others; a server that answers but reports the query ran out of time counts as busy, not as "no hikes". When the peaks can't be fetched (no signal, every server busy) and none are saved for the place, the pill says **Getting peaks…** and Peak tries again, after 10 s and then less often, up to once a minute.
+**Downloads:** the Copernicus tiles have lower-resolution copies built in, and the full 30 m image is stored in blocks of about 2.5 MB. Peak starts downloading as soon as it has a rough position, fetching tiles at 240 m (about 0.6 MB each) and 120 m within 30 km (2 MB), all at once, and shows the view as soon as the tile you're in arrives. Then it sharpens the terrain block by block: the full 30 m within 10 km, 60 m within 35 km and 120 m everywhere, then USGS 3DEP's bare ground in the United States (its 512-pixel blocks of about 0.8 MB, 25 MB for all 10 km), and 30 m within 15–25 km on Wi-Fi (or on mobile data, unless you turn that off). Peaks, hikes and land cover come from OpenStreetMap through the Overpass API, facts from Wikidata and Wikipedia. Land cover (`natural=glacier|water|bare_rock|scree`, `waterway=riverbank`) is fetched in 0.1° cells, a block of up to 3 by 3 per query, with each area's whole outline so its rings close, and kept in a compact form (about 80 KB a cell in the Alps, a sixth of the Overpass answer); it's fetched only with a signal, and drawn from what's on the phone without one. Everything is cached on the phone. Overpass searches ask two servers at once (the main one and OpenStreetMap France's) and take the first good answer, then try the others; a server that answers but reports the query ran out of time counts as busy, not as "no hikes". When the peaks can't be fetched (no signal, every server busy) and none are saved for the place, the pill says **Getting peaks…** and Peak tries again, after 10 s and then less often, up to once a minute.
 
 **First launch anywhere, without a signal:** the app bundles a worldwide base layer (`World.pkbase`, 47 MB): coarse terrain for the whole world and every named OpenStreetMap peak (about 700,000). Where nothing is on the phone yet and the terrain doesn't come within a few seconds (at once with no signal), the view is drawn from it, and the pill says **Coarse terrain**; the downloaded tiles replace it as they arrive. Its terrain is good for far skylines, not near ones, so on it Peak stands your eye at the GPS altitude rather than on kilometers of averaged ground, leaves the first 3 km out of the horizon, matches the skyline only where it is at least 20 km away (with wider expected errors), and shows peaks whose line of sight it can't settle (near ones, or ones just clearing a ridge) as dots, never as labeled in sight or hidden. The bundled peaks stand in the same way until OpenStreetMap answers.
 
 **Offline areas** (Settings): before a trip without a signal, pick a place on a map (search for, say, Great Smoky Mountains), choose a radius of 5–50 km and download it. Peak fetches what the view needs anywhere in the circle: 30 m terrain within 10 km of it, 60 m within 35 km, 120 m for everything that can be seen from it (80 km), the peaks in that range, the hikes of every peak in it, and the land cover around those hikes. The hikes are fetched in boxes of up to 30 km, so a large area doesn't run out of time on the server, with the unnamed paths up to every summit, as for a single peak. It shows the size first (about 70 MB for 25 km in the Smokies), the progress while downloading, and resumes a download that stopped, without fetching again what it already has (at launch and when the connection comes back; on mobile data only if terrain on mobile data is on). An area counts as saved only when everything was kept, so a full disk shows as a failure. Inside a saved area the peaks and hikes come from the phone, without waiting on the network; an area that stopped partway still lends what it has. With no signal outside an area, the peaks cached nearest you that reach this far are used. Deleting an area keeps the terrain another area, or the place you are, still uses.
 
-Not in 0.8 yet: a learned skyline detector, your position on a trail, and lidar terrain.
+Not in 0.8 yet: a learned skyline detector, and bare-ground terrain outside the United States.
 
 ## Installing on your iPhone
 
@@ -144,7 +146,14 @@ swift build -c release
 
 `--harder` renders the photos from perturbed terrain, matches against the app's mixed 30/60/120 m terrain (with summits raised to the peaks in `--peaks`, an Overpass answer) and adds lens distortion and rolling shutter; `--world`, `--match` and `--camera` turn these on one at a time. For the second site, fetch `--lat 35.654 --lon -83.444` into another directory and add `--scene smokies`.
 
-`fetch_dem.py` downloads Copernicus GLO-30 tiles from the public AWS bucket (about 40 MB per 1° tile; 8 tiles for 100 km in the Alps) and converts them to `.pkdem` files. Use a release build of `peakbench`: debug builds are 10–35× slower. On Linux, images are read and written as `.ppm`.
+`fetch_dem.py` downloads Copernicus GLO-30 tiles from the public AWS bucket (about 40 MB per 1° tile; 8 tiles for 100 km in the Alps) and converts them to `.pkdem` files. `fetch_ground.py` fetches USGS 3DEP's bare ground the way the app does, just the blocks within `--radius-km` (default 10), as one `.pkdem` patch per cell; `peakbench trails … --ground DIR` then compares each hike's climb and its line on the mountain with Copernicus alone:
+
+```
+python3 Tools/fetch_ground.py --lat 35.654 --lon -83.444 --out GROUND-smokies
+.build/release/peakbench trails hikes.json --lat 35.6543 --lon -83.4361 --dem ../DEM-smokies \
+    --ground ../GROUND-smokies --from-lat 35.611 --from-lon -83.425
+```
+ Use a release build of `peakbench`: debug builds are 10–35× slower. On Linux, images are read and written as `.ppm`.
 
 ![Depth panorama from Gornergrat, 180° to 360°: nearer terrain lighter, ridges in white. The Matterhorn is the pyramid in the middle.](docs/gornergrat-panorama.png)
 
@@ -201,7 +210,8 @@ Peak/                      The iPhone app (SwiftUI)
 PeakCore/                  Swift package, no iOS dependencies (builds on macOS and Linux)
   Sources/PeakCore/
     Geodesy.swift          WGS84, east-north-up frames, conformal-sphere rays
-    Terrain.swift          DEM tiles (.pkdem) with bilinear lookups across tile edges
+    Terrain.swift          DEM tiles (.pkdem) with bilinear lookups across tile edges, sharper
+                           patches, and bare ground (USGS 3DEP) for trails and maps
     Horizon.swift          Horizon renderer: skyline, depth envelope, ridges, line of sight
     Camera.swift           Pinhole camera and heading/pitch/roll attitude
     SkylineDetector.swift  Sky/terrain boundary per image column
@@ -210,8 +220,8 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
     Anchors.swift          True attitude of a real photo from marked summits; proposed anchors
     TerrainVariants.swift  Coarser (overview) and perturbed terrain, the app's mixed-detail terrain
     Scene.swift            Ridge segments to draw, visible peaks, trails laid on the terrain
-    GeoTIFF.swift          Reads Copernicus tiles, their built-in lower resolutions and single
-                           blocks (with Inflate.swift)
+    GeoTIFF.swift          Reads Copernicus and USGS 3DEP tiles, their built-in lower resolutions
+                           and single blocks (with Inflate.swift and LZW.swift)
     Peaks.swift            Peaks from OpenStreetMap's Overpass API
     Trails.swift           Hiking routes and paths: parsing, joining ways, elevation profiles
     PeakFacts.swift        Facts from Wikidata and Wikipedia
@@ -227,6 +237,7 @@ PeakCore/                  Swift package, no iOS dependencies (builds on macOS a
   Sources/peakbench/       The desk harness
   Tests/PeakCoreTests/     Unit tests on procedural terrain with known geometry
 Tools/fetch_dem.py         Downloads Copernicus tiles and writes .pkdem files
+Tools/fetch_ground.py      Downloads USGS 3DEP bare ground around a point as .pkdem patches
 Tools/fetch_base_layer.sh  Downloads World.pkbase from its GitHub Release (checksum pinned)
 Tools/fetch_world_peaks.py Every named OpenStreetMap peak and volcano, for the base layer
 Tools/build_base_layer.py  Builds the worldwide base layer (World.pkbase) from ETOPO 2022 and those peaks
@@ -275,9 +286,9 @@ Standing on the base layer's own ground instead puts the eye 155 m too low on th
 - Match the detected boundary against the rendered ridges too, not just the skyline. In haze, the far skyline can fade into the sky while a nearer ridge stays sharp.
 - A small Core ML sky segmentation model in place of the heuristic.
 - Try the app on a phone in the mountains, and tune matching on real camera frames.
-- Lidar terrain where it's free: swissALTI3D, and USGS 3DEP (10 m) in the US.
-- Your live position on a trail drawn in the view.
+- Bare ground in Switzerland from swissALTI3D (2 m, in the Swiss grid, so it needs reprojecting), and USGS 3DEP around a trail you open, not just around you.
+- The eye on the bare ground for the whole camera view, with the trail drawn on the ground, once photos in forest can tell how far it helps.
 
 ## Data and attribution
 
-Terrain: produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018, provided under COPERNICUS by the European Union and ESA; all rights reserved. Worldwide base layer: NOAA NCEI ETOPO 2022 (public domain, doi:10.25921/fd45-gt74). Peaks and trails: © OpenStreetMap contributors, available under the Open Database License (ODbL). The app shows both in small print under the status pill. Facts: Wikidata (CC0) and Wikipedia (CC BY-SA), credited on each peak's card and in Settings.
+Terrain: produced using Copernicus WorldDEM-30 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018, provided under COPERNICUS by the European Union and ESA; all rights reserved. Worldwide base layer: NOAA NCEI ETOPO 2022 (public domain, doi:10.25921/fd45-gt74). Bare ground in the United States: U.S. Geological Survey, 3D Elevation Program (public domain), credited in Settings, and on a hike's card, its map from above and its walk in 3D where it's used. Peaks and trails: © OpenStreetMap contributors, available under the Open Database License (ODbL). The app shows both in small print under the status pill. Facts: Wikidata (CC0) and Wikipedia (CC BY-SA), credited on each peak's card and in Settings.

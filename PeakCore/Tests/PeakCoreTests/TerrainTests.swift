@@ -135,6 +135,64 @@ final class TerrainTests: XCTestCase {
         XCTAssertEqual(filled[1].elevation, 1_234)
     }
 
+    /// A bare-ground patch (a 3DEP-like 10 m grid, the ground 20 m below a forested
+    /// surface) answers for the ground only; the surface the skylines are drawn from stays.
+    /// It blends into the surface over more than 8 of its pixels: 240 m of latitude, 168 m of
+    /// longitude here.
+    func testGroundPatchesAreForTheGroundOnly() throws {
+        let surface = ElevationTile(south: 45, west: 7, size: 120) { _, _ in 1_020 }
+        let step = 1.0 / 10_800
+        let patch = ElevationTile(south: 45, west: 7, rows: 400, cols: 400, originLatitude: 45.5, originLongitude: 7.5,
+                                  stepLatitude: step, stepLongitude: step,
+                                  heights: [Int16](repeating: 1_000, count: 160_000))
+        let plain = Terrain(tiles: [surface])
+        XCTAssertTrue(plain.ground === plain)
+        let terrain = Terrain(tiles: [surface], ground: [patch])
+        XCTAssertEqual(terrain.groundPatches.count, 1)
+        let middle = (latitude: 45.5 - 200 * step, longitude: 7.5 + 200 * step)
+        XCTAssertEqual(terrain.height(latitude: middle.latitude, longitude: middle.longitude), 1_020)
+        XCTAssertEqual(terrain.ground.height(latitude: middle.latitude, longitude: middle.longitude), 1_000)
+        XCTAssertEqual(terrain.ground.height(latitude: 45.2, longitude: 7.2), 1_020, "outside the patch")
+        // In from the patch's west edge: still blending 100 m in, all ground 300 m in.
+        func ground(_ meters: Double) -> Double {
+            terrain.ground.height(latitude: middle.latitude, longitude: 7.5 + meters / (111_320 * cos(middle.latitude * .pi / 180)))
+        }
+        XCTAssertEqual(ground(0), 1_020, accuracy: 0.01)
+        XCTAssertGreaterThan(ground(100), 1_005)
+        XCTAssertLessThan(ground(100), 1_015)
+        XCTAssertEqual(ground(300), 1_000, accuracy: 0.01)
+        let ramp = stride(from: 0.0, through: 300, by: 10).map(ground)
+        XCTAssertTrue(zip(ramp, ramp.dropFirst()).allSatisfy { $0 >= $1 })
+        // Without sea for missing tiles, too.
+        XCTAssertEqual(Terrain(tiles: [surface], ground: [patch], missingIsSea: false)
+            .ground.height(latitude: middle.latitude, longitude: middle.longitude), 1_000)
+    }
+
+    /// A patch already on hand is kept for a new one only when it holds every height of it:
+    /// not when the new one fills a block it's missing, or is a newer version of the data.
+    func testPatchHoldsAnother() {
+        func patch(rows: Int, cols: Int, row0: Int, col0: Int, _ value: (Int, Int) -> Int16) -> ElevationTile {
+            let step = 1.0 / 3600
+            var h = [Int16](repeating: 0, count: rows * cols)
+            for r in 0..<rows { for c in 0..<cols { h[r * cols + c] = value(row0 + r, col0 + c) } }
+            return ElevationTile(south: 45, west: 7, rows: rows, cols: cols, originLatitude: 46 - Double(row0) * step,
+                                 originLongitude: 7 + Double(col0) * step, stepLatitude: step, stepLongitude: step, heights: h)
+        }
+        let height = { (r: Int, c: Int) in Int16(1_000 + r + 2 * c) }
+        let wide = patch(rows: 40, cols: 40, row0: 0, col0: 0, height)
+        let inside = patch(rows: 10, cols: 10, row0: 12, col0: 20, height)
+        XCTAssertTrue(wide.holds(inside))
+        XCTAssertFalse(inside.holds(wide), "the wider one reaches past it")
+        let holed = patch(rows: 40, cols: 40, row0: 0, col0: 0) { r, c in r >= 12 && r < 16 ? ElevationTile.noData : height(r, c) }
+        XCTAssertFalse(holed.holds(inside), "a block it couldn't fetch then")
+        XCTAssertTrue(wide.holds(holed), "no data in the new one adds nothing")
+        let newer = patch(rows: 10, cols: 10, row0: 12, col0: 20) { r, c in height(r, c) + (r == 15 && c == 25 ? 3 : 0) }
+        XCTAssertFalse(wide.holds(newer), "a newer version of the data")
+        let coarser = ElevationTile(south: 45, west: 7, rows: 5, cols: 5, originLatitude: 46, originLongitude: 7,
+                                    stepLatitude: 2.0 / 3600, stepLongitude: 2.0 / 3600, heights: [Int16](repeating: 1_000, count: 25))
+        XCTAssertFalse(wide.holds(coarser), "another grid")
+    }
+
     func testPkdemRoundTrip() throws {
         let tile = ElevationTile(south: 46, west: 7, size: 90) { lat, lon in 100 * lat + 10 * lon }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("test-\(UUID()).pkdem")

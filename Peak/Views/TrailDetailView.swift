@@ -119,6 +119,8 @@ struct TrailDetailView: View {
             Section {
                 Text(trail.isPartial
                      ? "Part of a longer route; the map shows the part near \(peak.name)."
+                     : (place?.terrain ?? model.scene?.terrain)?.hasGround(under: trail) == true
+                     ? "Route © OpenStreetMap contributors. Climb from the USGS 3DEP and Copernicus terrain models."
                      : "Route © OpenStreetMap contributors. Climb from the Copernicus terrain model.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)

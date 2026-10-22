@@ -237,15 +237,15 @@ private extension Data {
 }
 
 extension Terrain {
-    /// Terrain from `tiles` and `detail` where they are, and the base layer's coarse tiles
-    /// for every other 1° cell within `radius` meters of a point.
-    public convenience init(tiles: [ElevationTile], detail: [ElevationTile] = [], base: BaseLayer,
-                            latitude: Double, longitude: Double, radius: Double) {
+    /// Terrain from `tiles`, `detail` and `ground` where they are, and the base layer's coarse
+    /// tiles for every other 1° cell within `radius` meters of a point.
+    public convenience init(tiles: [ElevationTile], detail: [ElevationTile] = [], ground: [ElevationTile] = [],
+                            base: BaseLayer, latitude: Double, longitude: Double, radius: Double) {
         let have = Set(tiles.map { $0.south * 1000 + $0.west })
         let fill = BaseLayer.cells(latitude: latitude, longitude: longitude, radius: radius)
             .filter { !have.contains($0.south * 1000 + $0.west) }
             .compactMap { base.tile(south: $0.south, west: $0.west) }
-        self.init(tiles: tiles + fill, detail: detail, missingIsSea: false)
+        self.init(tiles: tiles + fill, detail: detail, ground: ground, missingIsSea: false)
     }
 }
 
