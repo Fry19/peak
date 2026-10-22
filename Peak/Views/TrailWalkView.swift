@@ -40,7 +40,8 @@ enum TrailTerrainStyle {
 /// ridge crests glowing faintly, then tilts down behind the start, the crests fading as it
 /// nears the horizon, and walks the trail to its end.
 /// Pause to look around (drag to orbit, pinch to zoom); the slider moves along the trail.
-/// Drawn from the terrain already on the phone, so it works offline.
+/// Drawn from the terrain already on the phone, so it works offline; with satellite as the
+/// map's style and a connection, the imagery is laid over it instead of those colors.
 struct TrailWalkView: View {
     let model: AppModel
     let trail: AppModel.ARTrail
@@ -49,6 +50,11 @@ struct TrailWalkView: View {
     @State private var world: WalkWorld?
     @State private var player = WalkPlayer()
     @State private var failed = false
+    /// Satellite imagery over the terrain and the ring around it, kept for a sharper
+    /// rebuild of the same ground.
+    @State private var nearImagery: MapImagery?
+    @State private var farImagery: MapImagery?
+    @State private var draped = false
 
     var body: some View {
         ZStack {
@@ -66,13 +72,25 @@ struct TrailWalkView: View {
                 ProgressView()
                     .tint(.white)
             }
+            if draped {
+                // Imagery is bright in places (snow, the trail up close): shade the bottom so
+                // the controls and the credits stay readable.
+                VStack(spacing: 0) {
+                    Spacer()
+                    LinearGradient(colors: [.clear, .black.opacity(0.6)], startPoint: .top, endPoint: .bottom)
+                        .frame(height: 170)
+                }
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
             VStack(spacing: 0) {
                 WalkChip(model: model, trail: trail, world: world, player: player, onClose: onClose)
                     .padding(.top, 8)
                     .padding(.horizontal, 12)
                 Spacer()
                 if let world {
-                    WalkControls(world: world, player: player)
+                    WalkControls(world: world, player: player, draped: draped)
                         .padding(.horizontal, 16)
                         .padding(.bottom, 12)
                 }
@@ -84,6 +102,12 @@ struct TrailWalkView: View {
         .task(id: CoverKey(trail: trail.trail.id, online: model.online)) {
             await model.fetchCover(trail.trail, peak: model.peak(trail.peakID))
         }
+        // Over satellite imagery when that's the map's style and it loads; in the terrain's own
+        // colors otherwise, or until it does.
+        .task(id: DrapeKey(world: world.map(ObjectIdentifier.init), satellite: model.settings.mapStyle == .satellite,
+                           online: model.online)) {
+            await drape()
+        }
         // Land cover that arrives once the walk is under way tints the terrain where it stands.
         .task(id: [model.covers[trail.trail.id]?.revision ?? -1, world == nil ? 0 : 1]) {
             if let world, let cover = model.covers[trail.trail.id] { await world.tint(with: cover) }
@@ -94,6 +118,34 @@ struct TrailWalkView: View {
     private struct BuildKey: Equatable {
         var trail: String
         var terrain: ObjectIdentifier?
+    }
+
+    private struct DrapeKey: Equatable {
+        var world: ObjectIdentifier?
+        var satellite: Bool
+        var online: Bool
+    }
+
+    /// Loads what imagery is missing, the terrain's before the ring's, and lays each on as
+    /// it comes; a part that didn't load is tried again when the connection returns.
+    private func drape() async {
+        guard let world, model.settings.mapStyle == .satellite else { return }
+        if !world.draped {
+            if nearImagery.map({ !world.fits($0, ring: false) }) ?? true {
+                guard let loaded = await world.loadNearImagery(), !Task.isCancelled, self.world === world else { return }
+                nearImagery = loaded
+            }
+            await world.drape(near: nearImagery, far: nil)
+            guard !Task.isCancelled, self.world === world else { return }
+            draped = world.draped
+        }
+        if !world.ringDraped {
+            if farImagery.map({ !world.fits($0, ring: true) }) ?? true {
+                guard let loaded = await world.loadFarImagery(), !Task.isCancelled, self.world === world else { return }
+                farImagery = loaded
+            }
+            await world.drape(near: nil, far: farImagery)
+        }
     }
 
     private func build() async {
@@ -111,6 +163,7 @@ struct TrailWalkView: View {
         withAnimation(.easeOut(duration: 0.3)) {
             world = built
             failed = built == nil
+            draped = false
         }
     }
 }
@@ -141,10 +194,19 @@ final class WalkWorld: @unchecked Sendable {
     private let ground: SCNNode
     private let shades: GroundShades
     private var coverRevision: Int?
+    /// The coarser terrain around it, out to the haze.
+    private let ring: SCNNode
+    private let far: ReliefMap
+    /// Satellite imagery laid over the sharp terrain, and over the ring around it, instead of
+    /// their colors (changed on the main thread only). Each is laid once its imagery loads.
+    private(set) var draped = false
+    private(set) var ringDraped = false
+    /// How strongly the crest lines show: fainter over imagery, which shows the ridges itself.
+    private(set) var crestStrength: CGFloat = 1
 
     private init(scene: SCNScene, camera: SCNNode, walker: SCNNode, you: SCNNode, label: SCNNode?, crests: SCNNode, walk: TrailWalk,
                  relief: ReliefMap, profile: TrailProfile?, overhead: (eye: SIMD3<Double>, target: SIMD3<Double>), range: Double,
-                 ground: SCNNode, shades: GroundShades, coverRevision: Int?) {
+                 ground: SCNNode, shades: GroundShades, coverRevision: Int?, ring: SCNNode, far: ReliefMap) {
         self.scene = scene
         self.camera = camera
         self.walker = walker
@@ -159,6 +221,8 @@ final class WalkWorld: @unchecked Sendable {
         self.ground = ground
         self.shades = shades
         self.coverRevision = coverRevision
+        self.ring = ring
+        self.far = far
     }
 
     static let background = UIColor(red: 0.035, green: 0.043, blue: 0.058, alpha: 1)
@@ -243,7 +307,8 @@ final class WalkWorld: @unchecked Sendable {
         let hole = (low: SIMD2(-edge, -edge), high: SIMD2(edge, edge))
         let ground = terrainNode(relief, low: low, high: high, cover: cover.flatMap { landCover($0, on: relief) })
         scene.rootNode.addChildNode(ground.node)
-        scene.rootNode.addChildNode(terrainNode(wide, low: low, high: high, hole: hole, sink: 15).node)
+        let ring = terrainNode(wide, low: low, high: high, hole: hole, sink: 15).node
+        scene.rootNode.addChildNode(ring)
         let crests = SCNNode()
         for node in crestNodes(relief) + crestNodes(wide, outside: hole) { crests.addChildNode(node) }
         scene.rootNode.addChildNode(crests)
@@ -327,7 +392,7 @@ final class WalkWorld: @unchecked Sendable {
                         target: SIMD3(center.x, center.y, floor.isFinite ? floor : Double(low)))
         return WalkWorld(scene: scene, camera: camera, walker: walker, you: you, label: label, crests: crests, walk: walk, relief: relief,
                          profile: profile, overhead: overhead, range: range, ground: ground.node, shades: ground.shades,
-                         coverRevision: cover?.revision)
+                         coverRevision: cover?.revision, ring: ring, far: wide)
     }
 
     /// Land cover on the sharp terrain's grid. It fades out toward the terrain's edge, where
@@ -338,16 +403,99 @@ final class WalkWorld: @unchecked Sendable {
 
     /// Tints the terrain with land cover that arrived after it was built.
     @MainActor func tint(with cover: AppModel.TrailCover) async {
-        guard cover.revision != coverRevision, let old = ground.geometry else { return }
+        guard !draped, cover.revision != coverRevision, let old = ground.geometry else { return }
         coverRevision = cover.revision
         let relief = self.relief, shades = self.shades
         let colors = await Task.detached(priority: .userInitiated) {
             Self.colors(shades, cover: Self.landCover(cover, on: relief))
         }.value
+        // Imagery may have been laid over it meanwhile; that stays.
+        guard !draped, ground.geometry === old else { return }
         let geometry = SCNGeometry(sources: old.sources.filter { $0.semantic != .color } + [Self.colorSource(colors)],
                                    elements: old.elements)
         geometry.firstMaterial = old.firstMaterial
         ground.geometry = geometry
+    }
+
+    /// Where a terrain grid's corner points lie, map meters: what imagery laid over it covers.
+    static func imageryRect(_ relief: ReliefMap) -> CGRect {
+        CGRect(x: -relief.size.x / 2, y: -relief.size.y / 2, width: relief.size.x, height: relief.size.y)
+    }
+
+    /// Imagery for the sharp terrain, sharp enough for the walker's view up close (a few
+    /// meters a pixel on most hikes).
+    @MainActor func loadNearImagery() async -> MapImagery? {
+        let rect = Self.imageryRect(relief)
+        return try? await MapImagery.load(projection: relief.projection, rect: rect, width: Int(min(3_072, rect.width / 2)))
+    }
+
+    /// Imagery for the ring around it, out to the haze.
+    @MainActor func loadFarImagery() async -> MapImagery? {
+        try? await MapImagery.load(projection: far.projection, rect: Self.imageryRect(far), width: 1_536)
+    }
+
+    /// Whether `imagery` was made for the sharp terrain (`ring` false) or the ring.
+    func fits(_ imagery: MapImagery, ring: Bool) -> Bool {
+        let grid = ring ? far : relief
+        return imagery.rect == Self.imageryRect(grid) && imagery.center == grid.projection.center
+    }
+
+    /// Lays satellite imagery over the terrain in place of its colors, still lit by the sun
+    /// so the slopes keep their shape. Part of it lights itself, so slopes facing away from
+    /// the sun stay readable (the imagery has its own shadows), and even white stays below
+    /// the brightness that glows. The contours go; the crest lines fade, as on the map.
+    /// Either part may come alone; nothing changes if the task is cancelled first.
+    @MainActor func drape(near: MapImagery?, far ringImagery: MapImagery?) async {
+        func material(_ image: CGImage) -> SCNMaterial {
+            let material = SCNMaterial()
+            material.lightingModel = .lambert
+            // At most 0.48 × 1.4 (the sun) + 0.25 + a little ambient: under the 0.95 bloom.
+            material.diffuse.contents = image
+            material.diffuse.intensity = 0.48
+            material.emission.contents = image
+            material.emission.intensity = 0.25
+            for property in [material.diffuse, material.emission] {
+                property.mipFilter = .linear
+                property.maxAnisotropy = 8
+                property.wrapS = .clamp
+                property.wrapT = .clamp
+            }
+            return material
+        }
+        var parts: [(node: SCNNode, picture: MapImagery, ring: Bool)] = []
+        if !draped, let near, fits(near, ring: false) { parts.append((ground, near, false)) }
+        if !ringDraped, let ringImagery, fits(ringImagery, ring: true) { parts.append((ring, ringImagery, true)) }
+        for part in parts {
+            guard let old = part.node.geometry, let vertices = old.sources(for: .vertex).first else { continue }
+            let rect = part.picture.rect
+            // From each vertex's place (SceneKit's x east, z south) to the picture's: u west
+            // to east, v north to south.
+            let coordinates = await Task.detached(priority: .userInitiated) {
+                Self.textureCoordinates(vertices, rect: rect)
+            }.value
+            guard !Task.isCancelled, part.node.geometry === old, !(part.ring ? ringDraped : draped) else { return }
+            let geometry = SCNGeometry(sources: old.sources.filter { $0.semantic != .color } + [coordinates], elements: old.elements)
+            geometry.firstMaterial = material(part.picture.image)
+            part.node.geometry = geometry
+            if part.ring { ringDraped = true } else { draped = true; crestStrength = 0.35 }
+        }
+    }
+
+    private static func textureCoordinates(_ vertices: SCNGeometrySource, rect: CGRect) -> SCNGeometrySource {
+        let count = vertices.vectorCount, stride = vertices.dataStride, offset = vertices.dataOffset
+        var uvs = [Float](repeating: 0, count: 2 * count)
+        vertices.data.withUnsafeBytes { raw in
+            for i in 0..<count {
+                let base = offset + i * stride
+                let x = Double(raw.loadUnaligned(fromByteOffset: base, as: Float.self))
+                let z = Double(raw.loadUnaligned(fromByteOffset: base + 8, as: Float.self))
+                uvs[2 * i] = Float((x - rect.minX) / rect.width)
+                uvs[2 * i + 1] = Float((rect.maxY + z) / rect.height)
+            }
+        }
+        return SCNGeometrySource(data: uvs.withUnsafeBufferPointer { Data(buffer: $0) }, semantic: .texcoord, vectorCount: count,
+                                 usesFloatComponents: true, componentsPerVector: 2, bytesPerComponent: 4,
+                                 dataOffset: 0, dataStride: 8)
     }
 
     /// Faint contour lines on the ground, every 50 m with a stronger one every 250 m, drawn
@@ -750,7 +898,7 @@ final class WalkPlayer {
             // only crowd the trail; they fade out between 55° and 30° down.
             let down = Double(asin(max(-1, min(1, -pov.simdWorldFront.y)))) * 180 / .pi
             let t = min(1, max(0, (down - 30) / 25))
-            let opacity = CGFloat(t * t * (3 - 2 * t))
+            let opacity = CGFloat(t * t * (3 - 2 * t)) * world.crestStrength
             // Only what changed is set, so a still scene isn't drawn again.
             if abs(world.crests.opacity - opacity) > 1e-3 { world.crests.opacity = opacity }
             if world.crests.isHidden != (opacity < 0.01) { world.crests.isHidden = opacity < 0.01 }
@@ -852,13 +1000,17 @@ private struct WalkChip: View {
                     .font(.system(size: 12, weight: .semibold))
                     .frame(width: 28, height: 28)
                     .background(.white.opacity(0.15), in: Circle())
+                    // A full target around the smaller circle: a button takes taps only
+                    // within its label's frame. The chip's padding makes up for it, so the
+                    // circle sits where it did.
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .accessibilityLabel("Back to the view from above")
         }
         .foregroundStyle(.white)
         .padding(.leading, 14)
-        .padding(.trailing, 8)
-        .padding(.vertical, 8)
+        .padding(.vertical, 1)
         .frame(maxWidth: 420)
         .glassBackground(in: Capsule())
         .environment(\.colorScheme, .dark)
@@ -878,6 +1030,7 @@ private struct WalkChip: View {
 private struct WalkControls: View {
     let world: WalkWorld
     let player: WalkPlayer
+    let draped: Bool
 
     var body: some View {
         VStack(spacing: 8) {
@@ -899,9 +1052,10 @@ private struct WalkControls: View {
             Text(player.playing ? " " : "Drag to look around")
                 .font(.system(size: 11))
                 .foregroundStyle(.white.opacity(0.6))
-            Text("Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors")
+            Text((draped ? "Imagery © Apple Maps · " : "") + "Terrain © Copernicus DEM (DLR, Airbus) · Map data © OpenStreetMap contributors")
                 .font(.system(size: 9))
-                .foregroundStyle(.white.opacity(0.45))
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white.opacity(draped ? 0.7 : 0.45))
         }
     }
 }

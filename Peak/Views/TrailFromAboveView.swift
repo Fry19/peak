@@ -255,7 +255,10 @@ struct TrailFromAboveView: View {
             .frame(width: 30, height: 30)
             .background(Circle().fill(.ultraThinMaterial).overlay(Circle().fill(Color.glassTint)))
             .environment(\.colorScheme, .dark)
-            .tapArea()
+            // A menu's label takes taps only within its own frame (`tapArea` doesn't widen
+            // it), so the frame is a full target around the smaller circle.
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
         }
         .accessibilityLabel("Map style")
         .accessibilityValue(style.title)
