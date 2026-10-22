@@ -32,6 +32,15 @@ extension AppModel {
         var height: Double
         /// How long it took to build, for diagnostics.
         var seconds: Double
+        /// The live view (`sceneGeneration`) it's seen from, for its terrain in 3D.
+        var generation: Int
+    }
+
+    /// The terrain in 3D around a live view, shared by its views from above.
+    struct RiseMesh {
+        var mesh: PanoramaMesh
+        var generation: Int
+        var seconds: Double
     }
 
     /// The views from above and the work under way.
@@ -40,6 +49,9 @@ extension AppModel {
         var views: [RisenView?] = []
         /// The views of the live view before last, shown while new ones are built.
         var stale: [RisenView?] = []
+        /// The terrain in 3D for `views`, and every generation still used by `stale`.
+        var mesh: RiseMesh?
+        var staleMeshes: [RiseMesh] = []
         /// The live view (`sceneGeneration`) `views` are seen from.
         var generation = -1
         /// The height to climb to: 1 at first, one more each `dwell` while held.
@@ -51,6 +63,12 @@ extension AppModel {
         /// The view for height `i`, or the stale one while it's built again.
         func view(_ i: Int) -> RisenView? {
             (i < views.count ? views[i] : nil) ?? (i < stale.count ? stale[i] : nil)
+        }
+
+        /// The terrain in 3D seen from the same spot as views of `generation`.
+        func mesh(for generation: Int) -> RiseMesh? {
+            if let mesh, mesh.generation == generation { return mesh }
+            return staleMeshes.first { $0.generation == generation }
         }
     }
 
@@ -78,6 +96,11 @@ extension AppModel {
     /// The view from above on screen, if risen.
     var risenView: RisenView? {
         rise.level > 0 ? riseWork.view(rise.level - 1) : nil
+    }
+
+    /// The terrain in 3D under the view from above on screen, once it's built.
+    var risenMesh: RiseMesh? {
+        risenView.flatMap { riseWork.mesh(for: $0.generation) }
     }
 
     /// What the overlay draws: the view from above while risen, else the live view.
@@ -134,6 +157,8 @@ extension AppModel {
         riseWork.build = nil
         riseWork.views = []
         riseWork.stale = []
+        riseWork.mesh = nil
+        riseWork.staleMeshes = []
         riseWork.generation = -1
     }
 
@@ -217,13 +242,26 @@ extension AppModel {
             riseWork.build = nil
             // Shown until the new ones are in, if they're for the same heights.
             riseWork.stale = riseWork.heights == heights ? riseWork.views.indices.map { riseWork.view($0) } : []
+            // Rebuilds may overlap: some heights can still be two generations old.
+            let generations = Set(riseWork.stale.compactMap { $0?.generation })
+            riseWork.staleMeshes = ([riseWork.mesh].compactMap { $0 } + riseWork.staleMeshes)
+                .filter { generations.contains($0.generation) }
+            riseWork.mesh = nil
             riseWork.views = Array(repeating: nil, count: heights.count)
             riseWork.heights = heights
             riseWork.generation = sceneGeneration
         }
-        guard riseWork.build == nil, riseWork.views.contains(where: { $0 == nil }) else { return }
+        guard riseWork.build == nil, riseWork.views.contains(where: { $0 == nil }) || riseWork.mesh == nil else { return }
         let generation = sceneGeneration
         riseWork.build = Task { @MainActor [weak self] in
+            // The terrain in 3D first: it's quick, and every height uses it.
+            if let self, self.riseWork.mesh == nil {
+                let started = Date()
+                let mesh = await Task.detached(priority: .userInitiated) { scene.panorama() }.value
+                guard !Task.isCancelled, self.riseWork.generation == generation else { return }
+                self.riseWork.mesh = RiseMesh(mesh: mesh, generation: generation, seconds: Date().timeIntervalSince(started))
+                self.screen?.overlay.setNeedsUpdate()
+            }
             for (i, height) in heights.enumerated() {
                 guard let self, !Task.isCancelled, self.riseWork.generation == generation else { return }
                 if self.riseWork.views[i] != nil { continue }
@@ -234,7 +272,7 @@ extension AppModel {
                         guard !up.uncertain.contains(id), let below = scene.allPeaks[id] else { return false }
                         return !below.isVisible && !below.isUncertain
                     })
-                    return RisenView(scene: up, revealed: revealed, height: height, seconds: 0)
+                    return RisenView(scene: up, revealed: revealed, height: height, seconds: 0, generation: generation)
                 }.value
                 guard !Task.isCancelled, self.riseWork.generation == generation else { return }
                 var built = view
@@ -247,6 +285,7 @@ extension AppModel {
             if let self, self.riseWork.generation == generation {
                 self.riseWork.build = nil
                 self.riseWork.stale = []
+                self.riseWork.staleMeshes = []
             }
         }
     }
@@ -254,8 +293,11 @@ extension AppModel {
     /// For diagnostics: how long each view from above took.
     var riseDiagnostics: String? {
         let built = riseWork.views.compactMap { $0 }
-        guard !built.isEmpty else { return nil }
-        return "from above: " + built.map {
+        guard !built.isEmpty || riseWork.mesh != nil else { return nil }
+        let mesh = riseWork.mesh.map {
+            String(format: "3D %.2f s, %ld k triangles; ", $0.seconds, $0.mesh.indices.count / 3_000)
+        } ?? ""
+        return "from above: " + mesh + built.map {
             String(format: "%@ %.2f s, %ld more", Format.elevation($0.height, settings.units), $0.seconds, $0.revealed.count)
         }.joined(separator: "; ")
     }
