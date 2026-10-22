@@ -11,6 +11,11 @@ struct PhotoView: View {
     @Environment(\.displayScale) private var displayScale
     @State private var card: PeakLink?
     @State private var lastDrag = CGSize.zero
+    /// A label being dragged onto its summit, and where the summit is from the finger, in
+    /// the picture's pixels; `dragging` once a drag has begun.
+    @State private var pinDrag: (id: Int64, offset: CGVector)?
+    @State private var dragging = false
+    @State private var lastDragEnd = Date.distantPast
     @State private var lastTwist = Angle.zero
     @State private var saving = false
     @State private var toast: String?
@@ -62,8 +67,10 @@ struct PhotoView: View {
     }
 
     private func overlay(selected: Bool = true) -> PhotoOverlay? {
-        photo.overlay(units: model.settings.units, ridges: model.settings.showRidges, maxLabels: model.settings.labels.maxLabels,
-                      selected: selected)
+        var o = photo.overlay(units: model.settings.units, ridges: model.settings.showRidges,
+                              maxLabels: model.settings.labels.maxLabels, selected: selected)
+        if selected { o?.pinned = Set(photo.pins.pins.map(\.id)) }
+        return o
     }
 
     // MARK: The picture
@@ -86,6 +93,7 @@ struct PhotoView: View {
                             cg.scaleBy(x: scale, y: scale)
                             overlay.draw(in: cg, labels: labels)
                         }
+                        drawPins(in: context, scale: scale)
                     }
                     .frame(width: shown.width, height: shown.height)
                     .allowsHitTesting(false)
@@ -96,37 +104,96 @@ struct PhotoView: View {
             .gesture(SpatialTapGesture().onEnded { tapped($0.location, scale: scale) })
             .simultaneousGesture(drag(scale: scale))
             .simultaneousGesture(twist)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(photo.adjusting ? "Picture being lined up" : "Picture")
+            .accessibilityActions {
+                if photo.adjusting {
+                    Button("Name the peak in the middle") {
+                        photo.pickSummit(at: CGPoint(x: size.width / 2, y: size.height / 2))
+                    }
+                }
+            }
             .position(x: geo.size.width / 2, y: geo.size.height / 2)
         }
     }
 
-    /// A label under the finger opens its peak's card.
-    private func tapped(_ location: CGPoint, scale: Double) {
-        guard !photo.adjusting, let overlay = overlay() else { return }
-        let p = CGPoint(x: location.x / scale, y: location.y / scale)
+    /// Pinned summits as amber rings, and a dashed one on a spot waiting to be named, in
+    /// points over the picture shown `scale` times its pixels.
+    private func drawPins(in context: GraphicsContext, scale: Double) {
+        guard photo.adjusting, let k = photo.camera?.intrinsics else { return }
+        var shadowed = context
+        shadowed.addFilter(.shadow(color: .black.opacity(0.7), radius: 2))
+        for pin in photo.pins.pins {
+            let p = pin.pixel(k)
+            let c = CGPoint(x: p.x * scale, y: p.y * scale)
+            shadowed.stroke(Path(ellipseIn: CGRect(x: c.x - 9, y: c.y - 9, width: 18, height: 18)), with: .color(.amber),
+                            lineWidth: 2)
+            shadowed.fill(Path(ellipseIn: CGRect(x: c.x - 1.5, y: c.y - 1.5, width: 3, height: 3)), with: .color(.amber))
+        }
+        if let pick = photo.summitPick?.point {
+            let c = CGPoint(x: pick.x * scale, y: pick.y * scale)
+            shadowed.stroke(Path(ellipseIn: CGRect(x: c.x - 11, y: c.y - 11, width: 22, height: 22)), with: .color(.white),
+                            style: StrokeStyle(lineWidth: 2, dash: [4, 3]))
+        }
+    }
+
+    /// The label within reach of `p` (the picture's pixels).
+    private func label(at p: CGPoint) -> PhotoOverlay.Placed? {
+        guard let overlay = overlay() else { return nil }
         let reach = 12 * overlay.unit
-        guard let hit = overlay.labels().first(where: { $0.hitRect.insetBy(dx: -reach, dy: -reach).contains(p) }) else { return }
+        return overlay.labels().first { $0.hitRect.insetBy(dx: -reach, dy: -reach).contains(p) }
+    }
+
+    /// A label under the finger opens its peak's card; lining up, a tap marks a summit to name.
+    private func tapped(_ location: CGPoint, scale: Double) {
+        // The end of a drag isn't a tap.
+        guard !dragging, Date().timeIntervalSince(lastDragEnd) > 0.3 else { return }
+        let p = CGPoint(x: location.x / scale, y: location.y / scale)
+        if photo.adjusting {
+            photo.pickSummit(at: p)
+            return
+        }
+        guard let hit = label(at: p) else { return }
         UISelectionFeedbackGenerator().selectionChanged()
         photo.selectedID = hit.id
         card = PeakLink(id: hit.id)
     }
 
-    /// While lining up: the lines follow the finger.
+    /// A drag that starts on a label puts that summit where it's dropped (and starts lining
+    /// up); otherwise, while lining up, the lines follow the finger.
     private func drag(scale: Double) -> some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
-                guard photo.adjusting else { return }
+                if !dragging {
+                    dragging = true
+                    let start = CGPoint(x: value.startLocation.x / scale, y: value.startLocation.y / scale)
+                    pinDrag = photo.stage == .ready ? label(at: start).map {
+                        ($0.id, CGVector(dx: $0.point.x - start.x, dy: $0.point.y - start.y))
+                    } : nil
+                }
+                if let pinDrag {
+                    photo.pin(pinDrag.id, at: CGPoint(x: value.location.x / scale + pinDrag.offset.dx,
+                                                      y: value.location.y / scale + pinDrag.offset.dy))
+                    return
+                }
+                // Pinned summits hold the lines; a drag that misses a label mustn't undo them.
+                guard photo.adjusting, photo.pins.isEmpty else { return }
                 let d = CGSize(width: value.translation.width - lastDrag.width, height: value.translation.height - lastDrag.height)
                 lastDrag = value.translation
                 photo.adjust(dx: d.width / scale, dy: d.height / scale, twist: 0)
             }
-            .onEnded { _ in lastDrag = .zero }
+            .onEnded { _ in
+                lastDrag = .zero
+                dragging = false
+                lastDragEnd = Date()
+                pinDrag = nil
+            }
     }
 
     private var twist: some Gesture {
         RotateGesture()
             .onChanged { value in
-                guard photo.adjusting else { return }
+                guard photo.adjusting, pinDrag == nil, photo.pins.isEmpty else { return }
                 let d = value.rotation - lastTwist
                 lastTwist = value.rotation
                 photo.adjust(dx: 0, dy: 0, twist: d.radians)
@@ -166,6 +233,12 @@ struct PhotoView: View {
         case .failed:
             return nil
         case .ready:
+            if photo.adjusting {
+                return AnyView(Group {
+                    Circle().fill(Color.cyan).frame(width: 7, height: 7)
+                    Text("Lining up by hand")
+                })
+            }
             if photo.snapping {
                 return AnyView(Group {
                     ProgressView().controlSize(.small).tint(.white)
@@ -223,8 +296,7 @@ struct PhotoView: View {
                     .font(.system(size: 13))
                     .foregroundStyle(.white.opacity(0.75))
             }
-            Text("Drag the lines onto the mountains. Turn with two fingers to level them.")
-                .font(.system(size: 14, weight: .medium))
+            SummitPinsBanner(pins: photo.pins.pins, misfit: photo.pinsMisfit, tilt: photo.pinsTilt) { photo.unpin($0) }
             HStack(spacing: 12) {
                 Button("Cancel") { photo.cancelAdjusting() }
                     .buttonStyle(.bordered)
@@ -240,6 +312,12 @@ struct PhotoView: View {
         .frame(maxWidth: 420)
         .glassBackground(in: RoundedRectangle(cornerRadius: 18))
         .environment(\.colorScheme, .dark)
+        .sheet(item: $photo.summitPick) { pick in
+            SummitPicker(pick: pick, units: model.settings.units) { photo.pin($0.id, at: pick.point) }
+                .presentationDetents([.medium, .large])
+                .presentationBackground(.sheetBackground)
+                .tint(.amber)
+        }
     }
 
     private var actions: some View {

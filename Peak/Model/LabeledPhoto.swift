@@ -46,11 +46,21 @@ final class LabeledPhoto: Identifiable {
     private(set) var snapping = false
     /// A note on how the lines were placed, shown once things are ready.
     var note: String?
+    /// Summits pinned where they really are while lining up, in the picture's pixels, and
+    /// whether they fit one view and set its tilt.
+    private(set) var pins = SummitPins()
+    private(set) var pinsMisfit = false
+    private(set) var pinsTilt = false
+    /// A spot tapped while lining up, to name its peak.
+    var summitPick: SummitPick?
 
     /// For matching: the camera from the metadata, and the picture shrunk.
     @ObservationIgnored private var photoCamera: PhotoCamera?
     @ObservationIgnored private var small: RGBImage?
     @ObservationIgnored private var beforeAdjusting: Camera?
+    /// Counts the times lining up by hand began, so a match started before the latest one
+    /// doesn't move lines put by hand since.
+    @ObservationIgnored private var adjustments = 0
 
     private init(fromCamera: Bool, stage: Stage) {
         self.fromCamera = fromCamera
@@ -161,8 +171,11 @@ final class LabeledPhoto: Identifiable {
     @MainActor private func match(near: Attitude? = nil) async {
         guard let image, let small, let photoCamera, let scene else { return }
         let horizon = scene.matchingHorizon
+        let started = adjustments
         let m = await Task.detached(priority: .userInitiated) { photoCamera.match(small, horizon: horizon, near: near) }.value
         let a = m.alignment
+        // Lined up by hand again meanwhile: that wins.
+        if near != nil, adjusting || adjustments != started { return }
         if a.accepted {
             camera = Camera(intrinsics: a.intrinsics.scaled(toWidth: image.width, height: image.height), attitude: a.attitude)
             fit = .matched
@@ -188,6 +201,8 @@ final class LabeledPhoto: Identifiable {
     func startAdjusting() {
         beforeAdjusting = camera
         adjusting = true
+        adjustments += 1
+        snapping = false
     }
 
     /// Moves the lines by a drag (in the picture's pixels) or a twist (radians): they follow
@@ -204,19 +219,60 @@ final class LabeledPhoto: Identifiable {
     func cancelAdjusting() {
         if let beforeAdjusting { camera = beforeAdjusting }
         adjusting = false
+        clearPins()
+    }
+
+    /// Lines the picture up by a peak: its summit belongs at `point` (the picture's pixels).
+    /// Pinning starts lining up by hand.
+    func pin(_ peakID: Int64, at point: CGPoint) {
+        guard let camera, let v = scene?.allPeaks[peakID], v.isVisible else { return }
+        if !adjusting { startAdjusting() }
+        let k = camera.intrinsics
+        pins.pin(SummitPins.Pin(id: peakID, name: v.peak.name, azimuth: v.azimuth, elevation: v.elevation,
+                                u: (point.x - k.cx) / k.fx, v: (point.y - k.cy) / k.fy), current: camera.attitude)
+        applyPins()
+    }
+
+    /// Takes a pin away; with none left, the lines go back to where they were before the first.
+    func unpin(_ peakID: Int64) {
+        pins.remove(peakID)
+        applyPins()
+        if pins.isEmpty { clearPins() }
+    }
+
+    func clearPins() {
+        pins.removeAll()
+        pinsMisfit = false
+        pinsTilt = false
+        summitPick = nil
+    }
+
+    /// The peaks that could be at `point` (the picture's pixels), to choose from.
+    func pickSummit(at point: CGPoint) {
+        guard adjusting, let camera, let scene else { return }
+        summitPick = SummitPick(point: point, camera: camera, peaks: scene.peaks)
+    }
+
+    private func applyPins() {
+        guard let k = camera?.intrinsics, let solved = pins.solve(intrinsics: k) else { return }
+        pinsMisfit = solved.misfit
+        pinsTilt = solved.tilt
+        camera?.attitude = solved.attitude
     }
 
     /// Done lining up: a photo from the library is matched again from here, which snaps the
     /// lines exactly onto the skyline when it can.
     @MainActor func finishAdjusting() {
         adjusting = false
+        clearPins()
         guard camera != beforeAdjusting else { return }
         fit = .linedUp
         guard !fromCamera, let near = camera?.attitude else { return }
         snapping = true
+        let started = adjustments
         Task { @MainActor in
             await match(near: near)
-            snapping = false
+            if adjustments == started { snapping = false }
         }
     }
 

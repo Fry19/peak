@@ -39,6 +39,9 @@ struct PhotoOverlay {
     var maxLabels = 10
     /// Highlighted while its card is open (on screen only, never in what's saved).
     var selectedID: Int64?
+    /// Summits pinned while lining up by hand: labeled whatever their rank, to show they're
+    /// on their pins.
+    var pinned: Set<Int64> = []
     /// Device pixels per picture pixel where it's drawn: shadows are blurred in device
     /// pixels, whatever the context's scale (1 when saving at full size).
     var deviceScale: CGFloat = 1
@@ -67,14 +70,15 @@ struct PhotoOverlay {
         var candidates: [LabelLayout.Candidate] = []
         var drafts: [Int64: Placed] = [:]
         for v in scene.peaks where abs(azimuthDifference(v.azimuth, camera.attitude.heading)) < 90 {
-            guard candidates.count < maxLabels * 4 || v.id == selectedID,
+            guard candidates.count < maxLabels * 4 || v.id == selectedID || pinned.contains(v.id),
                   let p = projector.pixel(azimuth: v.azimuth, elevation: v.elevation) else { continue }
             let point = CGPoint(x: p.x, y: p.y)
             guard inside.contains(point) else { continue }
             let draft = Self.place(v.peak, at: point, units: units, selected: v.id == selectedID, unit: u)
             drafts[v.id] = draft
             candidates.append(LabelLayout.Candidate(
-                id: v.id, x: p.x, y: p.y, score: v.id == selectedID ? .infinity : scene.scores[v.id] ?? 0,
+                id: v.id, x: p.x, y: p.y,
+                score: v.id == selectedID ? .infinity : pinned.contains(v.id) ? 1e9 : scene.scores[v.id] ?? 0,
                 box: LabelBox(minX: draft.box.minX, minY: draft.box.minY, maxX: draft.box.maxX, maxY: draft.box.maxY),
                 isSelected: v.id == selectedID))
         }
