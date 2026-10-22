@@ -63,6 +63,12 @@ peakbench: desk test harness for skyline matching.
       The terrain seen from above around a point, as the app draws it under a trail:
       hillshade and ridge crests. Prints how long each step takes and what it found.
 
+  peakbench viewshed --dem DIR --lat L --lon L [--ele M] [--radius-km K] [--cell M] [--image FILE]
+      Everywhere a person on the ground can see a summit from. --ele is the summit's height
+      (default: the highest terrain within 100 m). Prints the area, how long it took and,
+      near the Matterhorn, whether known places see it. --image draws it over a hillshade:
+      visible ground tinted, unknown ground hatched.
+
   peakbench sun --dem DIR --lat L --lon L [--date YYYY-MM-DD] [--tz ZONE]
                 [--peak-lat L --peak-lon L --peak-ele M]
       When the sun comes into and goes out of sight over the real terrain, against the
@@ -858,6 +864,88 @@ func reliefCommand(_ args: Arguments) throws {
     print("Wrote \(path)")
 }
 
+// MARK: - Viewshed
+
+/// Places around the Matterhorn and whether they see it: true for the classic views, false
+/// for spots tucked behind nearer ridges.
+let matterhornChecks: [(name: String, at: LatLon, sees: Bool?)] = [
+    ("Zermatt, church", LatLon(46.0200, 7.7486), true),
+    ("Gornergrat", LatLon(45.9833, 7.7845), true),
+    ("Schwarzsee", LatLon(45.9917, 7.7083), true),
+    ("Breuil-Cervinia", LatLon(45.9353, 7.6303), true),
+    ("Theodul Pass", LatLon(45.9433, 7.7097), true),
+    ("Weisshorn summit", LatLon(46.1013, 7.7163), true),
+    ("Dufourspitze", LatLon(45.9369, 7.8668), true),
+    ("Täsch", LatLon(46.0700, 7.7780), nil),
+    ("St. Niklaus", LatLon(46.1770, 7.8040), false),
+    ("Visp", LatLon(46.2930, 7.8820), false),
+    ("Saas-Fee", LatLon(46.1090, 7.9280), false),
+    ("Valtournenche village", LatLon(45.8770, 7.6240), nil),
+    ("Aosta", LatLon(45.7370, 7.3200), nil),
+]
+
+func viewshedCommand(_ args: Arguments) throws {
+    let terrain = try loadTerrain(args.string("dem"))
+    let lat = try args.required("lat"), lon = try args.required("lon")
+    var settings = ViewshedSettings()
+    if let km = args.double("radius-km") { settings.radius = km * 1000 }
+    if let cell = args.double("cell") { settings.cellSize = cell }
+    let ele = args.double("ele") ?? HorizonRenderer(terrain: terrain).groundHeight(latitude: lat, longitude: lon, within: 100)
+    let summit = GeoPoint(latitude: lat, longitude: lon, height: ele)
+    // Once to warm up, once to time.
+    _ = Viewshed.compute(terrain: terrain, summit: summit, settings: settings)
+    let v = timed("Viewshed") { Viewshed.compute(terrain: terrain, summit: summit, settings: settings) }
+    print("Summit \(f(ele, 0)) m; \(v.cols)×\(v.rows) cells of \(f(v.cellSize, 0)) m, radius \(f(v.radius / 1000, 1)) km")
+    print("Seen from \(f(v.visibleArea / 1e6, 0)) km² (\(f(100 * v.visibleArea / (.pi * v.radius * v.radius), 1))% of the disc); " +
+          "terrain known for \(f(100 * v.knownShare, 1))%")
+    var wrong = 0
+    for check in matterhornChecks {
+        guard let sight = v.sight(from: check.at, terrain: terrain), sight.distance <= v.radius else { continue }
+        let sees = sight.cell == .visible
+        let verdict = check.sees.map { $0 == sees ? "ok" : "WRONG" } ?? "?"
+        if check.sees != nil, check.sees != sees { wrong += 1 }
+        print("  \(check.name.padding(toLength: 22, withPad: " ", startingAt: 0)) \(f(sight.distance / 1000, 1).leftPad(5)) km  " +
+              "\(signed(sight.elevation, 2).leftPad(6))°  \(String(describing: sight.cell).padding(toLength: 8, withPad: " ", startingAt: 0)) \(verdict)")
+    }
+    if wrong > 0 { print("\(wrong) known places disagree") }
+
+    guard let path = args.string("image") else { return }
+    let size = Double(v.cols - 1) * v.cellSize
+    let relief = ReliefMap(terrain: terrain, extent: MapExtent(center: LatLon(lat, lon), width: size, height: size), cellSize: v.cellSize)
+    let shade = relief.hillshade(exaggeration: 1.3)
+    var image = RGBImage(width: v.cols, height: v.rows, fill: (9, 11, 16))
+    for r in 0..<v.rows {
+        for c in 0..<v.cols {
+            let s = r < relief.rows && c < relief.cols ? Double(shade[r * relief.cols + c]) : .nan
+            let base = s.isFinite ? 10 + 70 * s : 6
+            var rgb = (base * 0.86, base * 0.94, base * 1.08)
+            switch v.cell(row: r, col: c) {
+            case .visible: rgb = (rgb.0 * 0.55 + 120, rgb.1 * 0.55 + 96, rgb.2 * 0.55 + 52)
+            case .unknown: if (r + c) % 8 < 2 { rgb = (70, 74, 82) }
+            case .hidden, .outside: break
+            }
+            image.set(c, r, (UInt8(min(255, rgb.0)), UInt8(min(255, rgb.1)), UInt8(min(255, rgb.2))))
+        }
+    }
+    func pixel(_ p: LatLon) -> (Int, Int) {
+        let xy = v.projection.point(p)
+        return (v.cols / 2 + Int((xy.x / v.cellSize).rounded()), v.rows / 2 - Int((xy.y / v.cellSize).rounded()))
+    }
+    for (x, y) in [pixel(LatLon(lat, lon))] + matterhornChecks.map({ pixel($0.at) }) {
+        for d in -4...4 {
+            for (px, py) in [(x + d, y), (x, y + d)] where px >= 0 && px < v.cols && py >= 0 && py < v.rows {
+                image.set(px, py, (255, 255, 255))
+            }
+        }
+    }
+    try saveImage(image, to: path)
+    print("Wrote \(path)")
+}
+
+extension String {
+    func leftPad(_ n: Int) -> String { String(repeating: " ", count: max(0, n - count)) + self }
+}
+
 // MARK: - main
 
 let argv = CommandLine.arguments
@@ -882,6 +970,7 @@ do {
     case "sun": try sunCommand(args)
     case "relief": try reliefCommand(args)
     case "base": try baseCommand(args)
+    case "viewshed": try viewshedCommand(args)
     case "case": try caseCommand(args)
     case "help", "-h", "--help": print(usage)
     default:
