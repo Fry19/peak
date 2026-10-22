@@ -14,9 +14,10 @@ public struct PanoramaMeshSettings: Sendable {
     public var relativeStep = 0.01
     /// Atmospheric refraction, as for the horizon (`HorizonSettings.refraction`).
     public var refraction = 0.13
-    /// The light the slopes are shaded by: the usual north-west, 45° up.
+    /// The light the slopes are shaded by: the usual north-west, but low, 30° up, so the
+    /// relief shows seen from the side as well as from above.
     public var lightAzimuth = 315.0
-    public var lightAltitude = 45.0
+    public var lightAltitude = 30.0
     /// How bright ground facing away from the light still is, 0 to 1.
     public var ambient: Float = 0.3
 

@@ -37,7 +37,7 @@ final class PanoramaMeshTests: XCTestCase {
             }
         }
         // Flat ground is lit as by the light's altitude.
-        let flatShade = 0.3 + 0.7 * Float(sin(45 * Double.pi / 180))
+        let flatShade = settings.ambient + (1 - settings.ambient) * Float(sin(settings.lightAltitude * .pi / 180))
         XCTAssertEqual(mesh.vertex(ray: 3, ring: 100).w, flatShade, accuracy: 0.001)
         XCTAssertEqual(mesh.vertices.last!.w, flatShade, accuracy: 0.001)
         // Every cell is two triangles, plus the fan around the eye.

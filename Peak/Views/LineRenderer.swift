@@ -28,12 +28,18 @@ struct TerrainCamera {
     /// How far above the mesh's center the eye is, meters.
     var lift: Float
     var opacity: Float
-    /// The sky that far terrain fades into, and the ground facing away from and toward the light.
+    /// The night sky high up, and the paler sky along the horizon, which haze takes: level
+    /// and below, turning to `sky` by `skyHeight` up (the sine of that elevation).
     var sky: SIMD3<Float>
+    var horizon: SIMD3<Float>
+    var skyHeight: Float
+    /// The ground facing away from and toward the light.
     var dark: SIMD3<Float>
     var light: SIMD3<Float>
-    /// Distance at which haze has covered about two thirds of the ground, meters.
+    /// Distance at which haze has covered about two thirds of the ground, at the height of
+    /// the ground under the eye, and the height over which it thins by e, meters.
     var haze: Float
+    var hazeHeight: Float
 }
 
 /// Matches `TerrainUniforms` in Terrain.metal.
@@ -44,7 +50,9 @@ private struct TerrainUniforms {
     var eye: SIMD4<Float>
     var lens: SIMD4<Float>
     var view: SIMD4<Float>
+    var haze: SIMD4<Float>
     var sky: SIMD4<Float>
+    var horizon: SIMD4<Float>
     var dark: SIMD4<Float>
     var light: SIMD4<Float>
 }
@@ -192,11 +200,13 @@ final class LineRenderer {
         return (c, d)
     }
 
-    /// Draws the terrain alone into its target. False when there's nothing to draw.
-    private func encodeTerrain(_ camera: TerrainCamera, into commands: MTLCommandBuffer, size: CGSize, width: Int, height: Int) -> Bool {
+    /// Draws the terrain alone into its target, returning what it was drawn with, for laying
+    /// it under the lines; nil when there's nothing to draw.
+    private func encodeTerrain(_ camera: TerrainCamera, into commands: MTLCommandBuffer, size: CGSize, width: Int,
+                               height: Int) -> TerrainUniforms? {
         guard camera.opacity > 0, terrainIndexCount > 0, let vertices = terrainVertices, let indices = terrainIndices,
               let pipeline = terrainPipeline, let depthState = terrainDepthState,
-              let (color, depth) = terrainTargets(width: width, height: height) else { return false }
+              let (color, depth) = terrainTargets(width: width, height: height) else { return nil }
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = color
         pass.colorAttachments[0].loadAction = .clear
@@ -206,12 +216,13 @@ final class LineRenderer {
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.clearDepth = 0
         pass.depthAttachment.storeAction = .dontCare
-        guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return false }
+        guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return nil }
         var uniforms = TerrainUniforms(
             right: SIMD4(camera.right, 0), down: SIMD4(camera.down, 0), forward: SIMD4(camera.forward, 0),
             eye: SIMD4(0, 0, camera.lift, terrainReach), lens: camera.lens,
-            view: SIMD4(Float(size.width), Float(size.height), 1, camera.haze),
-            sky: SIMD4(camera.sky, camera.opacity), dark: SIMD4(camera.dark, 1), light: SIMD4(camera.light, 1))
+            view: SIMD4(Float(size.width), Float(size.height), 1, 0), haze: SIMD4(camera.haze, camera.hazeHeight, 0, 0),
+            sky: SIMD4(camera.sky, camera.opacity), horizon: SIMD4(camera.horizon, camera.skyHeight),
+            dark: SIMD4(camera.dark, 1), light: SIMD4(camera.light, 1))
         encoder.setRenderPipelineState(pipeline)
         encoder.setDepthStencilState(depthState)
         encoder.setCullMode(.none)
@@ -221,7 +232,7 @@ final class LineRenderer {
         encoder.drawIndexedPrimitives(type: .triangle, indexCount: terrainIndexCount, indexType: .uint32,
                                       indexBuffer: indices, indexBufferOffset: 0)
         encoder.endEncoding()
-        return true
+        return uniforms
     }
 
     /// Draws `lines` (ridgelines, blended brightest) and `overlay` (trail and dots, laid
@@ -237,9 +248,9 @@ final class LineRenderer {
             inFlight.signal()
             return
         }
-        let underlay = terrain.map {
+        let underlay = terrain.flatMap {
             encodeTerrain($0, into: commands, size: size, width: drawable.texture.width, height: drawable.texture.height)
-        } ?? false
+        }
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = drawable.texture
         pass.colorAttachments[0].loadAction = .clear
@@ -286,9 +297,11 @@ final class LineRenderer {
             }
             next = (next + 1) % buffers.count
         }
-        if underlay, let composite = compositePipeline, let color = terrainColor {
+        if var uniforms = underlay, let composite = compositePipeline, let color = terrainColor {
             encoder.setRenderPipelineState(composite)
             encoder.setFragmentTexture(color, index: 0)
+            // In place of the lines' own uniforms, for the sky where there's no terrain.
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<TerrainUniforms>.stride, index: 1)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         }
         encoder.endEncoding()

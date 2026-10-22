@@ -121,11 +121,16 @@ final class OverlayCanvas: UIView {
     private var backdropFading = Date.distantPast
     private static let sky = UIColor(red: 0.075, green: 0.09, blue: 0.12, alpha: 1)
     private static let land = UIColor(red: 0.02, green: 0.025, blue: 0.035, alpha: 1)
-    /// The terrain in 3D under the view from above (`PanoramaMesh`): slopes from a dark slate
-    /// away from the light to a pale one toward it, fading into the sky with distance.
-    private static let terrainDark = SIMD3<Float>(0.045, 0.055, 0.075)
-    private static let terrainLight = SIMD3<Float>(0.34, 0.39, 0.46)
-    private static let terrainHaze: Float = 35_000
+    /// The terrain in 3D under the view from above (`PanoramaMesh`): slopes from the sheets'
+    /// blue-black away from the light to a slate toward it, paler and bluer with distance like
+    /// haze, toward a paler band of sky along the horizon (about 12° deep). The haze is
+    /// thicker low down, so valleys fill with it and each ridge stands dark against the next.
+    private static let terrainDark = SIMD3<Float>(0.035, 0.043, 0.058)
+    private static let terrainLight = SIMD3<Float>(0.23, 0.27, 0.32)
+    private static let terrainHorizon = SIMD3<Float>(0.29, 0.34, 0.41)
+    private static let terrainSkyHeight: Float = 0.2
+    private static let terrainHaze: Float = 18_000
+    private static let terrainHazeHeight: Float = 1_000
     /// How much the terrain in 3D shows, fading with the backdrop, and the height it was last
     /// seen from, for fading out from there.
     private var terrainOpacity: Float = 0
@@ -604,7 +609,9 @@ final class OverlayCanvas: UIView {
         return TerrainCamera(right: float(axes.right), down: float(axes.down), forward: float(axes.forward),
                              lens: SIMD4(Float(k.fx), Float(k.fy), Float(k.cx), Float(k.cy)), lift: terrainLift,
                              opacity: terrainOpacity, sky: SIMD3(Float(sky[0]), Float(sky[1]), Float(sky[2])),
-                             dark: Self.terrainDark, light: Self.terrainLight, haze: Self.terrainHaze)
+                             horizon: Self.terrainHorizon, skyHeight: Self.terrainSkyHeight,
+                             dark: Self.terrainDark, light: Self.terrainLight, haze: Self.terrainHaze,
+                             hazeHeight: Self.terrainHazeHeight)
     }
 
     /// The land below the skyline, filled, across the view: from each stretch of skyline in
