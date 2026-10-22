@@ -160,6 +160,9 @@ final class AppModel {
     var showsFromAbove = false {
         didSet { if showsFromAbove != oldValue { cameraCovered(showsFromAbove) } }
     }
+    /// The view from above shows satellite imagery under the lines (while there's a
+    /// connection) instead of the terrain's shading. Starts off each time Peak opens.
+    var fromAboveSatellite = false
     /// Lining the view up by hand: the picture is paused and dragging moves the lines.
     var aligning = false
     /// How far the picture and the lines are zoomed in, 1 to `maxZoom`.
@@ -213,7 +216,8 @@ final class AppModel {
     /// A load for a place this far behind is dropped for one where you are.
     static let restartDistance = 8_000.0
     @ObservationIgnored private(set) var onWiFi = false
-    @ObservationIgnored private var online = false
+    /// There's a connection, so imagery and anything else not saved on the phone can load.
+    private(set) var online = false
     /// Temporary full accuracy has been asked for since Peak last came to the front.
     @ObservationIgnored private var askedForPrecision = false
     /// The accuracy of the fix the view on screen was built from, meters.
@@ -404,7 +408,7 @@ final class AppModel {
     private func networkChanged(online: Bool, wifi: Bool) {
         let back = online && !self.online
         let joinedWiFi = wifi && !onWiFi
-        self.online = online
+        if self.online != online { self.online = online }
         onWiFi = wifi
         networkKnown = true
         if back || joinedWiFi { resumeIncompleteAreas() }
@@ -537,6 +541,11 @@ final class AppModel {
         details[peak.id] = d
         d.load(store: store, terrain: { [weak self] in self?.scene?.terrain })
         return d
+    }
+
+    /// A hike already loaded for a peak's card.
+    func hike(_ trailID: String, peakID: Int64) -> PeakDetails.Hike? {
+        details[peakID]?.hikes.first { $0.id == trailID }
     }
 
     /// Loads again the facts or hikes that failed for a peak.
@@ -1075,6 +1084,7 @@ final class AppModel {
             refreshAlpenglow()
             updateCorrector()
             if arTrail != nil { drapeTrail() }
+            for d in details.values { d.refreshProfiles(on: built.terrain) }
         } while rebuildAgain
         rebuilding = false
     }
@@ -1227,6 +1237,8 @@ final class PeakDetails {
     var factsState: State = .loading
     var hikes: [Hike] = []
     var hikesState: State = .loading
+    /// The terrain the hikes' climbs were worked out on.
+    @ObservationIgnored private weak var profiledOn: Terrain?
 
     init(peak: Peak) {
         self.peak = peak
@@ -1235,6 +1247,21 @@ final class PeakDetails {
     func load(store: DataStore, terrain: @escaping () -> Terrain?) {
         loadFacts(store: store)
         loadHikes(store: store, terrain: terrain)
+    }
+
+    /// Works the hikes' climbs out again on sharper terrain, so the list, the card and the
+    /// map from above all give the same numbers, and the best ones.
+    func refreshProfiles(on terrain: Terrain) {
+        guard hikesState == .loaded, profiledOn !== terrain else { return }
+        profiledOn = terrain
+        let trails = hikes.map(\.trail)
+        Task { @MainActor in
+            let profiles = await Task.detached(priority: .utility) { trails.map { $0.profile(on: terrain) } }.value
+            guard profiledOn === terrain else { return }
+            for (i, profile) in profiles.enumerated() where i < hikes.count && hikes[i].id == trails[i].id {
+                hikes[i].profile = profile
+            }
+        }
     }
 
     func loadFacts(store: DataStore) {
@@ -1264,7 +1291,10 @@ final class PeakDetails {
                     }
                     .sorted { ($0.reachesSummit ? 0 : 1, $0.distanceFromPeak) < ($1.reachesSummit ? 0 : 1, $1.distanceFromPeak) }
                 }.value
+                profiledOn = ground
                 hikesState = .loaded
+                // The terrain sharpened meanwhile.
+                if let now = terrain(), now !== ground { refreshProfiles(on: now) }
             } catch let error as URLError {
                 switch error.code {
                 case .notConnectedToInternet, .dataNotAllowed, .networkConnectionLost, .internationalRoamingOff:
