@@ -96,11 +96,11 @@ struct StatusPill: View {
             case let .ready(note):
                 let state = model.correction.state
                 Circle()
-                    .fill(state == .locked ? Color.green : state == .byHand ? Color.cyan : Color.orange)
+                    .fill(state == .locked ? Color.green : state == .byHand || state == .remembered ? Color.cyan : Color.orange)
                     .frame(width: 7, height: 7)
                 HStack(spacing: 4) {
                     if let heading { headingText(heading, alignment: .trailing); Text("·") }
-                    Text((state == .locked ? "Locked" : state == .byHand ? "Lined up" : "Compass")
+                    Text((state == .locked ? "Locked" : state == .byHand ? "Lined up" : state == .remembered ? "Remembered" : "Compass")
                          + (model.waitingForPeaks ? " · Getting peaks…" : "") + (note.map { " · \($0)" } ?? ""))
                 }
             }

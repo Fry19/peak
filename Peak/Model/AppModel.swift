@@ -44,12 +44,17 @@ final class AppModel {
         var lastRMS = 0.0
         /// When the view was last lined up by hand.
         var byHand: Date?
+        /// The heading remembered from an earlier launch here (`RememberedHeading`), while it's
+        /// the one in use: not a match, so skyline matching searches around the plain compass
+        /// as without it, and the first lock or line-up replaces it.
+        var remembered: Double?
 
-        enum State { case locked, byHand, compass }
+        enum State { case locked, byHand, remembered, compass }
 
         var state: State {
             if let lastMatch, Date().timeIntervalSince(lastMatch) < 20 { return .locked }
             if let byHand, Date().timeIntervalSince(byHand) < 600 { return .byHand }
+            if remembered != nil { return .remembered }
             return .compass
         }
 
@@ -76,6 +81,7 @@ final class AppModel {
             // the compass, so it moves more slowly, and only with matches the lock took.
             // `from` has the north of its frame, as the gyroscope's divergence then does.
             guard compass.add(o.from - (o.gyro?.north ?? north) + o.delta, at: o.gyro?.reading, now: now?.reading) else { return false }
+            remembered = nil
             let first = matches == 0
             let i = o.sideways ? 1 : 0
             let gain = first ? 0.5 : 0.3
@@ -233,6 +239,8 @@ final class AppModel {
     var opticalZoom = 1.0
     @ObservationIgnored var lensOffsets = LensOffsets()
     @ObservationIgnored var lastWideMatch: Date?
+    /// Whether this launch has had its chance to start from the heading remembered here.
+    @ObservationIgnored private var headingRestoreSettled = false
     /// The last skyline match, for diagnostics.
     var lastOutcome: SkylineCorrector.Outcome?
     var storageBytes: Int?
@@ -361,8 +369,11 @@ final class AppModel {
     private func updateCorrector() {
         let north = motion.northCorrection
         var upright = correction.view(sideways: false), sideways = correction.view(sideways: true)
-        upright.heading += north
-        sideways.heading += north
+        // A heading remembered from an earlier launch isn't a match: frames are matched around
+        // the plain compass, as they would be without it, so it can't steer which fit wins.
+        let remembered = correction.remembered ?? 0
+        upright.heading += north - remembered
+        sideways.heading += north - remembered
         // Matching against the horizon from a rough fix would lock onto the wrong one.
         let horizon = sceneAccuracy < LocationQuality.matchingAccuracy ? scene?.matchingHorizon : nil
         // How far you may be from where the horizon was rendered: near ridges count for less.
@@ -424,6 +435,8 @@ final class AppModel {
         corrector.onResult = { [weak self] outcome in
             guard let self else { return }
             self.lastOutcome = outcome
+            self.checkRememberedNorth()
+            self.restoreHeading()
             guard outcome.accepted, self.frozen == nil else { return }
             if self.takeMatch(outcome) { self.updateCorrector() }
         }
@@ -455,6 +468,7 @@ final class AppModel {
             askedForPrecision = false
             land()
             dropRisenViews()
+            rememberHeading()
             saveCalibration()
             camera.stop()
             motion.stop()
@@ -508,6 +522,7 @@ final class AppModel {
             locationPermission = .granted
             // With the location known, the sensors can reference true north.
             if active, !cameraIsCovered { motion.start(trueNorth: true) }
+            restoreHeading()
             checkPrecision()
         default:
             locationPermission = .undetermined
@@ -703,6 +718,8 @@ final class AppModel {
         // A telephoto's offset is measured against the wide lens's last match, which no
         // longer holds: the next telephoto match goes through the lock like any other.
         lastWideMatch = nil
+        correction.remembered = nil
+        rememberHeading()
         updateCorrector()
     }
 
@@ -725,8 +742,10 @@ final class AppModel {
         }
         correction.lastMatch = nil
         correction.byHand = nil
+        correction.remembered = nil
         correction.lock.reset()
         correction.compass.hold.reset()
+        forgetHeading()
         saveCalibration()
         updateCorrector()
     }
@@ -762,6 +781,105 @@ final class AppModel {
     private func saveCalibration() {
         saveLensOffsets()
         if let data = try? JSONEncoder().encode(correction.level) { UserDefaults.standard.set(data, forKey: Self.calibrationKey) }
+    }
+
+    // MARK: Remembering the heading here
+
+    private static let rememberedHeadingKey = "rememberedHeading"
+
+    /// The heading found here last (`RememberedHeading`), saved as the view is lined up.
+    private var savedHeading: RememberedHeading? {
+        get {
+            UserDefaults.standard.data(forKey: Self.rememberedHeadingKey)
+                .flatMap { try? JSONDecoder().decode(RememberedHeading.self, from: $0) }
+        }
+        set {
+            if let newValue, let data = try? JSONEncoder().encode(newValue) {
+                UserDefaults.standard.set(data, forKey: Self.rememberedHeadingKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.rememberedHeadingKey)
+            }
+        }
+    }
+
+    /// A fix good enough to tell this spot by, from the last minute.
+    private var preciseFix: CLLocation? {
+        guard let location, location.horizontalAccuracy >= 0, location.horizontalAccuracy <= RememberedHeading.maxAccuracy,
+              location.timestamp.timeIntervalSinceNow > -60 else { return nil }
+        return location
+    }
+
+    /// Keeps the heading in use for the next launch here, while it's as good as when it was
+    /// lined up: just matched or lined up by hand, or held whole by the gyroscope since (so a
+    /// lock found with a wide view outside carries to the window you then stand at). Only on
+    /// true north, where the heading doesn't hang on a declination that may not be known.
+    func rememberHeading() {
+        // The sensors' last reading, which stays behind when they stop (a view covering the
+        // camera), doesn't say where the phone points now.
+        guard let latest = motion.latestGyro, ProcessInfo.processInfo.systemUptime - latest.time < 1 else { return }
+        let gyro = latest.reading
+        guard correction.remembered == nil, correction.compass.hold.isWhole(gyro), onTrueNorth,
+              let fix = preciseFix else { return }
+        let r = RememberedHeading(heading: correction.compass.correction(gyro),
+                                  latitude: fix.coordinate.latitude, longitude: fix.coordinate.longitude,
+                                  accuracy: fix.horizontalAccuracy, date: Date(),
+                                  byHand: correction.state == .byHand, sideways: CameraGeometry.isSideways(motion.pose))
+        if r.isValid { savedHeading = r }
+    }
+
+    /// The sensors are on true north and have read under it (a restart clears their readings).
+    private var onTrueNorth: Bool {
+        guard motion.status.trueNorth, let latest = motion.latestGyro else { return false }
+        return ProcessInfo.processInfo.systemUptime - latest.time < 1
+    }
+
+    private func forgetHeading() {
+        savedHeading = nil
+        headingRestoreSettled = true
+    }
+
+    /// Once per launch, before anything has lined the view up: starts from the heading
+    /// remembered here, if it was found close by within the week (`RememberedHeading`).
+    private func restoreHeading() {
+        guard !headingRestoreSettled else { return }
+        guard correction.matches == 0, correction.byHand == nil, !correction.lock.isLocked else {
+            headingRestoreSettled = true
+            return
+        }
+        // Wait for true north and a precise fix here; they may come after the first fixes (a
+        // cached one from elsewhere among them).
+        guard onTrueNorth, let fix = preciseFix, let saved = savedHeading,
+              saved.applies(latitude: fix.coordinate.latitude, longitude: fix.coordinate.longitude,
+                            accuracy: fix.horizontalAccuracy, now: Date()) else { return }
+        headingRestoreSettled = true
+        correction.compass.restore(saved.heading)
+        correction.remembered = saved.heading
+        updateCorrector()
+    }
+
+    /// A new fix: the remembered heading may now apply, or no longer, once you've walked
+    /// away from where it was found; and the heading lined up may be worth keeping here.
+    private func rememberedHeadingMoved(_ new: CLLocation) {
+        restoreHeading()
+        if correction.remembered != nil, let saved = savedHeading, let fix = preciseFix,
+           saved.distance(latitude: fix.coordinate.latitude, longitude: fix.coordinate.longitude) > RememberedHeading.maxDistance {
+            dropRememberedHeading()
+        }
+        checkRememberedNorth()
+        rememberHeading()
+    }
+
+    /// The sensors fell back to magnetic north: the remembered heading was found under true
+    /// north and may not carry over, so back to the plain compass.
+    private func checkRememberedNorth() {
+        if correction.remembered != nil, !motion.status.trueNorth { dropRememberedHeading() }
+    }
+
+    private func dropRememberedHeading() {
+        guard let remembered = correction.remembered else { return }
+        correction.heading -= remembered
+        correction.remembered = nil
+        updateCorrector()
     }
 
     // MARK: Peaks and trails
@@ -958,6 +1076,7 @@ final class AppModel {
         if let old = location, new.timestamp.timeIntervalSince(old.timestamp) < 60, old.horizontalAccuracy < new.horizontalAccuracy,
            new.distance(from: old) < old.horizontalAccuracy { return }
         location = new
+        rememberedHeadingMoved(new)
         updateCorrector()
         // Tiles are 1° wide, so a rough first fix is enough to start downloading.
         guard LocationQuality.usableForLoading(accuracy: new.horizontalAccuracy, precise: preciseLocation) else { return }
@@ -1634,6 +1753,12 @@ final class AppModel {
                             correction.level[i].pitch, correction.level[i].roll,
                             correction.byHandLevel[i].pitch, correction.byHandLevel[i].roll))
         lines.append(String(format: "%ld matches", correction.matches))
+        if let r = savedHeading {
+            let away = preciseFix.map { String(format: ", %.0f m away", r.distance(latitude: $0.coordinate.latitude, longitude: $0.coordinate.longitude)) } ?? ""
+            lines.append(String(format: "remembered heading %+.2f°%@ (%@, %.1f h ago%@)", r.heading,
+                                correction.remembered != nil ? " in use" : "", r.byHand ? "by hand" : "matched",
+                                Date().timeIntervalSince(r.date) / 3600, away))
+        }
         if let r = correction.compass.hold.reference, let g = motion.latestGyro {
             lines.append(r.epoch == g.epoch
                 ? String(format: "gyroscope hold %+.2f°, lined up %.0f s ago", correction.held(g), g.time - r.time)

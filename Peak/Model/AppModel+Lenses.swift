@@ -33,6 +33,7 @@ extension AppModel {
         case .main:
             let moved = correction.add(o, north: motion.northCorrection, now: motion.latestGyro)
             if moved, o.lens == LensSet.wideName { lastWideMatch = Date() }
+            if moved { rememberHeading() }
             return moved
         case .refinedOffset:
             correction.lastMatch = Date()
