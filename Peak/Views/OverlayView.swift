@@ -1,4 +1,5 @@
 import PeakCore
+import SwiftUI
 import UIKit
 
 /// Thin glowing ridgelines, nearer ones brighter and farther ones fading like haze, a few
@@ -46,7 +47,7 @@ final class OverlayCanvas: UIView {
     /// Distance bands: (farthest distance in meters, opacity).
     private static let bands: [(Float, CGFloat)] = [(3_000, 0.95), (10_000, 0.75), (30_000, 0.55), (.infinity, 0.35)]
     private static let tint = UIColor(red: 0.86, green: 0.94, blue: 1.0, alpha: 1)
-    private static let trailColor = UIColor(red: 1.0, green: 0.72, blue: 0.28, alpha: 1)
+    private static let trailColor = UIColor(Color.amber)
     private static let accent = UIColor(red: 1.0, green: 0.84, blue: 0.45, alpha: 1)
 
     // Under each line a wide faint stroke makes the glow (cheaper than a blurred shadow).

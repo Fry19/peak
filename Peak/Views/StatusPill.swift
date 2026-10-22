@@ -20,7 +20,7 @@ struct StatusPill: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
             .frame(minHeight: 44)
-            .background(.ultraThinMaterial, in: Capsule())
+            .glassBackground(in: Capsule())
             .environment(\.colorScheme, .dark)
             .contentShape(Capsule())
             .onTapGesture { if !model.aligning { model.toggleFreeze() } }

@@ -45,7 +45,7 @@ struct RootView: View {
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)
-                                .background(.ultraThinMaterial, in: Capsule())
+                                .glassBackground(in: Capsule())
                                 .environment(\.colorScheme, .dark)
                                 .tapArea(minWidth: 64, minHeight: 44)
                         }
@@ -72,15 +72,15 @@ struct RootView: View {
                             }
                             RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
                         } else if showsBarButtons {
-                            RoundButton(systemImage: "arrow.up.and.down.and.arrow.left.and.right", label: "Line up by hand") {
-                                model.startAligning()
-                            }
+                            // Lining up by hand is in Settings: the skyline match usually does it.
                             RoundButton(systemImage: "gearshape", label: "Settings") { model.sheet = .settings }
                         }
                     }
                     Text("Terrain © Copernicus DEM (DLR, Airbus), NOAA ETOPO · Map data © OpenStreetMap contributors")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.white.opacity(0.45))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .shadow(color: .black.opacity(0.6), radius: 1)
                 }
                 .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { bottomControls = $0 }
             }
@@ -110,7 +110,7 @@ struct RootView: View {
         }
     }
 
-    /// The peak list, lining up and settings sit beside the pill once the view is working;
+    /// The peak list and settings sit beside the pill once the view is working;
     /// while something's wrong, the pill's message gets the whole width.
     private var showsBarButtons: Bool {
         guard !model.aligning else { return false }
@@ -162,6 +162,7 @@ private struct SheetContent: View {
             .presentationDetents([.medium, .large])
             .presentationBackgroundInteraction(.enabled(upThrough: .medium))
             .presentationBackground(.sheetBackground)
+            .tint(.amber)
         case .list:
             NavigationStack {
                 PeakListView(model: model)
@@ -170,11 +171,13 @@ private struct SheetContent: View {
             }
             .presentationDetents([.medium, .large])
             .presentationBackground(.sheetBackground)
+            .tint(.amber)
         case .settings:
             NavigationStack {
                 SettingsView(model: model)
             }
             .presentationBackground(.sheetBackground)
+            .tint(.amber)
         }
     }
 }
@@ -186,24 +189,6 @@ struct PeakLink: Hashable {
 struct TrailLink: Hashable {
     var peakID: Int64
     var trailID: String
-}
-
-extension ShapeStyle where Self == Color {
-    /// Behind every sheet and the pages pushed in it: the cool blue-black of the views from
-    /// above and the 3D walk, so the whole app is one night-sky palette. Opaque: a material
-    /// turns light gray over a bright sky or snow, and the rows sink into it.
-    static var sheetBackground: Color { Color(red: 0.035, green: 0.043, blue: 0.058) }
-    /// Rows and tiles on a sheet: the same blue, a step lighter, in place of the system's
-    /// neutral gray.
-    static var sheetSurface: Color { Color(red: 0.085, green: 0.1, blue: 0.125) }
-}
-
-extension View {
-    /// A sheet's list section, its rows in the app's slate instead of the system gray. Rows
-    /// that set their own background keep it.
-    func sheetSection() -> some View {
-        listRowBackground(Color.sheetSurface)
-    }
 }
 
 /// A round glass button for the bottom bar.
@@ -218,7 +203,7 @@ struct RoundButton: View {
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(.white)
                 .frame(width: 44, height: 44)
-                .background(.ultraThinMaterial, in: Circle())
+                .glassBackground(in: Circle())
                 .environment(\.colorScheme, .dark)
         }
         .accessibilityLabel(label)
@@ -245,7 +230,7 @@ private struct AlignBanner: View {
         .foregroundStyle(.white)
         .padding(14)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .glassBackground(in: RoundedRectangle(cornerRadius: 18))
         .environment(\.colorScheme, .dark)
     }
 }
@@ -259,7 +244,7 @@ private struct TrailChip: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "figure.hiking")
-                .foregroundStyle(Color(red: 1, green: 0.72, blue: 0.28))
+                .foregroundStyle(Color.amber)
             VStack(alignment: .leading, spacing: 1) {
                 Text(trail.trail.name)
                     .font(.system(size: 13, weight: .semibold))
@@ -278,7 +263,7 @@ private struct TrailChip: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(xRay ? .black : .white)
                     .frame(width: 28, height: 28)
-                    .background(xRay ? AnyShapeStyle(Color(red: 1, green: 0.72, blue: 0.28)) : AnyShapeStyle(.white.opacity(0.15)),
+                    .background(xRay ? AnyShapeStyle(Color.amber) : AnyShapeStyle(.white.opacity(0.15)),
                                 in: Circle())
                     .tapArea()
             }
@@ -310,7 +295,7 @@ private struct TrailChip: View {
         .padding(.trailing, 8)
         .padding(.vertical, 8)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: Capsule())
+        .glassBackground(in: Capsule())
         .environment(\.colorScheme, .dark)
         .contentShape(Capsule())
         .onTapGesture { model.select(trail.peakID) }

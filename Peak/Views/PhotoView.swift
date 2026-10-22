@@ -36,7 +36,7 @@ struct PhotoView: View {
                     .foregroundStyle(.white)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
-                    .background(.ultraThinMaterial, in: Capsule())
+                    .glassBackground(in: Capsule())
                     .environment(\.colorScheme, .dark)
                     .transition(.opacity)
             }
@@ -51,6 +51,7 @@ struct PhotoView: View {
             }
             .presentationDetents([.medium, .large])
             .presentationBackground(.sheetBackground)
+            .tint(.amber)
         }
     }
 
@@ -146,7 +147,7 @@ struct PhotoView: View {
                     .padding(.horizontal, 14)
                     .padding(.vertical, 9)
                     .frame(minHeight: 44)
-                    .background(.ultraThinMaterial, in: Capsule())
+                    .glassBackground(in: Capsule())
                     .environment(\.colorScheme, .dark)
             }
             Spacer(minLength: 0)
@@ -200,7 +201,7 @@ struct PhotoView: View {
             .foregroundStyle(.white)
             .padding(18)
             .frame(maxWidth: 420)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
+            .glassBackground(in: RoundedRectangle(cornerRadius: 20))
             .environment(\.colorScheme, .dark)
             Spacer()
         case .loading:
@@ -236,7 +237,7 @@ struct PhotoView: View {
         .foregroundStyle(.white)
         .padding(14)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .glassBackground(in: RoundedRectangle(cornerRadius: 18))
         .environment(\.colorScheme, .dark)
     }
 
@@ -270,7 +271,7 @@ struct PhotoView: View {
                     }
                     .foregroundStyle(.white)
                     .frame(width: 44, height: 44)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .glassBackground(in: Circle())
                     .environment(\.colorScheme, .dark)
                 }
                 .disabled(saving)
@@ -282,7 +283,7 @@ struct PhotoView: View {
                             .font(.system(size: 17, weight: .medium))
                             .foregroundStyle(.white)
                             .frame(width: 44, height: 44)
-                            .background(.ultraThinMaterial, in: Circle())
+                            .glassBackground(in: Circle())
                             .environment(\.colorScheme, .dark)
                     }
                     .accessibilityLabel("Share")

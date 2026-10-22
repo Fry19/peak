@@ -107,7 +107,7 @@ final class WalkWorld: @unchecked Sendable {
     static let background = UIColor(red: 0.035, green: 0.043, blue: 0.058, alpha: 1)
     /// The sky, and the haze far terrain fades into.
     static let haze = UIColor(red: 0.055, green: 0.066, blue: 0.09, alpha: 1)
-    static let trailColor = UIColor(red: 1.0, green: 0.72, blue: 0.28, alpha: 1)
+    static let trailColor = UIColor(Color.amber)
     /// Vertical field of view, degrees.
     static let fieldOfView = 62.0
 
@@ -741,7 +741,7 @@ private struct WalkChip: View {
         .padding(.trailing, 8)
         .padding(.vertical, 8)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: Capsule())
+        .glassBackground(in: Capsule())
         .environment(\.colorScheme, .dark)
     }
 
@@ -775,7 +775,7 @@ private struct WalkControls: View {
             .padding(.leading, 4)
             .padding(.trailing, 12)
             .padding(.vertical, 4)
-            .background(.ultraThinMaterial, in: Capsule())
+            .glassBackground(in: Capsule())
             .environment(\.colorScheme, .dark)
             Text(player.playing ? " " : "Drag to look around")
                 .font(.system(size: 11))

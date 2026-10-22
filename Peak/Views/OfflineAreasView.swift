@@ -204,7 +204,9 @@ struct SaveAreaView: View {
         return VStack(alignment: .leading, spacing: 14) {
             TextField("Name", text: Binding(get: { name }, set: { name = $0; nameChosen = true }))
                 .font(.headline)
-                .textFieldStyle(.roundedBorder)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color.sheetSurface, in: RoundedRectangle(cornerRadius: 10))
             HStack {
                 Text("Radius")
                 Slider(value: radiusSteps, in: model.settings.units == .metric ? 5...50 : 5...30, step: 5)
@@ -219,7 +221,7 @@ struct SaveAreaView: View {
             Button {
                 save()
             } label: {
-                Text("Download").font(.headline).frame(maxWidth: .infinity)
+                Text("Download").font(.headline).foregroundStyle(.black).frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)

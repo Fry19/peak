@@ -51,11 +51,13 @@ struct PeakListView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
-                Picker("Order", selection: $order) {
-                    ForEach(Order.allCases) { Text($0.rawValue).tag($0) }
+                Menu {
+                    Picker("Sort by", selection: $order) {
+                        ForEach(Order.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                } label: {
+                    Label("Sort: \(order.rawValue)", systemImage: "arrow.up.arrow.down")
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 170)
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Done") { model.sheet = nil }
@@ -75,14 +77,14 @@ struct PeakListView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(v.peak.name)
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(.headline)
                     Text("\(Format.distance(v.distance, units)) · \(Format.bearing(v.azimuth))")
-                        .font(.system(size: 13))
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Text(Format.elevation(of: v.peak, units))
-                    .font(.system(size: 15, weight: .medium))
+                    .font(.subheadline.weight(.medium))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }

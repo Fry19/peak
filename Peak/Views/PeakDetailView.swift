@@ -45,12 +45,13 @@ struct PeakDetailView: View {
             Section {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(peak.name)
-                        .font(.system(size: 28, weight: .bold))
+                        .font(.title.bold())
                     Text(facts?.description?.capitalizedFirst ?? subtitle(view))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
                 .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 4, trailing: 4))
 
                 if let url = facts?.pictureURL {
@@ -70,11 +71,13 @@ struct PeakDetailView: View {
                         }
                     }
                     .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 }
 
                 StatGrid(stats: stats(peak, view, facts, units))
                     .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
 
                 Button {
@@ -86,9 +89,10 @@ struct PeakDetailView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(Color(red: 1, green: 0.72, blue: 0.28))
+                .tint(Color.amber)
                 .foregroundStyle(.black)
                 .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             }
             .sheetSection()
@@ -202,12 +206,12 @@ struct HikeRow: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 Text(hike.trail.name)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.headline)
                     .lineLimit(2)
                 if hike.reachesSummit {
                     Image(systemName: "flag.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color(red: 1, green: 0.72, blue: 0.28))
+                        .font(.caption2)
+                        .foregroundStyle(Color.amber)
                         .accessibilityLabel("Reaches the summit")
                 }
             }
@@ -218,12 +222,12 @@ struct HikeRow: View {
                     Label(Format.elevation(p.gain, units), systemImage: "arrow.up.right")
                 }
             }
-            .font(.system(size: 13))
+            .font(.footnote)
             .foregroundStyle(.secondary)
             .labelStyle(CompactLabelStyle())
             if let from, let start = hike.profile?.trailhead {
                 Text("Start \(Format.distance(from.distance(to: start), units)) from you")
-                    .font(.system(size: 12))
+                    .font(.caption)
                     .foregroundStyle(.tertiary)
             }
         }
@@ -237,7 +241,7 @@ struct DifficultyBadge: View {
 
     var body: some View {
         Text(difficulty.grade)
-            .font(.system(size: 11, weight: .bold))
+            .font(.caption2.bold())
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .foregroundStyle(difficulty.rawValue >= 5 ? Color.white : Color.black)
@@ -279,10 +283,10 @@ struct StatGrid: View {
             ForEach(stats) { stat in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(stat.title.uppercased())
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Text(stat.value)
-                        .font(.system(size: 17, weight: .semibold))
+                        .font(.headline)
                         .monospacedDigit()
                         .lineLimit(2)
                         .minimumScaleFactor(0.8)

@@ -30,7 +30,7 @@ struct TrailFromAboveView: View {
     }
 
     static let background = Color.sheetBackground
-    static let trailColor = Color(red: 1, green: 0.72, blue: 0.28)
+    static let trailColor = Color.amber
 
     var body: some View {
         GeometryReader { geo in
@@ -124,7 +124,7 @@ struct TrailFromAboveView: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 14)
                         .frame(height: 36)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .glassBackground(in: Capsule())
                         .environment(\.colorScheme, .dark)
                 }
                 .accessibilityLabel("Walk the trail in 3D")
@@ -142,7 +142,7 @@ struct TrailFromAboveView: View {
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(.white.opacity(0.85))
                     .frame(width: 30, height: 30)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .glassBackground(in: Circle())
                     .environment(\.colorScheme, .dark)
                     .accessibilityLabel("North is up")
             }
@@ -183,7 +183,7 @@ struct TrailFromAboveView: View {
             .foregroundStyle(on ? .black : .white.opacity(0.85))
             .frame(width: 30, height: 30)
             .background {
-                if on { Circle().fill(.white.opacity(0.9)) } else { Circle().fill(.ultraThinMaterial) }
+                if on { Circle().fill(.white.opacity(0.9)) } else { Circle().fill(.ultraThinMaterial).overlay(Circle().fill(Color.glassTint)) }
             }
             .environment(\.colorScheme, .dark)
             .tapArea()
@@ -727,7 +727,7 @@ private struct EdgeArrow: View {
         .foregroundStyle(.white)
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
-        .background(.ultraThinMaterial, in: Capsule())
+        .glassBackground(in: Capsule())
         .environment(\.colorScheme, .dark)
         .fixedSize()
         .position(x: spot.x, y: spot.y + shift)
@@ -817,7 +817,7 @@ private struct FromAboveChip: View {
         .padding(.trailing, 8)
         .padding(.vertical, 8)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: Capsule())
+        .glassBackground(in: Capsule())
         .environment(\.colorScheme, .dark)
         .contentShape(Capsule())
         .onTapGesture { model.select(trail.peakID) }

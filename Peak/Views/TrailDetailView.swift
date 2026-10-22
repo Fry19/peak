@@ -30,30 +30,34 @@ struct TrailDetailView: View {
             Section {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(trail.name)
-                        .font(.system(size: 24, weight: .bold))
+                        .font(.title2.bold())
                     Text(kind(trail))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
                 .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 4, trailing: 4))
 
                 TrailMapPreview(model: model, trail: trail, peak: peak, trailhead: hike.profile?.trailhead, place: place)
                     .frame(height: 220)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                     .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
 
                 StatGrid(stats: stats(hike, units))
                     .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
 
                 // Not for a photo: the trail is drawn in the live view.
                 if place == nil {
                     mountainButton(trail, peak)
-                        .tint(Color(red: 1, green: 0.72, blue: 0.28))
+                        .tint(Color.amber)
                         .lineLimit(1)
                         .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
                         .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 }
             }
@@ -76,7 +80,7 @@ struct TrailDetailView: View {
                     HStack(alignment: .top, spacing: 10) {
                         DifficultyBadge(difficulty: d)
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(d.title).font(.system(size: 15, weight: .semibold))
+                            Text(d.title).font(.subheadline.weight(.semibold))
                             Text(d.summary).font(.callout).foregroundStyle(.secondary)
                         }
                     }
@@ -185,13 +189,15 @@ private struct ProfileChart: View {
             AreaMark(x: .value("Distance", p.distance / along),
                      yStart: .value("Base", low),
                      yEnd: .value("Elevation", p.elevation * scale))
-                .foregroundStyle(LinearGradient(colors: [Color(red: 1, green: 0.72, blue: 0.28).opacity(0.35), .clear],
+                .foregroundStyle(LinearGradient(colors: [Color.amber.opacity(0.35), .clear],
                                                 startPoint: .top, endPoint: .bottom))
             LineMark(x: .value("Distance", p.distance / along), y: .value("Elevation", p.elevation * scale))
-                .foregroundStyle(Color(red: 1, green: 0.72, blue: 0.28))
+                .foregroundStyle(Color.amber)
                 .lineStyle(StrokeStyle(lineWidth: 2))
         }
         .chartYScale(domain: low...high)
+        // The axis ends where the trail does.
+        .chartXScale(domain: 0...max(0.01, (profile.points.last?.distance ?? 0) / along))
         // Numbers on the axes written like the rest of the app's.
         .chartXAxis {
             AxisMarks { _ in
